@@ -19,20 +19,22 @@ use dbx_core::storage::FileTransferStorageRecord;
 use futures::io::AsyncRead as FuturesAsyncRead;
 use futures::io::AsyncReadExt as FuturesAsyncReadExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewWindow};
 use tauri_plugin_fs::FsExt;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::file_manager::{
     validate_remote_relative_path, CancellationSignal, FileManagerRuntime, PreparedFileMutation, PreparedFileOperation,
-    UploadPolicy, UploadPublishResolution, UploadPublishState,
+    RemoteFileFingerprint, UploadPolicy, UploadPublishResolution, UploadPublishState,
 };
 
 const DOWNLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const UPLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const REMOTE_COPY_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const GLOBAL_TRANSFER_LIMIT: usize = 8;
 const CONNECTION_TRANSFER_LIMIT: usize = 4;
 const GLOBAL_UPLOAD_HANDLE_LIMIT: usize = 32;
@@ -64,6 +66,20 @@ static TEST_UPLOAD_AFTER_CLOSE_BARRIER: std::sync::OnceLock<Mutex<Option<TestRem
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static TEST_REMOTE_COPY_AFTER_CLOSE_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_REMOTE_RENAME_AFTER_PUBLISH_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_REMOTE_COPY_WRITER_OPEN_SIDE_EFFECT_FAILURE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+static TEST_REMOTE_COPY_PERSISTENCE_FAILURE_AFTER_VERIFY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
 #[derive(Clone)]
 struct TestBlockingBarrier {
     entry_name: OsString,
@@ -80,12 +96,36 @@ static TEST_LEAF_MUTATION_BARRIER: std::sync::OnceLock<Mutex<Option<TestBlocking
 #[cfg(test)]
 static TEST_UNSUPPORTED_ATOMIC_RENAME: std::sync::OnceLock<Mutex<Option<OsString>>> = std::sync::OnceLock::new();
 
+type RemotePathLockKey = (String, String);
+type RemotePathLockRegistry = Arc<Mutex<HashMap<RemotePathLockKey, Arc<AsyncMutex<()>>>>>;
+
 pub struct FileTransferRuntime {
     global_limit: Arc<Semaphore>,
     connection_limits: Mutex<HashMap<String, Arc<Semaphore>>>,
     active: Mutex<HashMap<String, ActiveTransfer>>,
     recovery: OnceCell<()>,
     last_progress_event: Mutex<Option<Instant>>,
+    path_locks: RemotePathLockRegistry,
+}
+
+struct RemotePathLockGuards {
+    registry: RemotePathLockRegistry,
+    keys: Vec<RemotePathLockKey>,
+    locks: Vec<Arc<AsyncMutex<()>>>,
+    guards: Vec<OwnedMutexGuard<()>>,
+}
+
+impl Drop for RemotePathLockGuards {
+    fn drop(&mut self) {
+        self.guards.clear();
+        self.locks.clear();
+        let mut registry = self.registry.lock().unwrap_or_else(|error| error.into_inner());
+        for key in &self.keys {
+            if registry.get(key).is_some_and(|lock| Arc::strong_count(lock) == 1) {
+                registry.remove(key);
+            }
+        }
+    }
 }
 
 struct ActiveTransfer {
@@ -111,6 +151,48 @@ pub struct StartUploadInput {
     pub policy: UploadPolicy,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteMutationPolicy {
+    BestEffortNoClobber {
+        #[serde(rename = "atomicNoClobber")]
+        atomic_no_clobber: bool,
+        #[serde(rename = "externalToctouRisk")]
+        external_toctou_risk: bool,
+    },
+    Replace {
+        confirmed: bool,
+    },
+}
+
+impl RemoteMutationPolicy {
+    fn validate(self) -> Result<(), String> {
+        match self {
+            Self::BestEffortNoClobber { atomic_no_clobber: false, external_toctou_risk: true } => Ok(()),
+            Self::BestEffortNoClobber { .. } => {
+                Err("FTP copy/rename requires atomicNoClobber=false and externalToctouRisk=true".to_string())
+            }
+            Self::Replace { confirmed: true } => Ok(()),
+            Self::Replace { confirmed: false } => {
+                Err("Replace requires explicit confirmation before the operation starts".to_string())
+            }
+        }
+    }
+
+    fn replace(self) -> bool {
+        matches!(self, Self::Replace { confirmed: true })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartRemoteTransferInput {
+    pub connection_id: String,
+    pub source_path: String,
+    pub destination_path: String,
+    pub policy: RemoteMutationPolicy,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartTransferResult {
@@ -133,6 +215,35 @@ struct UploadOutcome {
     bytes_transferred: i64,
     total_bytes: Option<i64>,
     publish_outcome: Option<String>,
+}
+
+struct RemoteTransferOutcome {
+    bytes_transferred: i64,
+    total_bytes: i64,
+    operation_outcome: &'static str,
+    operation_phase: &'static str,
+    source_fingerprint: String,
+    destination_fingerprint: String,
+}
+
+struct VerifiedRemoteContent {
+    fingerprint: RemoteFileFingerprint,
+    sha256: String,
+}
+
+impl VerifiedRemoteContent {
+    fn durable_fingerprint(&self) -> String {
+        format!("{};relay_sha256:{}", self.fingerprint.encode(), self.sha256)
+    }
+}
+
+struct RemoteTransferFailure {
+    failure: TransferFailure,
+    operation_outcome: &'static str,
+    operation_phase: &'static str,
+    partial_destination: Option<String>,
+    source_fingerprint: Option<String>,
+    destination_fingerprint: Option<String>,
 }
 
 struct UploadFailure {
@@ -231,6 +342,7 @@ impl FileTransferRuntime {
             active: Mutex::new(HashMap::new()),
             recovery: OnceCell::new(),
             last_progress_event: Mutex::new(None),
+            path_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -241,6 +353,31 @@ impl FileTransferRuntime {
             .entry(connection_id.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(CONNECTION_TRANSFER_LIMIT)))
             .clone()
+    }
+
+    async fn lock_remote_paths(
+        &self,
+        connection_id: &str,
+        source_path: &str,
+        destination_path: &str,
+    ) -> RemotePathLockGuards {
+        let mut keys = vec![
+            (connection_id.to_string(), source_path.to_string()),
+            (connection_id.to_string(), destination_path.to_string()),
+        ];
+        keys.sort();
+        keys.dedup();
+        let locks = {
+            let mut path_locks = self.path_locks.lock().unwrap_or_else(|error| error.into_inner());
+            keys.iter()
+                .map(|key| path_locks.entry(key.clone()).or_insert_with(|| Arc::new(AsyncMutex::new(()))).clone())
+                .collect()
+        };
+        let mut locked = RemotePathLockGuards { registry: self.path_locks.clone(), keys, locks, guards: Vec::new() };
+        for lock in &locked.locks {
+            locked.guards.push(lock.clone().lock_owned().await);
+        }
+        locked
     }
 
     fn register(&self, transfer_id: String, connection_id: String, cancellation: CancellationToken) {
@@ -461,6 +598,77 @@ async fn start_upload_inner<R: Runtime>(
 }
 
 #[tauri::command]
+pub async fn start_file_copy(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    runtime: State<'_, FileTransferRuntime>,
+    input: StartRemoteTransferInput,
+) -> Result<StartTransferResult, String> {
+    start_remote_transfer_inner(app, state.inner(), runtime.inner(), input, "copy").await
+}
+
+#[tauri::command]
+pub async fn start_file_rename(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    runtime: State<'_, FileTransferRuntime>,
+    input: StartRemoteTransferInput,
+) -> Result<StartTransferResult, String> {
+    start_remote_transfer_inner(app, state.inner(), runtime.inner(), input, "rename").await
+}
+
+async fn start_remote_transfer_inner<R: Runtime>(
+    app: AppHandle<R>,
+    state: &Arc<AppState>,
+    runtime: &FileTransferRuntime,
+    input: StartRemoteTransferInput,
+    operation: &'static str,
+) -> Result<StartTransferResult, String> {
+    let file_manager = app.state::<FileManagerRuntime>();
+    runtime.ensure_recovered(state, file_manager.inner()).await?;
+    input.policy.validate()?;
+    let source_path = validate_remote_relative_path(&input.source_path)?;
+    let destination_path = validate_remote_relative_path(&input.destination_path)?;
+    if source_path == destination_path {
+        return Err("Source and destination paths must be different".to_string());
+    }
+    let connection = state
+        .storage
+        .load_file_connection(&input.connection_id)
+        .await?
+        .ok_or_else(|| "File connection not found".to_string())?;
+    let transfer_id = Uuid::new_v4().to_string();
+    let cancellation = CancellationToken::new();
+    runtime.register(transfer_id.clone(), input.connection_id.clone(), cancellation.clone());
+    let queued = match state
+        .storage
+        .create_file_remote_transfer(
+            transfer_id.clone(),
+            input.connection_id.clone(),
+            operation.to_string(),
+            source_path,
+            destination_path,
+            connection.revision,
+        )
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            runtime.unregister(&transfer_id);
+            return Err(error);
+        }
+    };
+    emit_transfer(&app, &queued);
+    let worker_id = transfer_id.clone();
+    let connection_id = input.connection_id;
+    let policy = input.policy;
+    tokio::spawn(async move {
+        run_remote_transfer_worker(app, worker_id, connection_id, cancellation, operation, policy).await;
+    });
+    Ok(StartTransferResult { transfer_id })
+}
+
+#[tauri::command]
 pub async fn get_file_transfer(
     state: State<'_, Arc<AppState>>,
     runtime: State<'_, FileTransferRuntime>,
@@ -509,6 +717,117 @@ pub async fn cancel_file_transfer(
     transfer_id: String,
 ) -> Result<FileTransferStorageRecord, String> {
     cancel_file_transfer_inner(&app, state.inner(), runtime.inner(), file_manager.inner(), &transfer_id).await
+}
+
+#[tauri::command]
+pub async fn retry_file_rename_source_delete(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    runtime: State<'_, FileTransferRuntime>,
+    file_manager: State<'_, FileManagerRuntime>,
+    transfer_id: String,
+) -> Result<FileTransferStorageRecord, String> {
+    retry_file_rename_source_delete_inner(&app, state.inner(), runtime.inner(), file_manager.inner(), &transfer_id)
+        .await
+}
+
+async fn retry_file_rename_source_delete_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &Arc<AppState>,
+    runtime: &FileTransferRuntime,
+    file_manager: &FileManagerRuntime,
+    transfer_id: &str,
+) -> Result<FileTransferStorageRecord, String> {
+    runtime.ensure_recovered(state, file_manager).await?;
+    let record =
+        state.storage.get_file_transfer(transfer_id).await?.ok_or_else(|| "File transfer not found".to_string())?;
+    if record.direction != "rename"
+        || record.status != "partial"
+        || record.operation_outcome.as_deref() != Some("copied_source_delete_failed")
+        || record.operation_phase.as_deref() != Some("delete_uncertain")
+    {
+        return Err("Rename is not eligible for source-delete recovery".to_string());
+    }
+    let cancellation = CancellationToken::new();
+    let (_connection_permit, _global_permit) = acquire_transfer_permits(runtime, &record.connection_id, &cancellation)
+        .await
+        .map_err(|failure| failure.message)?;
+    let _path_locks = runtime.lock_remote_paths(&record.connection_id, &record.remote_path, &record.local_path).await;
+    let record =
+        state.storage.get_file_transfer(transfer_id).await?.ok_or_else(|| "File transfer not found".to_string())?;
+    if record.direction != "rename"
+        || record.status != "partial"
+        || record.operation_outcome.as_deref() != Some("copied_source_delete_failed")
+        || record.operation_phase.as_deref() != Some("delete_uncertain")
+    {
+        return Err("Rename is not eligible for source-delete recovery".to_string());
+    }
+    let expected_revision =
+        record.connection_revision.ok_or_else(|| "Rename recovery has no durable connection revision".to_string())?;
+    let prepared = file_manager
+        .prepare_file_mutation_operation(state, &record.connection_id, &record.remote_path, expected_revision)
+        .await?;
+    let destination = match verify_remote_content(&prepared, &record.local_path, &cancellation).await {
+        Ok(verified) => verified,
+        Err(failure) => {
+            if failure.invalidate_operator {
+                file_manager.evict_revision(&record.connection_id, prepared.revision);
+            }
+            return Err(failure.message);
+        }
+    };
+    let destination_matches = record
+        .destination_fingerprint
+        .as_deref()
+        .is_some_and(|expected| persisted_verified_remote_content_matches(expected, &destination));
+    if !destination_matches {
+        return Err("Destination content or fingerprint changed; source was not deleted".to_string());
+    }
+    if persisted_relay_hash(record.source_fingerprint.as_deref())
+        != persisted_relay_hash(record.destination_fingerprint.as_deref())
+    {
+        return Err("Persisted source and destination content hashes differ; source was not deleted".to_string());
+    }
+    match prepared.fingerprint_remote_file(&record.remote_path).await {
+        Ok(_) => {}
+        Err(error) if error.contains("no longer exists") => {
+            let completed = state.storage.complete_file_rename_retry(transfer_id).await?;
+            emit_transfer(app, &completed);
+            return Ok(completed);
+        }
+        Err(error) => {
+            file_manager.evict_revision(&record.connection_id, prepared.revision);
+            return Err(error);
+        }
+    }
+    let source = match verify_remote_content(&prepared, &record.remote_path, &cancellation).await {
+        Ok(verified) => verified,
+        Err(failure) => {
+            if failure.invalidate_operator {
+                file_manager.evict_revision(&record.connection_id, prepared.revision);
+            }
+            return Err(failure.message);
+        }
+    };
+    let source_matches = record
+        .source_fingerprint
+        .as_deref()
+        .is_some_and(|expected| persisted_verified_remote_content_matches(expected, &source));
+    if !source_matches || source.sha256 != destination.sha256 {
+        return Err("Source content or fingerprint changed; source was not deleted".to_string());
+    }
+    prepared
+        .delete_source_if_fingerprints_match(
+            state,
+            &record.remote_path,
+            &record.local_path,
+            &source.fingerprint,
+            &destination.fingerprint,
+        )
+        .await?;
+    let completed = state.storage.complete_file_rename_retry(transfer_id).await?;
+    emit_transfer(app, &completed);
+    Ok(completed)
 }
 
 async fn cancel_file_transfer_inner<R: Runtime>(
@@ -700,6 +1019,616 @@ async fn run_upload_worker<R: Runtime>(
 
     finalize_upload_result(&app, &state, &transfer_id, result, &progress).await;
     runtime.unregister(&transfer_id);
+}
+
+async fn run_remote_transfer_worker<R: Runtime>(
+    app: AppHandle<R>,
+    transfer_id: String,
+    connection_id: String,
+    cancellation: CancellationToken,
+    operation: &'static str,
+    policy: RemoteMutationPolicy,
+) {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let runtime = app.state::<FileTransferRuntime>();
+    let file_manager = app.state::<FileManagerRuntime>();
+    let progress = Arc::new(TransferProgressSnapshot::new());
+    let result = async {
+        let initial = transfer_record_for_worker(&state, &transfer_id).await.map_err(remote_transfer_before_copy)?;
+        let source_path = initial.remote_path.clone();
+        let destination_path = initial.local_path.clone();
+        let (_connection_permit, _global_permit) = acquire_transfer_permits(&runtime, &connection_id, &cancellation)
+            .await
+            .map_err(remote_transfer_before_copy)?;
+        let _path_locks = tokio::select! {
+            _ = cancellation.cancelled() => return Err(remote_transfer_before_copy(cancelled_failure())),
+            locks = runtime.lock_remote_paths(&connection_id, &source_path, &destination_path) => locks,
+        };
+        let current = transfer_record_for_worker(&state, &transfer_id).await.map_err(remote_transfer_before_copy)?;
+        if current.remote_path != source_path
+            || current.local_path != destination_path
+            || current.direction != operation
+        {
+            return Err(remote_transfer_before_copy(local_failure(
+                "Remote transfer paths or operation changed while queued",
+            )));
+        }
+        let expected_revision = current.connection_revision.ok_or_else(|| {
+            remote_transfer_before_copy(local_failure("Queued remote transfer has no connection revision"))
+        })?;
+        let prepared = tokio::select! {
+            _ = cancellation.cancelled() => return Err(remote_transfer_before_copy(cancelled_failure())),
+            prepared = file_manager.prepare_file_mutation_operation(
+                &state,
+                &connection_id,
+                &source_path,
+                expected_revision,
+            ) => prepared.map_err(remote_failure).map_err(remote_transfer_before_copy)?,
+        };
+        let result = execute_remote_transfer(
+            &app,
+            &state,
+            &runtime,
+            &transfer_id,
+            operation,
+            policy,
+            &source_path,
+            &destination_path,
+            &prepared,
+            &cancellation,
+            progress.clone(),
+        )
+        .await;
+        result.inspect_err(|failure| {
+            if failure.failure.invalidate_operator {
+                file_manager.evict_revision(&connection_id, prepared.revision);
+            }
+        })
+    }
+    .await;
+    finalize_remote_transfer_result(&app, &state, &transfer_id, result, &progress).await;
+    runtime.unregister(&transfer_id);
+}
+
+async fn verify_remote_content(
+    prepared: &PreparedFileMutation<'_>,
+    relative_path: &str,
+    cancellation: &CancellationToken,
+) -> Result<VerifiedRemoteContent, TransferFailure> {
+    let before = prepared.fingerprint_remote_file(relative_path).await.map_err(remote_failure)?;
+    let relative_path = validate_remote_relative_path(relative_path).map_err(local_failure)?;
+    let mut ftp = tokio::time::timeout(IO_PROGRESS_WATCHDOG, prepared.open_exact_ftp_read_session())
+        .await
+        .map_err(|_| remote_failure("Opening the remote verification session timed out"))?
+        .map_err(remote_failure)?;
+    let mut reader = tokio::time::timeout(IO_PROGRESS_WATCHDOG, ftp.retr_as_stream(&relative_path))
+        .await
+        .map_err(|_| remote_failure("Opening the remote verification reader timed out"))?
+        .map_err(|error| remote_failure(prepared.redact_exact_ftp_error(error)))?;
+    let mut buffer = vec![0_u8; REMOTE_COPY_BUFFER_SIZE];
+    let mut bytes_read = 0_u64;
+    let mut hasher = Sha256::new();
+    loop {
+        let count = tokio::select! {
+            _ = cancellation.cancelled() => return Err(cancelled_active_failure()),
+            _ = prepared.cancellation.cancelled() => {
+                return Err(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed during remote content verification".to_string(),
+                    invalidate_operator: true,
+                })
+            },
+            result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, reader.read(&mut buffer)) => {
+                result
+                    .map_err(|_| remote_failure("Remote content verification made no progress before the I/O watchdog expired"))?
+                    .map_err(|error| remote_failure(error.to_string()))?
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        hasher.update(&buffer[..count]);
+    }
+    tokio::time::timeout(IO_PROGRESS_WATCHDOG, ftp.finalize_retr_stream(reader))
+        .await
+        .map_err(|_| remote_failure("Finalizing the remote verification reader timed out"))?
+        .map_err(|error| remote_failure(prepared.redact_exact_ftp_error(error)))?;
+    let _ = ftp.quit().await;
+    let after = prepared.fingerprint_remote_file(&relative_path).await.map_err(remote_failure)?;
+    if before != after || bytes_read != before.size {
+        return Err(remote_failure(
+            "Remote file changed while its content hash was being verified; source deletion was not attempted",
+        ));
+    }
+    Ok(VerifiedRemoteContent { fingerprint: after, sha256: format!("{:x}", hasher.finalize()) })
+}
+
+async fn open_remote_copy_writer(
+    prepared: &PreparedFileMutation<'_>,
+    partial_configured: &str,
+) -> Result<opendal::Writer, TransferFailure> {
+    let writer = tokio::time::timeout(
+        IO_PROGRESS_WATCHDOG,
+        prepared.operator.writer_with(partial_configured).append(true).chunk(REMOTE_COPY_BUFFER_SIZE).concurrent(1),
+    )
+    .await
+    .map_err(|_| remote_failure("Opening the remote copy destination timed out"))?
+    .map_err(|error| remote_failure(error.to_string()))?;
+    #[cfg(test)]
+    if TEST_REMOTE_COPY_WRITER_OPEN_SIDE_EFFECT_FAILURE.swap(false, Ordering::SeqCst) {
+        let mut writer = writer;
+        writer
+            .write(Bytes::from_static(b"injected writer-open side effect"))
+            .await
+            .map_err(|error| remote_failure(error.to_string()))?;
+        writer.close().await.map_err(|error| remote_failure(error.to_string()))?;
+        return Err(remote_failure(
+            "Injected remote copy writer-open failure after creating its operation-owned partial",
+        ));
+    }
+    Ok(writer)
+}
+
+fn injected_remote_copy_persistence_error() -> Option<String> {
+    #[cfg(test)]
+    if TEST_REMOTE_COPY_PERSISTENCE_FAILURE_AFTER_VERIFY.swap(false, Ordering::SeqCst) {
+        return Some("Injected persistence failure after the remote copy partial was verified".to_string());
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_remote_transfer<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    runtime: &FileTransferRuntime,
+    transfer_id: &str,
+    operation: &'static str,
+    policy: RemoteMutationPolicy,
+    source_path: &str,
+    destination_path: &str,
+    prepared: &PreparedFileMutation<'_>,
+    cancellation: &CancellationToken,
+    progress: Arc<TransferProgressSnapshot>,
+) -> Result<RemoteTransferOutcome, RemoteTransferFailure> {
+    let source_before =
+        prepared.stat_remote_file(source_path).await.map_err(remote_failure).map_err(remote_transfer_before_copy)?;
+    let total_bytes = i64::try_from(source_before.size)
+        .map_err(|_| local_failure("Remote source size is not representable"))
+        .map_err(remote_transfer_before_copy)?;
+    progress.record_total(Some(total_bytes));
+    if prepared
+        .remote_entry_exists(destination_path)
+        .await
+        .map_err(remote_failure)
+        .map_err(remote_transfer_before_copy)?
+    {
+        if !policy.replace() {
+            return Err(remote_transfer_before_copy(remote_failure(
+                "Remote destination already exists; best_effort_no_clobber does not replace it",
+            )));
+        }
+        prepared
+            .stat_remote_file(destination_path)
+            .await
+            .map_err(remote_failure)
+            .map_err(remote_transfer_before_copy)?;
+    }
+    let partial_relative = remote_copy_partial_path(destination_path, transfer_id);
+    if prepared
+        .remote_entry_exists(&partial_relative)
+        .await
+        .map_err(remote_failure)
+        .map_err(remote_transfer_before_copy)?
+    {
+        return Err(remote_transfer_before_copy(remote_failure(
+            "Operation-owned remote copy partial unexpectedly already exists",
+        )));
+    }
+    let source_configured =
+        prepared.configured_path(source_path).map_err(local_failure).map_err(remote_transfer_before_copy)?;
+    let partial_configured =
+        prepared.configured_path(&partial_relative).map_err(local_failure).map_err(remote_transfer_before_copy)?;
+    let copying = state
+        .storage
+        .update_file_remote_transfer_phase(
+            transfer_id,
+            "running".to_string(),
+            "copying".to_string(),
+            0,
+            Some(total_bytes),
+            Some(partial_relative.clone()),
+            Some(source_before.encode()),
+            None,
+        )
+        .await
+        .map_err(local_failure)
+        .map_err(remote_transfer_before_copy)?;
+    emit_transfer(app, &copying);
+    if copying.status == "cancelling" || cancellation.is_cancelled() {
+        return Err(remote_transfer_before_copy(cancelled_failure()));
+    }
+
+    let reader = tokio::time::timeout(
+        IO_PROGRESS_WATCHDOG,
+        prepared.operator.reader_with(&source_configured).concurrent(1).chunk(REMOTE_COPY_BUFFER_SIZE),
+    )
+    .await
+    .map_err(|_| remote_failure("Opening the remote copy source timed out"))
+    .and_then(|result| result.map_err(|error| remote_failure(error.to_string())))
+    .map_err(remote_transfer_before_copy)?;
+    let mut reader = reader
+        .into_futures_async_read(..)
+        .await
+        .map_err(|error| remote_transfer_before_copy(remote_failure(error.to_string())))?;
+    let mut writer = match open_remote_copy_writer(prepared, &partial_configured).await {
+        Ok(writer) => writer,
+        Err(failure) => {
+            return Err(cleanup_remote_copy_partial(
+                prepared,
+                &partial_relative,
+                None,
+                failure,
+                Some(source_before.encode()),
+            )
+            .await)
+        }
+    };
+    let mut buffer = vec![0_u8; REMOTE_COPY_BUFFER_SIZE];
+    let mut bytes_transferred = 0_i64;
+    let mut hasher = Sha256::new();
+    let mut last_progress = Instant::now();
+    let body = async {
+        loop {
+            let count = tokio::select! {
+                _ = cancellation.cancelled() => return Err(cancelled_active_failure()),
+                _ = prepared.cancellation.cancelled() => {
+                    return Err(TransferFailure {
+                        status: "cancelled",
+                        message: "The file connection was removed while the remote copy was running".to_string(),
+                        invalidate_operator: true,
+                    })
+                },
+                result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, reader.read(&mut buffer)) => {
+                    result
+                        .map_err(|_| remote_failure("Remote copy read made no progress before the I/O watchdog expired"))?
+                        .map_err(|error| remote_failure(error.to_string()))?
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(cancelled_active_failure()),
+                _ = prepared.cancellation.cancelled() => {
+                    return Err(TransferFailure {
+                        status: "cancelled",
+                        message: "The file connection was removed while the remote copy was running".to_string(),
+                        invalidate_operator: true,
+                    })
+                },
+                result = tokio::time::timeout(
+                    IO_PROGRESS_WATCHDOG,
+                    writer.write(Bytes::copy_from_slice(&buffer[..count])),
+                ) => {
+                    result
+                        .map_err(|_| remote_failure("Remote copy write made no progress before the I/O watchdog expired"))?
+                        .map_err(|error| remote_failure(error.to_string()))?;
+                }
+            }
+            bytes_transferred =
+                bytes_transferred.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
+            progress.record_bytes(bytes_transferred);
+            if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                let update = state
+                    .storage
+                    .update_file_remote_transfer_phase(
+                        transfer_id,
+                        "running".to_string(),
+                        "copying".to_string(),
+                        bytes_transferred,
+                        Some(total_bytes),
+                        Some(partial_relative.clone()),
+                        Some(source_before.encode()),
+                        None,
+                    )
+                    .await
+                    .map_err(local_failure)?;
+                if update.status == "running" && runtime.should_emit_progress() {
+                    emit_transfer(app, &update);
+                }
+                last_progress = Instant::now();
+            }
+        }
+        if bytes_transferred != total_bytes {
+            return Err(remote_failure(format!(
+                "Remote source size changed during copy: expected {total_bytes}, copied {bytes_transferred}"
+            )));
+        }
+        tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.close())
+            .await
+            .map_err(|_| remote_failure("Closing the remote copy destination timed out"))?
+            .map_err(|error| remote_failure(error.to_string()))?;
+        Ok(())
+    }
+    .await;
+    if let Err(failure) = body {
+        return Err(cleanup_remote_copy_partial(prepared, &partial_relative, None, failure, None).await);
+    }
+    wait_at_test_remote_copy_after_close_barrier().await;
+
+    let source_after = match prepared.fingerprint_remote_file(source_path).await {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            return Err(
+                cleanup_remote_copy_partial(prepared, &partial_relative, None, remote_failure(error), None).await
+            )
+        }
+    };
+    let relay_hash = format!("{:x}", hasher.finalize());
+    let partial_verified = match verify_remote_content(prepared, &partial_relative, cancellation).await {
+        Ok(verified) => verified,
+        Err(failure) => {
+            return Err(cleanup_remote_copy_partial(
+                prepared,
+                &partial_relative,
+                None,
+                failure,
+                Some(source_after.encode()),
+            )
+            .await)
+        }
+    };
+    let partial_fingerprint = &partial_verified.fingerprint;
+    if source_after != source_before {
+        return Err(cleanup_remote_copy_partial(
+            prepared,
+            &partial_relative,
+            Some(partial_fingerprint),
+            remote_failure("Remote source changed while it was being copied; the partial was not published"),
+            Some(source_before.encode()),
+        )
+        .await);
+    }
+    if partial_fingerprint.size != source_before.size || partial_verified.sha256 != relay_hash {
+        return Err(remote_partial_failure(
+            format!(
+                "Operation-owned partial content mismatch: expected {} bytes and relay SHA-256 {}, actual {} bytes and SHA-256 {}; partial was preserved",
+                source_before.size, relay_hash, partial_fingerprint.size, partial_verified.sha256
+            ),
+            partial_relative,
+            Some(source_before.encode()),
+            Some(partial_verified.durable_fingerprint()),
+        ));
+    }
+    let source_durable = format!("{};relay_sha256:{relay_hash}", source_after.encode());
+    let partial_durable = partial_verified.durable_fingerprint();
+    let publishing_result = if let Some(error) = injected_remote_copy_persistence_error() {
+        Err(error)
+    } else {
+        state
+            .storage
+            .update_file_remote_transfer_phase(
+                transfer_id,
+                "publishing".to_string(),
+                "copying".to_string(),
+                bytes_transferred,
+                Some(total_bytes),
+                Some(partial_relative.clone()),
+                Some(source_durable.clone()),
+                Some(partial_durable),
+            )
+            .await
+    };
+    let publishing = match publishing_result {
+        Ok(publishing) => publishing,
+        Err(error) => {
+            return Err(cleanup_remote_copy_partial(
+                prepared,
+                &partial_relative,
+                Some(partial_fingerprint),
+                local_failure(error),
+                Some(source_durable),
+            )
+            .await)
+        }
+    };
+    emit_transfer(app, &publishing);
+    if publishing.status == "cancelling" || cancellation.is_cancelled() {
+        return Err(cleanup_remote_copy_partial(
+            prepared,
+            &partial_relative,
+            Some(partial_fingerprint),
+            cancelled_active_failure(),
+            Some(source_durable),
+        )
+        .await);
+    }
+    match prepared
+        .publish_owned_remote_partial(state, &partial_relative, destination_path, total_bytes, policy.replace())
+        .await
+    {
+        Ok(UploadPublishResolution { state: UploadPublishState::Completed, .. }) => {}
+        Ok(UploadPublishResolution { state: UploadPublishState::PartialSource, detail }) => {
+            return Err(cleanup_remote_copy_partial(
+                prepared,
+                &partial_relative,
+                Some(partial_fingerprint),
+                remote_failure(detail),
+                Some(source_durable),
+            )
+            .await)
+        }
+        Ok(UploadPublishResolution { state: UploadPublishState::PartialTarget, detail }) => {
+            return Err(remote_partial_failure(detail, destination_path.to_string(), Some(source_durable), None))
+        }
+        Ok(UploadPublishResolution { state: UploadPublishState::Unknown, detail }) => {
+            return Err(RemoteTransferFailure {
+                failure: partial_failure(detail),
+                operation_outcome: "failed_with_partial_destination",
+                operation_phase: "copying",
+                partial_destination: None,
+                source_fingerprint: Some(source_durable),
+                destination_fingerprint: None,
+            })
+        }
+        Err(error) => {
+            return Err(cleanup_remote_copy_partial(
+                prepared,
+                &partial_relative,
+                Some(partial_fingerprint),
+                remote_failure(error),
+                Some(source_durable),
+            )
+            .await)
+        }
+    }
+    let destination_verified =
+        verify_remote_content(prepared, destination_path, cancellation).await.map_err(|failure| {
+            RemoteTransferFailure {
+                failure: TransferFailure { status: "partial", ..failure },
+                operation_outcome: "failed_with_partial_destination",
+                operation_phase: "copying",
+                partial_destination: Some(destination_path.to_string()),
+                source_fingerprint: Some(source_durable.clone()),
+                destination_fingerprint: None,
+            }
+        })?;
+    let destination_durable = destination_verified.durable_fingerprint();
+    if destination_verified.fingerprint.size != source_before.size || destination_verified.sha256 != relay_hash {
+        return Err(remote_partial_failure(
+            "Published destination content does not match the relayed source; source deletion was not attempted"
+                .to_string(),
+            destination_path.to_string(),
+            Some(source_durable),
+            Some(destination_durable),
+        ));
+    }
+    if operation == "copy" {
+        return Ok(RemoteTransferOutcome {
+            bytes_transferred,
+            total_bytes,
+            operation_outcome: "completed",
+            operation_phase: "completed",
+            source_fingerprint: source_durable,
+            destination_fingerprint: destination_durable,
+        });
+    }
+
+    let published = state
+        .storage
+        .update_file_remote_transfer_phase(
+            transfer_id,
+            "publishing".to_string(),
+            "published_before_delete".to_string(),
+            bytes_transferred,
+            Some(total_bytes),
+            None,
+            Some(source_durable.clone()),
+            Some(destination_durable.clone()),
+        )
+        .await
+        .map_err(local_failure)
+        .map_err(|failure| RemoteTransferFailure {
+            failure,
+            operation_outcome: "copied_source_delete_failed",
+            operation_phase: "published_before_delete",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_durable.clone()),
+            destination_fingerprint: Some(destination_durable.clone()),
+        })?;
+    emit_transfer(app, &published);
+    wait_at_test_remote_rename_after_publish_barrier().await;
+    let source_verified =
+        verify_remote_content(prepared, source_path, cancellation).await.map_err(|failure| RemoteTransferFailure {
+            failure: TransferFailure { status: "partial", ..failure },
+            operation_outcome: "copied_source_delete_failed",
+            operation_phase: "published_before_delete",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_durable.clone()),
+            destination_fingerprint: Some(destination_durable.clone()),
+        })?;
+    let destination_reverified =
+        verify_remote_content(prepared, destination_path, cancellation).await.map_err(|failure| {
+            RemoteTransferFailure {
+                failure: TransferFailure { status: "partial", ..failure },
+                operation_outcome: "copied_source_delete_failed",
+                operation_phase: "published_before_delete",
+                partial_destination: Some(destination_path.to_string()),
+                source_fingerprint: Some(source_verified.durable_fingerprint()),
+                destination_fingerprint: Some(destination_durable.clone()),
+            }
+        })?;
+    let source_verified_durable = source_verified.durable_fingerprint();
+    let destination_verified_durable = destination_reverified.durable_fingerprint();
+    if source_verified.fingerprint != source_after
+        || destination_reverified.fingerprint != destination_verified.fingerprint
+        || source_verified.sha256 != relay_hash
+        || destination_reverified.sha256 != relay_hash
+        || source_verified.sha256 != destination_reverified.sha256
+    {
+        return Err(RemoteTransferFailure {
+            failure: partial_failure(
+                "Current source or destination content no longer matches the relayed copy; source deletion was not attempted",
+            ),
+            operation_outcome: "copied_source_delete_failed",
+            operation_phase: "published_before_delete",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_verified_durable),
+            destination_fingerprint: Some(destination_verified_durable),
+        });
+    }
+    state
+        .storage
+        .update_file_remote_transfer_phase(
+            transfer_id,
+            "publishing".to_string(),
+            "delete_uncertain".to_string(),
+            bytes_transferred,
+            Some(total_bytes),
+            None,
+            Some(source_verified_durable.clone()),
+            Some(destination_verified_durable.clone()),
+        )
+        .await
+        .map_err(local_failure)
+        .map_err(|failure| RemoteTransferFailure {
+            failure,
+            operation_outcome: "copied_source_delete_failed",
+            operation_phase: "published_before_delete",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_verified_durable.clone()),
+            destination_fingerprint: Some(destination_verified_durable.clone()),
+        })?;
+    if let Err(error) = prepared
+        .delete_source_if_fingerprints_match(
+            state,
+            source_path,
+            destination_path,
+            &source_verified.fingerprint,
+            &destination_reverified.fingerprint,
+        )
+        .await
+    {
+        return Err(RemoteTransferFailure {
+            failure: partial_failure(error),
+            operation_outcome: "copied_source_delete_failed",
+            operation_phase: "delete_uncertain",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_verified_durable),
+            destination_fingerprint: Some(destination_verified_durable),
+        });
+    }
+    Ok(RemoteTransferOutcome {
+        bytes_transferred,
+        total_bytes,
+        operation_outcome: "completed",
+        operation_phase: "completed",
+        source_fingerprint: source_verified_durable,
+        destination_fingerprint: destination_verified_durable,
+    })
 }
 
 struct UploadExecutionContext<'a, 'runtime, R: Runtime> {
@@ -1231,6 +2160,146 @@ async fn finalize_upload_result<R: Runtime>(
     }
 }
 
+async fn finalize_remote_transfer_result<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    transfer_id: &str,
+    result: Result<RemoteTransferOutcome, RemoteTransferFailure>,
+    progress: &TransferProgressSnapshot,
+) {
+    let latest = state.storage.get_file_transfer(transfer_id).await.ok().flatten();
+    let (
+        status,
+        bytes_transferred,
+        total_bytes,
+        error,
+        partial_destination,
+        operation_outcome,
+        operation_phase,
+        source_fingerprint,
+        destination_fingerprint,
+    ) = match result {
+        Ok(outcome) => (
+            "completed",
+            outcome.bytes_transferred,
+            Some(outcome.total_bytes),
+            None,
+            None,
+            outcome.operation_outcome,
+            outcome.operation_phase,
+            Some(outcome.source_fingerprint),
+            Some(outcome.destination_fingerprint),
+        ),
+        Err(remote) => (
+            remote.failure.status,
+            progress.bytes().max(latest.as_ref().map_or(0, |record| record.bytes_transferred)),
+            progress.total().or_else(|| latest.as_ref().and_then(|record| record.total_bytes)),
+            Some(sanitize_error(&remote.failure.message)),
+            remote.partial_destination,
+            remote.operation_outcome,
+            remote.operation_phase,
+            remote.source_fingerprint.or_else(|| latest.as_ref().and_then(|record| record.source_fingerprint.clone())),
+            remote
+                .destination_fingerprint
+                .or_else(|| latest.as_ref().and_then(|record| record.destination_fingerprint.clone())),
+        ),
+    };
+    match state
+        .storage
+        .finish_file_remote_transfer(
+            transfer_id,
+            status.to_string(),
+            bytes_transferred,
+            total_bytes,
+            error,
+            partial_destination,
+            operation_outcome.to_string(),
+            operation_phase.to_string(),
+            source_fingerprint,
+            destination_fingerprint,
+        )
+        .await
+    {
+        Ok(record) => emit_transfer(app, &record),
+        Err(error) => log::error!("Failed to persist terminal remote transfer state: {error}"),
+    }
+}
+
+fn remote_transfer_before_copy(failure: TransferFailure) -> RemoteTransferFailure {
+    RemoteTransferFailure {
+        failure,
+        operation_outcome: "failed_before_copy",
+        operation_phase: "queued",
+        partial_destination: None,
+        source_fingerprint: None,
+        destination_fingerprint: None,
+    }
+}
+
+fn remote_partial_failure(
+    message: impl ToString,
+    partial_destination: String,
+    source_fingerprint: Option<String>,
+    destination_fingerprint: Option<String>,
+) -> RemoteTransferFailure {
+    RemoteTransferFailure {
+        failure: partial_failure(message),
+        operation_outcome: "failed_with_partial_destination",
+        operation_phase: "copying",
+        partial_destination: Some(partial_destination),
+        source_fingerprint,
+        destination_fingerprint,
+    }
+}
+
+async fn cleanup_remote_copy_partial(
+    prepared: &PreparedFileMutation<'_>,
+    partial_path: &str,
+    expected_fingerprint: Option<&RemoteFileFingerprint>,
+    failure: TransferFailure,
+    source_fingerprint: Option<String>,
+) -> RemoteTransferFailure {
+    let current = prepared.fingerprint_remote_file(partial_path).await;
+    match current {
+        Ok(current) if expected_fingerprint.is_some_and(|expected| expected != &current) => remote_partial_failure(
+            format!("{}; operation-owned partial fingerprint changed and was preserved", failure.message),
+            partial_path.to_string(),
+            source_fingerprint,
+            Some(current.encode()),
+        ),
+        Ok(_) => match prepared.delete_owned_remote_partial(partial_path).await {
+            Ok(()) => RemoteTransferFailure {
+                failure,
+                operation_outcome: "failed_before_copy",
+                operation_phase: "copying",
+                partial_destination: None,
+                source_fingerprint,
+                destination_fingerprint: None,
+            },
+            Err(error) => remote_partial_failure(
+                format!("{}; operation-owned partial cleanup failed safely: {error}", failure.message),
+                partial_path.to_string(),
+                source_fingerprint,
+                expected_fingerprint.map(RemoteFileFingerprint::encode),
+            ),
+        },
+        Err(error) if error.contains("no longer exists") => RemoteTransferFailure {
+            failure,
+            operation_outcome: "failed_before_copy",
+            operation_phase: "copying",
+            partial_destination: None,
+            source_fingerprint,
+            destination_fingerprint: None,
+        },
+        Err(error) => remote_partial_failure(
+            format!("{}; partial ownership verification failed safely: {error}", failure.message),
+            partial_path.to_string(),
+            source_fingerprint,
+            expected_fingerprint.map(RemoteFileFingerprint::encode),
+        ),
+    }
+}
+
 impl From<TransferFailure> for UploadFailure {
     fn from(failure: TransferFailure) -> Self {
         Self { failure, partial_destination: None, abort_outcome: None, publish_outcome: None }
@@ -1240,6 +2309,11 @@ impl From<TransferFailure> for UploadFailure {
 fn upload_partial_path(remote_path: &str, transfer_id: &str) -> String {
     let name = format!(".dbx-upload-{transfer_id}-{}.part", Uuid::new_v4());
     remote_path.rsplit_once('/').map_or(name.clone(), |(parent, _)| format!("{parent}/{name}"))
+}
+
+fn remote_copy_partial_path(destination_path: &str, transfer_id: &str) -> String {
+    let name = format!(".dbx-copy-{transfer_id}-{}.part", Uuid::new_v4());
+    destination_path.rsplit_once('/').map_or(name.clone(), |(parent, _)| format!("{parent}/{name}"))
 }
 
 fn sibling_remote_path(final_path: &str, sibling_relative: &str) -> String {
@@ -1654,6 +2728,53 @@ async fn wait_at_test_upload_after_close_barrier() {
 
 #[cfg(not(test))]
 async fn wait_at_test_upload_after_close_barrier() {}
+
+#[cfg(test)]
+fn install_test_remote_copy_after_close_barrier() -> TestRemoteReaderBarrier {
+    install_test_async_barrier(&TEST_REMOTE_COPY_AFTER_CLOSE_BARRIER)
+}
+
+#[cfg(test)]
+async fn wait_at_test_remote_copy_after_close_barrier() {
+    wait_at_test_async_barrier(&TEST_REMOTE_COPY_AFTER_CLOSE_BARRIER).await;
+}
+
+#[cfg(not(test))]
+async fn wait_at_test_remote_copy_after_close_barrier() {}
+
+#[cfg(test)]
+fn install_test_remote_rename_after_publish_barrier() -> TestRemoteReaderBarrier {
+    install_test_async_barrier(&TEST_REMOTE_RENAME_AFTER_PUBLISH_BARRIER)
+}
+
+#[cfg(test)]
+async fn wait_at_test_remote_rename_after_publish_barrier() {
+    wait_at_test_async_barrier(&TEST_REMOTE_RENAME_AFTER_PUBLISH_BARRIER).await;
+}
+
+#[cfg(not(test))]
+async fn wait_at_test_remote_rename_after_publish_barrier() {}
+
+#[cfg(test)]
+fn install_test_async_barrier(
+    slot: &std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>>,
+) -> TestRemoteReaderBarrier {
+    let barrier = TestRemoteReaderBarrier {
+        opened: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *slot.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner()) = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn wait_at_test_async_barrier(slot: &std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>>) {
+    let barrier = slot.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner()).take();
+    if let Some(barrier) = barrier {
+        barrier.opened.notify_one();
+        barrier.release.notified().await;
+    }
+}
 
 #[cfg(test)]
 fn install_test_blocking_barrier(
@@ -2392,6 +3513,134 @@ async fn recover_interrupted_transfer(
             .await?;
         return Ok(());
     }
+    if matches!(transfer.direction.as_str(), "copy" | "rename") {
+        let phase = transfer.operation_phase.as_deref().unwrap_or("queued");
+        if transfer.direction == "rename" && matches!(phase, "published_before_delete" | "delete_uncertain") {
+            let expected_revision = transfer
+                .connection_revision
+                .ok_or_else(|| "Interrupted rename has no durable connection revision".to_string())?;
+            let prepared = file_manager
+                .prepare_file_mutation_operation(
+                    state,
+                    &transfer.connection_id,
+                    &transfer.remote_path,
+                    expected_revision,
+                )
+                .await?;
+            let source = prepared.fingerprint_remote_file(&transfer.remote_path).await;
+            let destination = prepared.fingerprint_remote_file(&transfer.local_path).await;
+            let relay_hashes_match = persisted_relay_hash(transfer.source_fingerprint.as_deref())
+                == persisted_relay_hash(transfer.destination_fingerprint.as_deref());
+            let destination_matches = relay_hashes_match
+                && destination.as_ref().is_ok_and(|fingerprint| {
+                    transfer
+                        .destination_fingerprint
+                        .as_deref()
+                        .is_some_and(|expected| persisted_remote_fingerprint_matches(expected, fingerprint))
+                });
+            let source_matches = relay_hashes_match
+                && source.as_ref().is_ok_and(|fingerprint| {
+                    transfer
+                        .source_fingerprint
+                        .as_deref()
+                        .is_some_and(|expected| persisted_remote_fingerprint_matches(expected, fingerprint))
+                });
+            let source_missing = source.as_ref().is_err_and(|error| error.contains("no longer exists"));
+            let mut destination_verification_error = None;
+            let destination_content_matches = if source_missing && destination_matches {
+                let cancellation = CancellationToken::new();
+                match verify_remote_content(&prepared, &transfer.local_path, &cancellation).await {
+                    Ok(verified) => transfer
+                        .destination_fingerprint
+                        .as_deref()
+                        .is_some_and(|expected| persisted_verified_remote_content_matches(expected, &verified)),
+                    Err(failure) => {
+                        if failure.invalidate_operator {
+                            file_manager.evict_revision(&transfer.connection_id, prepared.revision);
+                        }
+                        destination_verification_error = Some(failure.message);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            let (status, outcome, terminal_phase, error) = if source_missing && destination_content_matches {
+                ("completed", "completed", "completed", None)
+            } else {
+                let detail = if let Some(error) = destination_verification_error {
+                    format!(
+                        "Interrupted rename destination content could not be verified; completion was refused: {error}"
+                    )
+                } else if source_missing && destination_matches {
+                    "Interrupted rename destination content no longer matches the durable copy; completion was refused"
+                        .to_string()
+                } else if source_matches && destination_matches {
+                    "Rename copy was published before exit; source deletion requires explicit fingerprint-checked retry"
+                        .to_string()
+                } else {
+                    "Interrupted rename fingerprints no longer match; source was not deleted".to_string()
+                };
+                ("partial", "copied_source_delete_failed", "delete_uncertain", Some(detail))
+            };
+            state
+                .storage
+                .finish_file_remote_transfer(
+                    &transfer.id,
+                    status.to_string(),
+                    transfer.bytes_transferred,
+                    transfer.total_bytes,
+                    error,
+                    (status == "partial").then(|| transfer.local_path.clone()),
+                    outcome.to_string(),
+                    terminal_phase.to_string(),
+                    transfer.source_fingerprint.clone(),
+                    transfer.destination_fingerprint.clone(),
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let owned_partial = transfer
+            .temp_path
+            .as_deref()
+            .filter(|path| is_owned_remote_copy_partial(transfer, path))
+            .map(str::to_string);
+        let partial_destination =
+            owned_partial.or_else(|| (transfer.status == "publishing").then(|| transfer.local_path.clone()));
+        let (status, outcome, error) = if let Some(path) = partial_destination.as_ref() {
+            (
+                "partial",
+                "failed_with_partial_destination",
+                format!(
+                    "The application exited during remote {}; the operation-owned or published destination was preserved at {path}",
+                    transfer.direction
+                ),
+            )
+        } else {
+            (
+                "failed",
+                "failed_before_copy",
+                format!("The application exited before remote {} published a destination", transfer.direction),
+            )
+        };
+        state
+            .storage
+            .finish_file_remote_transfer(
+                &transfer.id,
+                status.to_string(),
+                transfer.bytes_transferred,
+                transfer.total_bytes,
+                Some(error),
+                partial_destination,
+                outcome.to_string(),
+                phase.to_string(),
+                transfer.source_fingerprint.clone(),
+                transfer.destination_fingerprint.clone(),
+            )
+            .await?;
+        return Ok(());
+    }
     let Some(temp_path) = transfer.temp_path.as_deref() else {
         if transfer.status == "publishing" {
             state
@@ -2530,6 +3779,38 @@ fn is_owned_upload_partial(transfer: &FileTransferStorageRecord, partial_path: &
     }
     let name = partial_path.rsplit('/').next().unwrap_or(partial_path);
     name.starts_with(&format!(".dbx-upload-{}-", transfer.id)) && name.ends_with(".part")
+}
+
+fn is_owned_remote_copy_partial(transfer: &FileTransferStorageRecord, partial_path: &str) -> bool {
+    if !matches!(transfer.direction.as_str(), "copy" | "rename") {
+        return false;
+    }
+    let target_parent = transfer.local_path.rsplit_once('/').map(|(parent, _)| parent);
+    let partial_parent = partial_path.rsplit_once('/').map(|(parent, _)| parent);
+    if target_parent != partial_parent {
+        return false;
+    }
+    let name = partial_path.rsplit('/').next().unwrap_or(partial_path);
+    name.starts_with(&format!(".dbx-copy-{}-", transfer.id)) && name.ends_with(".part")
+}
+
+fn persisted_remote_fingerprint_matches(persisted: &str, observed: &RemoteFileFingerprint) -> bool {
+    let Some((remote, relay_hash)) = persisted.rsplit_once(";relay_sha256:") else {
+        return false;
+    };
+    remote == observed.encode() && relay_hash.len() == 64 && relay_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn persisted_verified_remote_content_matches(persisted: &str, observed: &VerifiedRemoteContent) -> bool {
+    persisted_remote_fingerprint_matches(persisted, &observed.fingerprint)
+        && persisted_relay_hash(Some(persisted)) == Some(observed.sha256.as_str())
+}
+
+fn persisted_relay_hash(persisted: Option<&str>) -> Option<&str> {
+    persisted
+        .and_then(|fingerprint| fingerprint.rsplit_once(";relay_sha256:"))
+        .map(|(_, relay_hash)| relay_hash)
+        .filter(|relay_hash| relay_hash.len() == 64 && relay_hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn is_owned_temp_path(transfer: &FileTransferStorageRecord, temp_path: &Path) -> bool {
@@ -2687,6 +3968,80 @@ mod tests {
         false_atomic_claim["policy"]["atomicNoClobber"] = serde_json::json!(true);
         let parsed: StartUploadInput = serde_json::from_value(false_atomic_claim).unwrap();
         assert!(parsed.policy.validate().unwrap_err().contains("atomicNoClobber=false"));
+    }
+
+    #[test]
+    fn remote_mutation_input_rejects_cross_connection_fields_and_unconfirmed_replace() {
+        let valid = serde_json::json!({
+            "connectionId": "ftp-1",
+            "sourcePath": "source.bin",
+            "destinationPath": "destination.bin",
+            "policy": {
+                "mode": "best_effort_no_clobber",
+                "atomicNoClobber": false,
+                "externalToctouRisk": true
+            }
+        });
+        let parsed: StartRemoteTransferInput = serde_json::from_value(valid.clone()).unwrap();
+        parsed.policy.validate().unwrap();
+
+        let mut cross_connection = valid.clone();
+        cross_connection["destinationConnectionId"] = serde_json::json!("ftp-2");
+        assert!(serde_json::from_value::<StartRemoteTransferInput>(cross_connection).is_err());
+
+        let mut unknown_policy = valid.clone();
+        unknown_policy["policy"]["overwrite"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<StartRemoteTransferInput>(unknown_policy).is_err());
+
+        let mut missing_policy = valid.clone();
+        missing_policy.as_object_mut().unwrap().remove("policy");
+        assert!(serde_json::from_value::<StartRemoteTransferInput>(missing_policy).is_err());
+
+        let mut replace = valid;
+        replace["policy"] = serde_json::json!({"mode": "replace", "confirmed": false});
+        let parsed: StartRemoteTransferInput = serde_json::from_value(replace.clone()).unwrap();
+        assert!(parsed.policy.validate().unwrap_err().contains("explicit confirmation"));
+        replace["policy"]["confirmed"] = serde_json::json!(true);
+        serde_json::from_value::<StartRemoteTransferInput>(replace).unwrap().policy.validate().unwrap();
+    }
+
+    #[test]
+    fn persisted_remote_fingerprint_requires_exact_remote_fields_and_relay_hash() {
+        let observed = RemoteFileFingerprint { size: 16, modified: "2026-07-25T00:00:00Z".to_string() };
+        let hash = "a".repeat(64);
+        let persisted = format!("{};relay_sha256:{hash}", observed.encode());
+        assert!(persisted_remote_fingerprint_matches(&persisted, &observed));
+        assert_eq!(persisted_relay_hash(Some(&persisted)), Some(hash.as_str()));
+        assert!(!persisted_remote_fingerprint_matches(
+            &format!("{}0;relay_sha256:{hash}", observed.encode()),
+            &observed
+        ));
+        assert!(!persisted_remote_fingerprint_matches(&observed.encode(), &observed));
+        assert!(!persisted_remote_fingerprint_matches(&format!("{};relay_sha256:short", observed.encode()), &observed));
+    }
+
+    #[tokio::test]
+    async fn remote_path_locks_serialize_reversed_pairs_and_prune_registry() {
+        let runtime = Arc::new(FileTransferRuntime::default());
+        let first = runtime.lock_remote_paths("ftp-1", "source.bin", "destination.bin").await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let second_runtime = runtime.clone();
+        let second = tokio::spawn(async move {
+            entered_tx.send(()).unwrap();
+            second_runtime.lock_remote_paths("ftp-1", "destination.bin", "source.bin").await
+        });
+        entered_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished(), "reversed source/destination paths must use the same locks");
+
+        drop(first);
+        let second = tokio::time::timeout(Duration::from_secs(1), second).await.unwrap().unwrap();
+        drop(second);
+        assert!(runtime.path_locks.lock().unwrap().is_empty());
+
+        let same_path = runtime.lock_remote_paths("ftp-1", "same.bin", "same.bin").await;
+        drop(same_path);
+        assert!(runtime.path_locks.lock().unwrap().is_empty());
     }
 
     impl AsyncWrite for DiskFullAfterFirstWrite {
@@ -3296,6 +4651,10 @@ mod tests {
             partial_destination: None,
             abort_outcome: None,
             publish_outcome: None,
+            operation_outcome: None,
+            operation_phase: None,
+            source_fingerprint: None,
+            destination_fingerprint: None,
             status: "running".to_string(),
             bytes_transferred: 10,
             total_bytes: Some(20),
@@ -3308,6 +4667,20 @@ mod tests {
         assert!(is_owned_temp_path(&transfer, &owned));
         assert!(!is_owned_temp_path(&transfer, &target.parent().unwrap().join(".dbx-download-other-random.part")));
         assert!(!is_owned_temp_path(&transfer, &target.parent().unwrap().join("../outside.part")));
+
+        let remote_copy = FileTransferStorageRecord {
+            direction: "copy".to_string(),
+            remote_path: "reports/source.csv".to_string(),
+            local_path: "reports/final.csv".to_string(),
+            ..transfer
+        };
+        assert!(is_owned_remote_copy_partial(&remote_copy, "reports/.dbx-copy-transfer-1-random.part"));
+        assert!(!is_owned_remote_copy_partial(&remote_copy, "other/.dbx-copy-transfer-1-random.part"));
+        assert!(!is_owned_remote_copy_partial(&remote_copy, "reports/.dbx-copy-someone-else-random.part"));
+        assert!(!is_owned_remote_copy_partial(
+            &FileTransferStorageRecord { direction: "download".to_string(), ..remote_copy.clone() },
+            "reports/.dbx-copy-transfer-1-random.part"
+        ));
     }
 
     #[tokio::test]
@@ -4073,6 +5446,16 @@ mod tests {
         assert!(output.stdout.is_empty(), "residual remote partial: {}", String::from_utf8_lossy(&output.stdout));
     }
 
+    fn assert_no_remote_copy_partial(container: &str, transfer_id: &str) {
+        let prefix = format!(".dbx-copy-{transfer_id}-");
+        let output = Command::new("docker")
+            .args(["exec", container, "find", "/ftp/dbx", "-type", "f", "-name", &format!("{prefix}*.part"), "-print"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "docker find failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.stdout.is_empty(), "residual remote partial: {}", String::from_utf8_lossy(&output.stdout));
+    }
+
     async fn build_ftp_contract_app(
     ) -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, opendal::Operator, tempfile::TempDir, String) {
         use super::super::file_manager::{build_operator, password_scope, FileConnectionConfig, FtpConnectionConfig};
@@ -4108,6 +5491,562 @@ mod tests {
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
         (app, state, operator, directory, container)
+    }
+
+    async fn create_remote_worker_transfer<R: Runtime>(
+        app: &tauri::App<R>,
+        transfer_id: &str,
+        operation: &'static str,
+        source_path: &str,
+        destination_path: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let state = app.state::<Arc<AppState>>();
+        state
+            .storage
+            .create_file_remote_transfer(
+                transfer_id.to_string(),
+                "ftp-contract".into(),
+                operation.to_string(),
+                source_path.to_string(),
+                destination_path.to_string(),
+                1,
+            )
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        app.state::<FileTransferRuntime>().register(
+            transfer_id.to_string(),
+            "ftp-contract".into(),
+            cancellation.clone(),
+        );
+        let app_handle = app.handle().clone();
+        let transfer_id = transfer_id.to_string();
+        tokio::spawn(async move {
+            run_remote_transfer_worker(
+                app_handle,
+                transfer_id,
+                "ftp-contract".into(),
+                cancellation,
+                operation,
+                RemoteMutationPolicy::BestEffortNoClobber { atomic_no_clobber: false, external_toctou_risk: true },
+            )
+            .await;
+        })
+    }
+
+    async fn write_ftp_contract_fixture(operator: &opendal::Operator, path: &str, payload: &[u8], replace: bool) {
+        if replace {
+            operator.delete(path).await.unwrap();
+        }
+        let mut writer =
+            operator.writer_with(path).append(true).chunk(REMOTE_COPY_BUFFER_SIZE).concurrent(1).await.unwrap();
+        writer.write(Bytes::copy_from_slice(payload)).await.unwrap();
+        writer.close().await.unwrap();
+    }
+
+    fn rewrite_ftp_fixture_preserving_mtime(container: &str, path: &str, payload: &str) {
+        let output = Command::new("docker")
+            .args([
+                "exec",
+                container,
+                "sh",
+                "-c",
+                r#"
+                    set -eu
+                    path="$1"
+                    payload="$2"
+                    reference="/tmp/dbx-mtime-$$"
+                    cp -p "$path" "$reference"
+                    printf '%s' "$payload" > "$path"
+                    touch -r "$reference" "$path"
+                    rm -f "$reference"
+                "#,
+                "sh",
+                path,
+                payload,
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "FTP fixture rewrite failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/ftp-contract.sh with a pinned FTP image"]
+    async fn fixed_ftp_copy_rename_contract() {
+        let (app, state, operator, _directory, container) = build_ftp_contract_app().await;
+
+        let copy_worker =
+            create_remote_worker_transfer(&app, "ftp-copy-success", "copy", "fixture.txt", "copy-success.txt").await;
+        copy_worker.await.unwrap();
+        let copy = state.storage.get_file_transfer("ftp-copy-success").await.unwrap().unwrap();
+        assert_eq!(copy.status, "completed", "{copy:?}");
+        assert_eq!(copy.operation_outcome.as_deref(), Some("completed"));
+        assert_eq!(operator.read("ftp/dbx/copy-success.txt").await.unwrap().to_vec(), b"dbx ftp fixture\n");
+        assert!(operator.stat("ftp/dbx/fixture.txt").await.is_ok());
+        assert!(copy.source_fingerprint.as_deref().is_some_and(|value| value.contains("relay_sha256:")));
+        assert!(copy.destination_fingerprint.as_deref().is_some_and(|value| value.contains("relay_sha256:")));
+        assert_no_remote_copy_partial(&container, "ftp-copy-success");
+
+        TEST_REMOTE_COPY_WRITER_OPEN_SIDE_EFFECT_FAILURE.store(true, Ordering::SeqCst);
+        let writer_open_worker = create_remote_worker_transfer(
+            &app,
+            "ftp-copy-writer-open-side-effect",
+            "copy",
+            "fixture.txt",
+            "writer-open-side-effect.txt",
+        )
+        .await;
+        writer_open_worker.await.unwrap();
+        let writer_open = state.storage.get_file_transfer("ftp-copy-writer-open-side-effect").await.unwrap().unwrap();
+        assert_eq!(writer_open.operation_outcome.as_deref(), Some("failed_before_copy"), "{writer_open:?}");
+        assert_eq!(writer_open.partial_destination, None);
+        assert_no_remote_copy_partial(&container, "ftp-copy-writer-open-side-effect");
+
+        TEST_REMOTE_COPY_PERSISTENCE_FAILURE_AFTER_VERIFY.store(true, Ordering::SeqCst);
+        let persistence_worker = create_remote_worker_transfer(
+            &app,
+            "ftp-copy-persistence-failure",
+            "copy",
+            "fixture.txt",
+            "persistence-failure.txt",
+        )
+        .await;
+        persistence_worker.await.unwrap();
+        let persistence = state.storage.get_file_transfer("ftp-copy-persistence-failure").await.unwrap().unwrap();
+        assert_eq!(persistence.operation_outcome.as_deref(), Some("failed_before_copy"), "{persistence:?}");
+        assert_eq!(persistence.partial_destination, None);
+        assert_no_remote_copy_partial(&container, "ftp-copy-persistence-failure");
+
+        write_ftp_contract_fixture(&operator, "ftp/dbx/existing.txt", b"existing", false).await;
+        let existing_worker =
+            create_remote_worker_transfer(&app, "ftp-copy-existing", "copy", "fixture.txt", "existing.txt").await;
+        existing_worker.await.unwrap();
+        let existing = state.storage.get_file_transfer("ftp-copy-existing").await.unwrap().unwrap();
+        assert_eq!(existing.operation_outcome.as_deref(), Some("failed_before_copy"));
+        assert_eq!(operator.read("ftp/dbx/existing.txt").await.unwrap().to_vec(), b"existing");
+
+        let target_race = install_test_remote_copy_after_close_barrier();
+        let target_race_worker =
+            create_remote_worker_transfer(&app, "ftp-copy-target-race", "copy", "fixture.txt", "target-race.txt").await;
+        tokio::time::timeout(Duration::from_secs(10), target_race.opened.notified()).await.unwrap();
+        write_ftp_contract_fixture(&operator, "ftp/dbx/target-race.txt", b"external writer", false).await;
+        target_race.release.notify_one();
+        target_race_worker.await.unwrap();
+        let raced = state.storage.get_file_transfer("ftp-copy-target-race").await.unwrap().unwrap();
+        assert_eq!(raced.operation_outcome.as_deref(), Some("failed_before_copy"), "{raced:?}");
+        assert_eq!(operator.read("ftp/dbx/target-race.txt").await.unwrap().to_vec(), b"external writer");
+        assert_no_remote_copy_partial(&container, "ftp-copy-target-race");
+
+        write_ftp_contract_fixture(&operator, "ftp/dbx/source-mutation.txt", b"original source", false).await;
+        let source_race = install_test_remote_copy_after_close_barrier();
+        let source_race_worker = create_remote_worker_transfer(
+            &app,
+            "ftp-copy-source-race",
+            "copy",
+            "source-mutation.txt",
+            "source-mutation-copy.txt",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), source_race.opened.notified()).await.unwrap();
+        write_ftp_contract_fixture(&operator, "ftp/dbx/source-mutation.txt", b"changed and longer source", true).await;
+        source_race.release.notify_one();
+        source_race_worker.await.unwrap();
+        let source_changed = state.storage.get_file_transfer("ftp-copy-source-race").await.unwrap().unwrap();
+        assert_eq!(source_changed.operation_outcome.as_deref(), Some("failed_before_copy"), "{source_changed:?}");
+        assert_eq!(
+            operator.stat("ftp/dbx/source-mutation-copy.txt").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert_no_remote_copy_partial(&container, "ftp-copy-source-race");
+
+        let mismatch_barrier = install_test_remote_copy_after_close_barrier();
+        let mismatch_worker =
+            create_remote_worker_transfer(&app, "ftp-copy-mismatch", "copy", "fixture.txt", "mismatch.txt").await;
+        tokio::time::timeout(Duration::from_secs(10), mismatch_barrier.opened.notified()).await.unwrap();
+        let copying = state.storage.get_file_transfer("ftp-copy-mismatch").await.unwrap().unwrap();
+        let mismatch_partial = copying.temp_path.clone().expect("copying phase persists its partial path");
+        write_ftp_contract_fixture(
+            &operator,
+            &format!("ftp/dbx/{mismatch_partial}"),
+            b"externally replaced mismatched partial",
+            true,
+        )
+        .await;
+        mismatch_barrier.release.notify_one();
+        mismatch_worker.await.unwrap();
+        let mismatch = state.storage.get_file_transfer("ftp-copy-mismatch").await.unwrap().unwrap();
+        assert_eq!(mismatch.operation_outcome.as_deref(), Some("failed_with_partial_destination"), "{mismatch:?}");
+        assert_eq!(mismatch.partial_destination.as_deref(), Some(mismatch_partial.as_str()));
+        assert_eq!(
+            operator.read(&format!("ftp/dbx/{mismatch_partial}")).await.unwrap().to_vec(),
+            b"externally replaced mismatched partial"
+        );
+
+        write_ftp_contract_fixture(&operator, "ftp/dbx/rename-source.txt", b"rename payload", false).await;
+        let rename_worker = create_remote_worker_transfer(
+            &app,
+            "ftp-rename-success",
+            "rename",
+            "rename-source.txt",
+            "rename-destination.txt",
+        )
+        .await;
+        rename_worker.await.unwrap();
+        let rename = state.storage.get_file_transfer("ftp-rename-success").await.unwrap().unwrap();
+        assert_eq!(rename.operation_outcome.as_deref(), Some("completed"), "{rename:?}");
+        assert_eq!(operator.stat("ftp/dbx/rename-source.txt").await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        assert_eq!(operator.read("ftp/dbx/rename-destination.txt").await.unwrap().to_vec(), b"rename payload");
+
+        write_ftp_contract_fixture(&operator, "ftp/dbx/rehash-source.txt", b"source-original!!", false).await;
+        let source_rehash_barrier = install_test_remote_rename_after_publish_barrier();
+        let source_rehash_worker = create_remote_worker_transfer(
+            &app,
+            "ftp-rename-source-rehash",
+            "rename",
+            "rehash-source.txt",
+            "rehash-source-destination.txt",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), source_rehash_barrier.opened.notified()).await.unwrap();
+        rewrite_ftp_fixture_preserving_mtime(&container, "/ftp/dbx/rehash-source.txt", "source-replaced!!");
+        source_rehash_barrier.release.notify_one();
+        source_rehash_worker.await.unwrap();
+        let source_rehash = state.storage.get_file_transfer("ftp-rename-source-rehash").await.unwrap().unwrap();
+        assert_eq!(
+            source_rehash.operation_outcome.as_deref(),
+            Some("copied_source_delete_failed"),
+            "{source_rehash:?}"
+        );
+        assert_eq!(source_rehash.operation_phase.as_deref(), Some("published_before_delete"));
+        assert!(operator.stat("ftp/dbx/rehash-source.txt").await.is_ok(), "source must not be deleted");
+
+        write_ftp_contract_fixture(&operator, "ftp/dbx/rehash-destination-source.txt", b"source-original!!", false)
+            .await;
+        let destination_rehash_barrier = install_test_remote_rename_after_publish_barrier();
+        let destination_rehash_worker = create_remote_worker_transfer(
+            &app,
+            "ftp-rename-destination-rehash",
+            "rename",
+            "rehash-destination-source.txt",
+            "rehash-destination.txt",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), destination_rehash_barrier.opened.notified()).await.unwrap();
+        rewrite_ftp_fixture_preserving_mtime(&container, "/ftp/dbx/rehash-destination.txt", "target-replaced!!");
+        destination_rehash_barrier.release.notify_one();
+        destination_rehash_worker.await.unwrap();
+        let destination_rehash =
+            state.storage.get_file_transfer("ftp-rename-destination-rehash").await.unwrap().unwrap();
+        assert_eq!(
+            destination_rehash.operation_outcome.as_deref(),
+            Some("copied_source_delete_failed"),
+            "{destination_rehash:?}"
+        );
+        assert_eq!(destination_rehash.operation_phase.as_deref(), Some("published_before_delete"));
+        assert!(operator.stat("ftp/dbx/rehash-destination-source.txt").await.is_ok(), "source must not be deleted");
+
+        write_ftp_contract_fixture(&operator, "ftp/dbx/delete-failure-source.txt", b"delete failure payload", false)
+            .await;
+        let delete_barrier = install_test_remote_rename_after_publish_barrier();
+        let delete_worker = create_remote_worker_transfer(
+            &app,
+            "ftp-rename-delete-failure",
+            "rename",
+            "delete-failure-source.txt",
+            "delete-failure-destination.txt",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), delete_barrier.opened.notified()).await.unwrap();
+        assert!(Command::new("docker")
+            .args(["exec", &container, "chmod", "0555", "/ftp/dbx"])
+            .status()
+            .unwrap()
+            .success());
+        delete_barrier.release.notify_one();
+        delete_worker.await.unwrap();
+        assert!(Command::new("docker")
+            .args(["exec", &container, "chmod", "0775", "/ftp/dbx"])
+            .status()
+            .unwrap()
+            .success());
+        let delete_failed = state.storage.get_file_transfer("ftp-rename-delete-failure").await.unwrap().unwrap();
+        assert_eq!(
+            delete_failed.operation_outcome.as_deref(),
+            Some("copied_source_delete_failed"),
+            "{delete_failed:?}"
+        );
+        assert!(operator.stat("ftp/dbx/delete-failure-source.txt").await.is_ok());
+        assert!(operator.stat("ftp/dbx/delete-failure-destination.txt").await.is_ok());
+        rewrite_ftp_fixture_preserving_mtime(
+            &container,
+            "/ftp/dbx/delete-failure-destination.txt",
+            "target failure payload",
+        );
+        let destination_retry_error = retry_file_rename_source_delete_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "ftp-rename-delete-failure",
+        )
+        .await
+        .unwrap_err();
+        assert!(destination_retry_error.contains("Destination content"), "{destination_retry_error}");
+        assert!(operator.stat("ftp/dbx/delete-failure-source.txt").await.is_ok());
+        rewrite_ftp_fixture_preserving_mtime(
+            &container,
+            "/ftp/dbx/delete-failure-destination.txt",
+            "delete failure payload",
+        );
+        rewrite_ftp_fixture_preserving_mtime(
+            &container,
+            "/ftp/dbx/delete-failure-source.txt",
+            "source failure payload",
+        );
+        let source_retry_error = retry_file_rename_source_delete_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "ftp-rename-delete-failure",
+        )
+        .await
+        .unwrap_err();
+        assert!(source_retry_error.contains("Source content"), "{source_retry_error}");
+        assert!(operator.stat("ftp/dbx/delete-failure-source.txt").await.is_ok());
+        rewrite_ftp_fixture_preserving_mtime(
+            &container,
+            "/ftp/dbx/delete-failure-source.txt",
+            "delete failure payload",
+        );
+        let recovered = retry_file_rename_source_delete_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "ftp-rename-delete-failure",
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.operation_outcome.as_deref(), Some("completed"));
+        assert_eq!(
+            operator.stat("ftp/dbx/delete-failure-source.txt").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+
+        let recovery_connection = state.storage.load_file_connection("ftp-contract").await.unwrap().unwrap();
+        state
+            .storage
+            .create_file_remote_transfer(
+                "ftp-recovery-queued".into(),
+                "ftp-contract".into(),
+                "copy".into(),
+                "fixture.txt".into(),
+                "recovery-queued.txt".into(),
+                recovery_connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .create_file_remote_transfer(
+                "ftp-recovery-copying".into(),
+                "ftp-contract".into(),
+                "copy".into(),
+                "fixture.txt".into(),
+                "recovery-copying.txt".into(),
+                recovery_connection.revision,
+            )
+            .await
+            .unwrap();
+        let recovery_partial = ".dbx-copy-ftp-recovery-copying-random.part";
+        state
+            .storage
+            .update_file_remote_transfer_phase(
+                "ftp-recovery-copying",
+                "running".into(),
+                "copying".into(),
+                4,
+                Some(16),
+                Some(recovery_partial.into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        write_ftp_contract_fixture(&operator, "ftp/dbx/recovery-published-source.txt", b"recovery-payload", false)
+            .await;
+        write_ftp_contract_fixture(&operator, "ftp/dbx/recovery-published-destination.txt", b"recovery-payload", false)
+            .await;
+        write_ftp_contract_fixture(&operator, "ftp/dbx/recovery-uncertain-source.txt", b"recovery-payload", false)
+            .await;
+        write_ftp_contract_fixture(&operator, "ftp/dbx/recovery-uncertain-destination.txt", b"recovery-payload", false)
+            .await;
+        write_ftp_contract_fixture(&operator, "ftp/dbx/recovery-mismatch-source.txt", b"recovery-payload", false).await;
+        write_ftp_contract_fixture(&operator, "ftp/dbx/recovery-mismatch-destination.txt", b"recovery-payload", false)
+            .await;
+        let recovery_file_manager = app.state::<FileManagerRuntime>();
+        let recovery_prepared = recovery_file_manager
+            .prepare_file_mutation_operation(
+                &state,
+                "ftp-contract",
+                "recovery-published-source.txt",
+                recovery_connection.revision,
+            )
+            .await
+            .unwrap();
+        let recovery_cancellation = CancellationToken::new();
+        let published_source =
+            verify_remote_content(&recovery_prepared, "recovery-published-source.txt", &recovery_cancellation)
+                .await
+                .unwrap();
+        let published_destination =
+            verify_remote_content(&recovery_prepared, "recovery-published-destination.txt", &recovery_cancellation)
+                .await
+                .unwrap();
+        let uncertain_source =
+            verify_remote_content(&recovery_prepared, "recovery-uncertain-source.txt", &recovery_cancellation)
+                .await
+                .unwrap();
+        let uncertain_destination =
+            verify_remote_content(&recovery_prepared, "recovery-uncertain-destination.txt", &recovery_cancellation)
+                .await
+                .unwrap();
+        let mismatch_source =
+            verify_remote_content(&recovery_prepared, "recovery-mismatch-source.txt", &recovery_cancellation)
+                .await
+                .unwrap();
+        let mismatch_destination =
+            verify_remote_content(&recovery_prepared, "recovery-mismatch-destination.txt", &recovery_cancellation)
+                .await
+                .unwrap();
+        state
+            .storage
+            .create_file_remote_transfer(
+                "ftp-recovery-published".into(),
+                "ftp-contract".into(),
+                "rename".into(),
+                "recovery-published-source.txt".into(),
+                "recovery-published-destination.txt".into(),
+                recovery_connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_remote_transfer_phase(
+                "ftp-recovery-published",
+                "publishing".into(),
+                "published_before_delete".into(),
+                16,
+                Some(16),
+                None,
+                Some(published_source.durable_fingerprint()),
+                Some(published_destination.durable_fingerprint()),
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .create_file_remote_transfer(
+                "ftp-recovery-uncertain".into(),
+                "ftp-contract".into(),
+                "rename".into(),
+                "recovery-uncertain-source.txt".into(),
+                "recovery-uncertain-destination.txt".into(),
+                recovery_connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_remote_transfer_phase(
+                "ftp-recovery-uncertain",
+                "publishing".into(),
+                "delete_uncertain".into(),
+                16,
+                Some(16),
+                None,
+                Some(uncertain_source.durable_fingerprint()),
+                Some(uncertain_destination.durable_fingerprint()),
+            )
+            .await
+            .unwrap();
+        operator.delete("ftp/dbx/recovery-uncertain-source.txt").await.unwrap();
+        state
+            .storage
+            .create_file_remote_transfer(
+                "ftp-recovery-mismatch".into(),
+                "ftp-contract".into(),
+                "rename".into(),
+                "recovery-mismatch-source.txt".into(),
+                "recovery-mismatch-destination.txt".into(),
+                recovery_connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_remote_transfer_phase(
+                "ftp-recovery-mismatch",
+                "publishing".into(),
+                "delete_uncertain".into(),
+                16,
+                Some(16),
+                None,
+                Some(mismatch_source.durable_fingerprint()),
+                Some(mismatch_destination.durable_fingerprint()),
+            )
+            .await
+            .unwrap();
+        operator.delete("ftp/dbx/recovery-mismatch-source.txt").await.unwrap();
+        rewrite_ftp_fixture_preserving_mtime(
+            &container,
+            "/ftp/dbx/recovery-mismatch-destination.txt",
+            "recovery-mutated",
+        );
+
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        let recovery_ids = [
+            "ftp-recovery-queued",
+            "ftp-recovery-copying",
+            "ftp-recovery-published",
+            "ftp-recovery-uncertain",
+            "ftp-recovery-mismatch",
+        ];
+        for recovery_id in recovery_ids {
+            let transfer = interrupted.iter().find(|transfer| transfer.id == recovery_id).unwrap();
+            assert!(
+                matches!(transfer.status.as_str(), "queued" | "running" | "publishing"),
+                "protocol recovery must receive the active durable state: {transfer:?}"
+            );
+            recover_interrupted_transfer(&state, app.state::<FileManagerRuntime>().inner(), transfer).await.unwrap();
+        }
+        let recovered_queued = state.storage.get_file_transfer("ftp-recovery-queued").await.unwrap().unwrap();
+        assert_eq!(recovered_queued.status, "failed");
+        assert_eq!(recovered_queued.operation_outcome.as_deref(), Some("failed_before_copy"));
+        assert_eq!(recovered_queued.operation_phase.as_deref(), Some("queued"));
+        assert_eq!(recovered_queued.partial_destination, None);
+        let recovered_copying = state.storage.get_file_transfer("ftp-recovery-copying").await.unwrap().unwrap();
+        assert_eq!(recovered_copying.status, "partial");
+        assert_eq!(recovered_copying.operation_outcome.as_deref(), Some("failed_with_partial_destination"));
+        assert_eq!(recovered_copying.operation_phase.as_deref(), Some("copying"));
+        assert_eq!(recovered_copying.partial_destination.as_deref(), Some(recovery_partial));
+        let recovered_published = state.storage.get_file_transfer("ftp-recovery-published").await.unwrap().unwrap();
+        assert_eq!(recovered_published.status, "partial");
+        assert_eq!(recovered_published.operation_outcome.as_deref(), Some("copied_source_delete_failed"));
+        assert_eq!(recovered_published.operation_phase.as_deref(), Some("delete_uncertain"));
+        assert_eq!(recovered_published.partial_destination.as_deref(), Some("recovery-published-destination.txt"));
+        let recovered_uncertain = state.storage.get_file_transfer("ftp-recovery-uncertain").await.unwrap().unwrap();
+        assert_eq!(recovered_uncertain.status, "completed");
+        assert_eq!(recovered_uncertain.operation_outcome.as_deref(), Some("completed"));
+        assert_eq!(recovered_uncertain.operation_phase.as_deref(), Some("completed"));
+        let recovered_mismatch = state.storage.get_file_transfer("ftp-recovery-mismatch").await.unwrap().unwrap();
+        assert_eq!(recovered_mismatch.status, "partial");
+        assert_eq!(recovered_mismatch.operation_outcome.as_deref(), Some("copied_source_delete_failed"));
+        assert_eq!(recovered_mismatch.operation_phase.as_deref(), Some("delete_uncertain"));
+        assert_eq!(recovered_mismatch.partial_destination.as_deref(), Some("recovery-mismatch-destination.txt"));
     }
 
     #[tokio::test]

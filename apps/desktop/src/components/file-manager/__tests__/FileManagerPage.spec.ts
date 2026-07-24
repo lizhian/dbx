@@ -21,7 +21,10 @@ const mocks = vi.hoisted(() => ({
   saveDialog: vi.fn(),
   saveFileConnection: vi.fn(),
   startFileDownload: vi.fn(),
+  startFileCopy: vi.fn(),
+  startFileRename: vi.fn(),
   startFileUpload: vi.fn(),
+  retryFileRenameSourceDelete: vi.fn(),
   statFileEntry: vi.fn(),
   testFileConnection: vi.fn(),
   toast: vi.fn(),
@@ -47,13 +50,16 @@ vi.mock("@lucide/vue", async (importOriginal) => {
     ...actual,
     AlertTriangle: Icon,
     CheckCircle2: Icon,
+    Copy: Icon,
     Download: Icon,
     File: Icon,
+    FilePenLine: Icon,
     Folder: Icon,
     Loader2: Icon,
     Pencil: Icon,
     Plus: Icon,
     RefreshCcw: Icon,
+    RotateCcw: Icon,
     Server: Icon,
     Trash2: Icon,
     X: Icon,
@@ -86,7 +92,10 @@ vi.mock("@/lib/backend/api", () => ({
   listenFileTransferProgress: mocks.listenFileTransferProgress,
   saveFileConnection: mocks.saveFileConnection,
   startFileDownload: mocks.startFileDownload,
+  startFileCopy: mocks.startFileCopy,
+  startFileRename: mocks.startFileRename,
   startFileUpload: mocks.startFileUpload,
+  retryFileRenameSourceDelete: mocks.retryFileRenameSourceDelete,
   statFileEntry: mocks.statFileEntry,
   testFileConnection: mocks.testFileConnection,
 }));
@@ -407,5 +416,105 @@ describe("FileManagerPage transfer lifecycle", () => {
 
     await vi.waitFor(() => expect(mocks.confirmUploadRisk).toHaveBeenCalledOnce());
     expect(mocks.startFileUpload).not.toHaveBeenCalled();
+  });
+
+  it("starts same-connection copy with the explicit best-effort policy", async () => {
+    const running = transfer("copy", "running", {
+      direction: "copy",
+      remotePath: remoteEntry.path,
+      localPath: "copied.bin",
+    });
+    mocks.startFileCopy.mockResolvedValue({ transferId: running.id });
+    mocks.getFileTransfer.mockResolvedValue(running);
+
+    await mountPage();
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.copy: remote.bin"]')?.click();
+    await nextTick();
+
+    const submit = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+      .filter((button) => button.textContent?.trim() === "fileManager.copy")
+      .at(-1);
+    submit?.click();
+
+    await vi.waitFor(() =>
+      expect(mocks.startFileCopy).toHaveBeenCalledWith({
+        connectionId: connection.id,
+        sourcePath: remoteEntry.path,
+        destinationPath: "a%2Fb copy",
+        policy: {
+          mode: "best_effort_no_clobber",
+          atomicNoClobber: false,
+          externalToctouRisk: true,
+        },
+      }),
+    );
+    await vi.waitFor(() => expect(root?.textContent).toContain("fileManager.transferCopying"));
+  });
+
+  it("requires a second explicit confirmation before replace", async () => {
+    mocks.confirmUploadRisk.mockReturnValue(false);
+
+    await mountPage();
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.rename: remote.bin"]')?.click();
+    await nextTick();
+
+    root?.querySelector<HTMLInputElement>('input[type="checkbox"]')?.click();
+    const submit = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+      .filter((button) => button.textContent?.trim() === "fileManager.rename")
+      .at(-1);
+    submit?.click();
+
+    await vi.waitFor(() => expect(mocks.confirmUploadRisk).toHaveBeenCalledOnce());
+    expect(mocks.startFileRename).not.toHaveBeenCalled();
+  });
+
+  it("shows copied_source_delete_failed and exposes fingerprint-checked recovery", async () => {
+    const partial = transfer("rename-partial", "partial", {
+      direction: "rename",
+      remotePath: "source.bin",
+      localPath: "destination.bin",
+      operationOutcome: "copied_source_delete_failed",
+      operationPhase: "delete_uncertain",
+      partialDestination: "destination.bin",
+      error: "source delete response was not observed",
+    });
+    const completed = {
+      ...partial,
+      status: "completed" as const,
+      operationOutcome: "completed" as const,
+      operationPhase: "completed" as const,
+      partialDestination: null,
+      error: null,
+    };
+    mocks.listFileTransfers.mockResolvedValue([partial]);
+    mocks.retryFileRenameSourceDelete.mockResolvedValue(completed);
+
+    await mountPage();
+
+    expect(root?.textContent).toContain("copied_source_delete_failed");
+    expect(root?.textContent).toContain("source.bin -> destination.bin");
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.retrySourceDelete"]')?.click();
+
+    await vi.waitFor(() => expect(mocks.retryFileRenameSourceDelete).toHaveBeenCalledWith(partial.id));
+    await vi.waitFor(() => expect(root?.textContent).toContain("fileManager.transferCompleted"));
+    expect(root?.textContent).toContain("fileManager.operationOutcome: completed");
+  });
+
+  it("does not offer source deletion retry before delete_uncertain", async () => {
+    mocks.listFileTransfers.mockResolvedValue([
+      transfer("rename-published", "partial", {
+        direction: "rename",
+        remotePath: "source.bin",
+        localPath: "destination.bin",
+        operationOutcome: "copied_source_delete_failed",
+        operationPhase: "published_before_delete",
+        partialDestination: "destination.bin",
+      }),
+    ]);
+
+    await mountPage();
+
+    expect(root?.textContent).toContain("source.bin -> destination.bin");
+    expect(root?.querySelector('button[aria-label="fileManager.retrySourceDelete"]')).toBeNull();
   });
 });

@@ -127,6 +127,18 @@ pub(super) struct UploadPublishResolution {
     pub detail: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RemoteFileFingerprint {
+    pub size: u64,
+    pub modified: String,
+}
+
+impl RemoteFileFingerprint {
+    pub(super) fn encode(&self) -> String {
+        format!("size:{};modified:{}", self.size, self.modified)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UploadConflictMode {
@@ -780,6 +792,10 @@ impl PreparedFileMutation<'_> {
     }
 
     pub(super) async fn delete_owned_upload_partial(&self, path: &str) -> Result<(), String> {
+        self.delete_owned_remote_partial(path).await
+    }
+
+    pub(super) async fn delete_owned_remote_partial(&self, path: &str) -> Result<(), String> {
         let path = RemotePath::parse(path)?;
         let _mutation_guard = self.mutation_lock.lock().await;
         delete_ftp_file_if_exists(&self.config, &path, self.password.as_deref()).await
@@ -850,6 +866,156 @@ impl PreparedFileMutation<'_> {
                 .await
             }
         }
+    }
+
+    pub(super) fn configured_path(&self, relative_path: &str) -> Result<String, String> {
+        let relative_path = validate_remote_relative_path(relative_path)?;
+        Ok(configured_entry_path(&self.config, &relative_path, false))
+    }
+
+    pub(super) async fn stat_remote_file(&self, relative_path: &str) -> Result<RemoteFileFingerprint, String> {
+        let relative_path = validate_remote_relative_path(relative_path)?;
+        let metadata =
+            stat_remote_metadata(&self.operator, &self.config, &relative_path, self.password.as_deref()).await?;
+        if !metadata.mode().is_file() {
+            return Err("Unsupported: directory copy and rename are not available in v1".to_string());
+        }
+        self.fingerprint_remote_file(relative_path.as_str()).await
+    }
+
+    pub(super) async fn remote_entry_exists(&self, relative_path: &str) -> Result<bool, String> {
+        let relative_path = validate_remote_relative_path(relative_path)?;
+        match stat_remote_metadata_once(&self.operator, &self.config, &relative_path).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(redact_error(error.to_string(), self.password.as_deref())),
+        }
+    }
+
+    pub(super) async fn fingerprint_remote_file(&self, relative_path: &str) -> Result<RemoteFileFingerprint, String> {
+        let path = RemotePath::parse(relative_path)?;
+        let FileConnectionConfig::Ftp(config) = &self.config;
+        let mut ftp = open_ftp_root_session(config, self.password.as_deref()).await?;
+        let fingerprint = ftp_file_fingerprint_in_session(&mut ftp, &path, self.password.as_deref()).await?;
+        let _ = ftp.quit().await;
+        fingerprint.ok_or_else(|| "Remote file no longer exists".to_string())
+    }
+
+    pub(super) async fn open_exact_ftp_read_session(&self) -> Result<AsyncFtpStream, String> {
+        let FileConnectionConfig::Ftp(config) = &self.config;
+        open_ftp_root_session(config, self.password.as_deref()).await
+    }
+
+    pub(super) fn redact_exact_ftp_error(&self, error: FtpError) -> String {
+        redact_ftp_error(error, self.password.as_deref())
+    }
+
+    pub(super) async fn publish_owned_remote_partial(
+        &self,
+        state: &AppState,
+        partial_path: &str,
+        target_path: &str,
+        expected_size: i64,
+        replace: bool,
+    ) -> Result<UploadPublishResolution, String> {
+        let partial = RemotePath::parse(partial_path)?;
+        let target = RemotePath::parse(target_path)?;
+        let expected_size = usize::try_from(expected_size)
+            .map_err(|_| "Remote copy size is not representable by the FTP client".to_string())?;
+        let _mutation_guard = tokio::select! {
+            _ = self.cancellation.cancelled() => {
+                return Err("The file connection was removed before remote copy publish".to_string())
+            },
+            guard = self.mutation_lock.lock() => guard,
+        };
+        self.cancellation.ensure_active()?;
+        let current = state
+            .storage
+            .load_file_connection(&self.connection_id)
+            .await?
+            .ok_or_else(|| "File connection not found".to_string())?;
+        if current.revision != self.revision || current.config_json != self.config_json {
+            return Err("File connection revision changed before remote copy publish".to_string());
+        }
+        let mutation = tokio::time::timeout(
+            MUTATION_TIMEOUT,
+            rename_ftp_file_exact_with_replace(
+                &self.config,
+                &partial,
+                &target,
+                expected_size,
+                self.password.as_deref(),
+                replace,
+                "Remote copy publish",
+            ),
+        )
+        .await;
+        match mutation {
+            Ok(Ok(())) => Ok(UploadPublishResolution {
+                state: UploadPublishState::Completed,
+                detail: "Remote copy publish rename completed and was verified".to_string(),
+            }),
+            Ok(Err(error)) => {
+                reconcile_ftp_upload_publish(
+                    &self.config,
+                    &partial,
+                    &target,
+                    expected_size,
+                    self.password.as_deref(),
+                    error,
+                )
+                .await
+            }
+            Err(_) => {
+                reconcile_ftp_upload_publish(
+                    &self.config,
+                    &partial,
+                    &target,
+                    expected_size,
+                    self.password.as_deref(),
+                    "Remote copy publish rename timed out; mutation response was not observed".to_string(),
+                )
+                .await
+            }
+        }
+    }
+
+    pub(super) async fn delete_source_if_fingerprints_match(
+        &self,
+        state: &AppState,
+        source_path: &str,
+        destination_path: &str,
+        expected_source: &RemoteFileFingerprint,
+        expected_destination: &RemoteFileFingerprint,
+    ) -> Result<(), String> {
+        let source = RemotePath::parse(source_path)?;
+        let destination = RemotePath::parse(destination_path)?;
+        let _mutation_guard = self.mutation_lock.lock().await;
+        self.cancellation.ensure_active()?;
+        let current = state
+            .storage
+            .load_file_connection(&self.connection_id)
+            .await?
+            .ok_or_else(|| "File connection not found".to_string())?;
+        if current.revision != self.revision || current.config_json != self.config_json {
+            return Err("File connection revision changed before rename source deletion".to_string());
+        }
+        let FileConnectionConfig::Ftp(config) = &self.config;
+        let mut ftp = open_ftp_root_session(config, self.password.as_deref()).await?;
+        let current_source = ftp_file_fingerprint_in_session(&mut ftp, &source, self.password.as_deref()).await?;
+        let current_destination =
+            ftp_file_fingerprint_in_session(&mut ftp, &destination, self.password.as_deref()).await?;
+        if current_source.as_ref() != Some(expected_source)
+            || current_destination.as_ref() != Some(expected_destination)
+        {
+            let _ = ftp.quit().await;
+            return Err("Source or destination fingerprint changed; source deletion was not attempted".to_string());
+        }
+        let result = ftp.rm(source.as_str()).await.map_err(|error| {
+            format!("Copied source could not be deleted: {}", redact_ftp_error(error, self.password.as_deref()))
+        });
+        let _ = ftp.quit().await;
+        result
     }
 }
 
@@ -1196,26 +1362,39 @@ async fn rename_ftp_file_exact(
     expected_size: usize,
     password: Option<&str>,
 ) -> Result<(), String> {
+    rename_ftp_file_exact_with_replace(config, source, target, expected_size, password, false, "Upload publish").await
+}
+
+async fn rename_ftp_file_exact_with_replace(
+    config: &FileConnectionConfig,
+    source: &RemotePath,
+    target: &RemotePath,
+    expected_size: usize,
+    password: Option<&str>,
+    replace: bool,
+    operation: &str,
+) -> Result<(), String> {
     let FileConnectionConfig::Ftp(config) = config;
     let mut ftp = open_ftp_root_session(config, password).await?;
-    if ftp_file_size_if_exists(&mut ftp, target)
-        .await
-        .map_err(|error| format!("Upload publish target preflight failed: {}", redact_ftp_error(error, password)))?
-        .is_some()
+    if !replace
+        && ftp_file_size_if_exists(&mut ftp, target)
+            .await
+            .map_err(|error| format!("{operation} target preflight failed: {}", redact_ftp_error(error, password)))?
+            .is_some()
     {
         let _ = ftp.quit().await;
-        return Err("Remote upload destination already exists".to_string());
+        return Err("Remote destination already exists".to_string());
     }
     let source_size = ftp_file_size_if_exists(&mut ftp, source)
         .await
-        .map_err(|error| format!("Upload partial preflight failed: {}", redact_ftp_error(error, password)))?;
+        .map_err(|error| format!("{operation} partial preflight failed: {}", redact_ftp_error(error, password)))?;
     let Some(source_size) = source_size else {
         let _ = ftp.quit().await;
-        return Err("Operation-owned upload partial is missing".to_string());
+        return Err("Operation-owned remote partial is missing".to_string());
     };
     if source_size != expected_size {
         let _ = ftp.quit().await;
-        return Err("Operation-owned upload partial size does not match the validated source".to_string());
+        return Err("Operation-owned remote partial size does not match the validated source".to_string());
     }
 
     let mutation = ftp.rename(source.as_str(), target.as_str()).await;
@@ -1229,7 +1408,7 @@ async fn rename_ftp_file_exact(
     }
     if let Err(error) = mutation {
         let _ = ftp.quit().await;
-        return Err(format!("Upload publish rename failed: {}", redact_ftp_error(error, password)));
+        return Err(format!("{operation} rename failed: {}", redact_ftp_error(error, password)));
     }
 
     match verify_ftp_rename_in_session(&mut ftp, config, source, target, expected_size).await {
@@ -1250,6 +1429,34 @@ async fn rename_ftp_file_exact(
             Err(format!("Upload publish verification failed: {}", redact_ftp_error(error, password)))
         }
     }
+}
+
+async fn ftp_file_fingerprint_in_session(
+    ftp: &mut AsyncFtpStream,
+    path: &RemotePath,
+    password: Option<&str>,
+) -> Result<Option<RemoteFileFingerprint>, String> {
+    let Some(size) = ftp_file_size_if_exists(ftp, path)
+        .await
+        .map_err(|error| format!("Remote file size check failed: {}", redact_ftp_error(error, password)))?
+    else {
+        return Ok(None);
+    };
+    let modified = ftp
+        .mdtm(path.as_str())
+        .await
+        .map_err(|error| {
+            format!(
+                "FTP server must support MDTM for safe copy/rename fingerprint checks: {}",
+                redact_ftp_error(error, password)
+            )
+        })?
+        .and_utc()
+        .to_rfc3339();
+    Ok(Some(RemoteFileFingerprint {
+        size: u64::try_from(size).map_err(|_| "Remote file size is not representable".to_string())?,
+        modified,
+    }))
 }
 
 async fn verify_ftp_rename_in_session(

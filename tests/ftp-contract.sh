@@ -207,6 +207,9 @@ run_contract "fixed_ftp_download_contract"
 start_ftp "upload"
 run_contract "fixed_ftp_upload_contract"
 
+start_ftp "copy-rename"
+run_contract "fixed_ftp_copy_rename_contract"
+
 start_ftp "upload-queued-revision"
 start_secondary_ftp
 run_dual_service_contract "fixed_ftp_upload_queued_revision_contract"

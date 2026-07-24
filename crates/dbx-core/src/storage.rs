@@ -143,6 +143,12 @@ pub struct FileTransferStorageRecord {
     pub partial_destination: Option<String>,
     pub abort_outcome: Option<String>,
     pub publish_outcome: Option<String>,
+    pub operation_outcome: Option<String>,
+    pub operation_phase: Option<String>,
+    #[serde(skip_serializing)]
+    pub source_fingerprint: Option<String>,
+    #[serde(skip_serializing)]
+    pub destination_fingerprint: Option<String>,
     pub status: String,
     pub bytes_transferred: i64,
     pub total_bytes: Option<i64>,
@@ -334,6 +340,10 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         partial_destination TEXT,
         abort_outcome TEXT,
         publish_outcome TEXT,
+        operation_outcome TEXT,
+        operation_phase TEXT,
+        source_fingerprint TEXT,
+        destination_fingerprint TEXT,
         status TEXT NOT NULL,
         bytes_transferred INTEGER NOT NULL DEFAULT 0,
         total_bytes INTEGER,
@@ -771,6 +781,30 @@ impl Storage {
         .await
     }
 
+    pub async fn create_file_remote_transfer(
+        &self,
+        id: String,
+        connection_id: String,
+        operation: String,
+        source_path: String,
+        destination_path: String,
+        connection_revision: i64,
+    ) -> Result<FileTransferStorageRecord, String> {
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO file_transfers (
+                    id, connection_id, direction, remote_path, local_path,
+                    connection_revision, operation_phase, status, bytes_transferred, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', 'queued', 0, ?7, ?7)",
+                params![id, connection_id, operation, source_path, destination_path, connection_revision, now],
+            )
+            .map_err(|error| error.to_string())?;
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
     pub async fn start_file_upload_transfer(
         &self,
         id: &str,
@@ -916,6 +950,118 @@ impl Storage {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_file_remote_transfer(
+        &self,
+        id: &str,
+        status: String,
+        bytes_transferred: i64,
+        total_bytes: Option<i64>,
+        error: Option<String>,
+        partial_destination: Option<String>,
+        operation_outcome: String,
+        operation_phase: String,
+        source_fingerprint: Option<String>,
+        destination_fingerprint: Option<String>,
+    ) -> Result<FileTransferStorageRecord, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE file_transfers
+                 SET status = ?2, bytes_transferred = ?3, total_bytes = ?4,
+                     error = ?5, partial_destination = ?6, operation_outcome = ?7,
+                     operation_phase = ?8, source_fingerprint = ?9, destination_fingerprint = ?10,
+                     updated_at = ?11, completed_at = ?11
+                 WHERE id = ?1
+                   AND status IN ('queued', 'running', 'cancelling', 'publishing')",
+                params![
+                    id,
+                    status,
+                    bytes_transferred,
+                    total_bytes,
+                    error,
+                    partial_destination,
+                    operation_outcome,
+                    operation_phase,
+                    source_fingerprint,
+                    destination_fingerprint,
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_file_remote_transfer_phase(
+        &self,
+        id: &str,
+        status: String,
+        operation_phase: String,
+        bytes_transferred: i64,
+        total_bytes: Option<i64>,
+        temp_path: Option<String>,
+        source_fingerprint: Option<String>,
+        destination_fingerprint: Option<String>,
+    ) -> Result<FileTransferStorageRecord, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE file_transfers
+                 SET status = CASE WHEN status = 'cancelling' THEN status ELSE ?2 END,
+                     operation_phase = ?3, bytes_transferred = ?4, total_bytes = ?5,
+                     temp_path = ?6, source_fingerprint = ?7, destination_fingerprint = ?8,
+                     updated_at = ?9
+                 WHERE id = ?1
+                   AND status IN ('queued', 'running', 'cancelling', 'publishing')",
+                params![
+                    id,
+                    status,
+                    operation_phase,
+                    bytes_transferred,
+                    total_bytes,
+                    temp_path,
+                    source_fingerprint,
+                    destination_fingerprint,
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
+    pub async fn complete_file_rename_retry(&self, id: &str) -> Result<FileTransferStorageRecord, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let changed = conn
+                .execute(
+                    "UPDATE file_transfers
+                     SET status = 'completed', operation_outcome = 'completed',
+                         operation_phase = 'completed', error = NULL,
+                         partial_destination = NULL, updated_at = ?2, completed_at = ?2
+                     WHERE id = ?1
+                       AND direction = 'rename'
+                       AND status = 'partial'
+                       AND operation_outcome = 'copied_source_delete_failed'
+                       AND operation_phase = 'delete_uncertain'",
+                    params![id, now],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("Rename is not eligible for source-delete recovery".to_string());
+            }
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
     pub async fn get_file_transfer(&self, id: &str) -> Result<Option<FileTransferStorageRecord>, String> {
         let id = id.to_string();
         self.with_conn(move |conn| {
@@ -971,7 +1117,7 @@ impl Storage {
                      error = 'The application exited before the transfer completed',
                      updated_at = ?1,
                      completed_at = ?1
-                 WHERE direction != 'upload'
+                 WHERE direction NOT IN ('upload', 'copy', 'rename')
                    AND status IN ('queued', 'running', 'cancelling')",
                 [&now],
             )
@@ -986,8 +1132,9 @@ impl Storage {
 const FILE_TRANSFER_SELECT: &str = "SELECT
     id, connection_id, direction, remote_path, local_path, local_directory_identity,
     temp_path, temp_identity, connection_revision, partial_destination,
-    abort_outcome, publish_outcome, status,
-    bytes_transferred, total_bytes, error, created_at, updated_at, completed_at
+    abort_outcome, publish_outcome, operation_outcome, operation_phase,
+    source_fingerprint, destination_fingerprint, status, bytes_transferred,
+    total_bytes, error, created_at, updated_at, completed_at
     FROM file_transfers";
 
 fn map_file_transfer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTransferStorageRecord> {
@@ -1004,13 +1151,17 @@ fn map_file_transfer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTransf
         partial_destination: row.get(9)?,
         abort_outcome: row.get(10)?,
         publish_outcome: row.get(11)?,
-        status: row.get(12)?,
-        bytes_transferred: row.get(13)?,
-        total_bytes: row.get(14)?,
-        error: row.get(15)?,
-        created_at: row.get(16)?,
-        updated_at: row.get(17)?,
-        completed_at: row.get(18)?,
+        operation_outcome: row.get(12)?,
+        operation_phase: row.get(13)?,
+        source_fingerprint: row.get(14)?,
+        destination_fingerprint: row.get(15)?,
+        status: row.get(16)?,
+        bytes_transferred: row.get(17)?,
+        total_bytes: row.get(18)?,
+        error: row.get(19)?,
+        created_at: row.get(20)?,
+        updated_at: row.get(21)?,
+        completed_at: row.get(22)?,
     })
 }
 
@@ -1147,6 +1298,10 @@ fn ensure_file_transfer_columns_sync(conn: &Connection) -> Result<(), String> {
         ("partial_destination", "TEXT"),
         ("abort_outcome", "TEXT"),
         ("publish_outcome", "TEXT"),
+        ("operation_outcome", "TEXT"),
+        ("operation_phase", "TEXT"),
+        ("source_fingerprint", "TEXT"),
+        ("destination_fingerprint", "TEXT"),
     ] {
         if !existing.contains(name) {
             conn.execute(&format!("ALTER TABLE file_transfers ADD COLUMN {name} {definition}"), [])
@@ -6256,6 +6411,98 @@ mod tests {
         let still_queued = storage.get_file_transfer("upload-after-edit").await.unwrap().unwrap();
         assert_eq!(still_queued.status, "queued");
         assert_eq!(still_queued.connection_revision, Some(1));
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn remote_transfer_phases_and_rename_retry_are_durable() {
+        let db = temp_db_path("remote-transfer-phases");
+        let storage = Storage::open(&db).await.unwrap();
+        storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP".into(),
+                "ftp".into(),
+                "{}".into(),
+                None,
+                "ftp-scope".into(),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let queued = storage
+            .create_file_remote_transfer(
+                "rename-1".into(),
+                "ftp-1".into(),
+                "rename".into(),
+                "source.bin".into(),
+                "destination.bin".into(),
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status, "queued");
+        assert_eq!(queued.operation_phase.as_deref(), Some("queued"));
+
+        let copying = storage
+            .update_file_remote_transfer_phase(
+                "rename-1",
+                "running".into(),
+                "copying".into(),
+                4,
+                Some(8),
+                Some(".dbx-copy-rename-1-random.part".into()),
+                Some("source-fingerprint".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(copying.operation_phase.as_deref(), Some("copying"));
+        assert_eq!(copying.temp_path.as_deref(), Some(".dbx-copy-rename-1-random.part"));
+
+        let published = storage
+            .update_file_remote_transfer_phase(
+                "rename-1",
+                "publishing".into(),
+                "published_before_delete".into(),
+                8,
+                Some(8),
+                None,
+                Some("source-fingerprint".into()),
+                Some("destination-fingerprint".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(published.operation_phase.as_deref(), Some("published_before_delete"));
+
+        let uncertain = storage
+            .finish_file_remote_transfer(
+                "rename-1",
+                "partial".into(),
+                8,
+                Some(8),
+                Some("source delete failed".into()),
+                Some("destination.bin".into()),
+                "copied_source_delete_failed".into(),
+                "delete_uncertain".into(),
+                Some("source-fingerprint".into()),
+                Some("destination-fingerprint".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(uncertain.operation_outcome.as_deref(), Some("copied_source_delete_failed"));
+        assert_eq!(uncertain.operation_phase.as_deref(), Some("delete_uncertain"));
+
+        let completed = storage.complete_file_rename_retry("rename-1").await.unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.operation_outcome.as_deref(), Some("completed"));
+        assert_eq!(completed.operation_phase.as_deref(), Some("completed"));
+        assert!(completed.partial_destination.is_none());
+        assert!(completed.error.is_none());
+        assert!(storage.complete_file_rename_retry("rename-1").await.unwrap_err().contains("not eligible"));
+
         std::fs::remove_file(&db).ok();
     }
 

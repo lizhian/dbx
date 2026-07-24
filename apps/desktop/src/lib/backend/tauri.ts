@@ -250,7 +250,7 @@ export type FileTransferStatus = "queued" | "running" | "cancelling" | "publishi
 export interface FileTransfer {
   id: string;
   connectionId: string;
-  direction: "download" | "upload";
+  direction: "download" | "upload" | "copy" | "rename";
   remotePath: string;
   localPath: string;
   status: FileTransferStatus;
@@ -260,6 +260,8 @@ export interface FileTransfer {
   partialDestination?: string | null;
   abortOutcome?: string | null;
   publishOutcome?: string | null;
+  operationOutcome?: "completed" | "copied_source_delete_failed" | "failed_with_partial_destination" | "failed_before_copy" | null;
+  operationPhase?: "queued" | "copying" | "published_before_delete" | "delete_uncertain" | "completed" | null;
   createdAt: string;
   updatedAt: string;
   completedAt?: string | null;
@@ -282,6 +284,24 @@ export interface FileUploadPolicy {
   mode: "best_effort_no_clobber";
   atomicNoClobber: false;
   externalToctouRisk: true;
+}
+
+export type FileRemoteMutationPolicy =
+  | {
+      mode: "best_effort_no_clobber";
+      atomicNoClobber: false;
+      externalToctouRisk: true;
+    }
+  | {
+      mode: "replace";
+      confirmed: true;
+    };
+
+export interface StartRemoteTransferInput {
+  connectionId: string;
+  sourcePath: string;
+  destinationPath: string;
+  policy: FileRemoteMutationPolicy;
 }
 
 export interface SavedSqlSyncEntry {
@@ -1400,6 +1420,14 @@ export async function startFileUpload(input: StartUploadInput): Promise<{ transf
   return invoke("start_upload", { input });
 }
 
+export async function startFileCopy(input: StartRemoteTransferInput): Promise<{ transferId: string }> {
+  return invoke("start_file_copy", { input });
+}
+
+export async function startFileRename(input: StartRemoteTransferInput): Promise<{ transferId: string }> {
+  return invoke("start_file_rename", { input });
+}
+
 export async function getFileTransfer(transferId: string): Promise<FileTransfer> {
   return invoke("get_file_transfer", { transferId });
 }
@@ -1410,6 +1438,10 @@ export async function listFileTransfers(connectionId?: string | null): Promise<F
 
 export async function cancelFileTransfer(transferId: string): Promise<FileTransfer> {
   return invoke("cancel_file_transfer", { transferId });
+}
+
+export async function retryFileRenameSourceDelete(transferId: string): Promise<FileTransfer> {
+  return invoke("retry_file_rename_source_delete", { transferId });
 }
 
 export async function listenFileTransferProgress(onProgress: (transfer: FileTransfer) => void): Promise<UnlistenFn> {

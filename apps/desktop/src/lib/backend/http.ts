@@ -125,6 +125,7 @@ import type {
   FileTransfer,
   StartDownloadInput,
   StartUploadInput,
+  StartRemoteTransferInput,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -353,6 +354,14 @@ export async function startFileUpload(_input: StartUploadInput): Promise<{ trans
   return desktopFileManagerUnavailable();
 }
 
+export async function startFileCopy(_input: StartRemoteTransferInput): Promise<{ transferId: string }> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function startFileRename(_input: StartRemoteTransferInput): Promise<{ transferId: string }> {
+  return desktopFileManagerUnavailable();
+}
+
 export async function getFileTransfer(_transferId: string): Promise<FileTransfer> {
   return desktopFileManagerUnavailable();
 }
@@ -362,6 +371,10 @@ export async function listFileTransfers(_connectionId?: string | null): Promise<
 }
 
 export async function cancelFileTransfer(_transferId: string): Promise<FileTransfer> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function retryFileRenameSourceDelete(_transferId: string): Promise<FileTransfer> {
   return desktopFileManagerUnavailable();
 }
 

@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Download, File, Folder, FolderPlus, Loader2, Pencil, Plus, RefreshCcw, Server, Trash2, Upload, X, XCircle } from "@lucide/vue";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Copy, Download, File, FilePenLine, Folder, FolderPlus, Loader2, Pencil, Plus, RefreshCcw, RotateCcw, Server, Trash2, Upload, X, XCircle } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -70,6 +70,14 @@ const text = computed(() => ({
   download: t("fileManager.download"),
   upload: t("fileManager.upload"),
   uploadRiskConfirm: (path: string) => t("fileManager.uploadRiskConfirm", { path }),
+  copy: t("fileManager.copy"),
+  rename: t("fileManager.rename"),
+  destinationPath: t("fileManager.destinationPath"),
+  copyRenameRisk: t("fileManager.copyRenameRisk"),
+  replaceDestination: t("fileManager.replaceDestination"),
+  replaceConfirm: (path: string) => t("fileManager.replaceConfirm", { path }),
+  retrySourceDelete: t("fileManager.retrySourceDelete"),
+  operationOutcome: t("fileManager.operationOutcome"),
   transfers: t("fileManager.transfers"),
   noTransfers: t("fileManager.noTransfers"),
   cancelTransfer: t("fileManager.cancelTransfer"),
@@ -84,6 +92,8 @@ const text = computed(() => ({
     partial: t("fileManager.transferPartial"),
   } satisfies Record<FileTransferStatus, string>,
   transferUploading: t("fileManager.transferUploading"),
+  transferCopying: t("fileManager.transferCopying"),
+  transferRenaming: t("fileManager.transferRenaming"),
   partialDestination: t("fileManager.partialDestination"),
   abortOutcome: t("fileManager.abortOutcome"),
   publishOutcome: t("fileManager.publishOutcome"),
@@ -107,6 +117,7 @@ const editorOpen = ref(false);
 const deleteOpen = ref(false);
 const createDirectoryOpen = ref(false);
 const entryDeleteOpen = ref(false);
+const remoteOperationOpen = ref(false);
 const saving = ref(false);
 const testing = ref(false);
 const deleting = ref(false);
@@ -114,6 +125,10 @@ const mutating = ref(false);
 const testResult = ref<FileConnectionTestResult | null>(null);
 const editingId = ref<string | null>(null);
 const pendingDeleteEntry = ref<FileManagerEntry | null>(null);
+const pendingRemoteEntry = ref<FileManagerEntry | null>(null);
+const remoteOperation = ref<"copy" | "rename">("copy");
+const remoteDestinationPath = ref("");
+const replaceDestination = ref(false);
 const directoryPath = ref("");
 const clearPassword = ref(false);
 const form = ref({ name: "", endpoint: "ftp://localhost:21", root: "/", username: "", password: "" });
@@ -433,7 +448,7 @@ function upsertTransfer(transfer: FileTransfer) {
   }
   transfers.value.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   transfers.value = transfers.value.slice(0, 100);
-  if (transfer.direction === "upload" && transfer.status === "completed" && previous?.status !== "completed" && transfer.connectionId === selectedId.value) {
+  if (["upload", "copy", "rename"].includes(transfer.direction) && transfer.status === "completed" && previous?.status !== "completed" && transfer.connectionId === selectedId.value) {
     void refreshDirectory();
   }
 }
@@ -446,7 +461,7 @@ async function refreshTransfers() {
     if (
       refreshed.some((transfer) => {
         const prior = previous.get(transfer.id);
-        return transfer.direction === "upload" && transfer.status === "completed" && prior !== undefined && prior.status !== "completed" && transfer.connectionId === selectedId.value;
+        return ["upload", "copy", "rename"].includes(transfer.direction) && transfer.status === "completed" && prior !== undefined && prior.status !== "completed" && transfer.connectionId === selectedId.value;
       })
     ) {
       void refreshDirectory();
@@ -498,6 +513,55 @@ async function uploadFile() {
   }
 }
 
+function suggestedCopyPath(entry: FileManagerEntry): string {
+  const slash = entry.path.lastIndexOf("/");
+  const parent = slash >= 0 ? entry.path.slice(0, slash + 1) : "";
+  const name = slash >= 0 ? entry.path.slice(slash + 1) : entry.path;
+  const dot = name.lastIndexOf(".");
+  return dot > 0 ? `${parent}${name.slice(0, dot)} copy${name.slice(dot)}` : `${parent}${name} copy`;
+}
+
+function openRemoteOperation(entry: FileManagerEntry, operation: "copy" | "rename") {
+  if (entry.kind !== "file") return;
+  pendingRemoteEntry.value = entry;
+  remoteOperation.value = operation;
+  remoteDestinationPath.value = operation === "copy" ? suggestedCopyPath(entry) : entry.path;
+  replaceDestination.value = false;
+  remoteOperationOpen.value = true;
+}
+
+async function startRemoteOperation() {
+  const connectionId = selectedId.value;
+  const entry = pendingRemoteEntry.value;
+  const destinationPath = remoteDestinationPath.value.trim();
+  if (!connectionId || !entry || !destinationPath || mutating.value) return;
+  if (replaceDestination.value && !globalThis.confirm(text.value.replaceConfirm(destinationPath))) return;
+  mutating.value = true;
+  try {
+    const input = {
+      connectionId,
+      sourcePath: entry.path,
+      destinationPath,
+      policy: replaceDestination.value ? ({ mode: "replace", confirmed: true } as const) : ({ mode: "best_effort_no_clobber", atomicNoClobber: false, externalToctouRisk: true } as const),
+    };
+    const started = remoteOperation.value === "copy" ? await api.startFileCopy(input) : await api.startFileRename(input);
+    upsertTransfer(await api.getFileTransfer(started.transferId));
+    remoteOperationOpen.value = false;
+  } catch (error) {
+    toast(String(error), 5000);
+  } finally {
+    mutating.value = false;
+  }
+}
+
+async function retrySourceDelete(transfer: FileTransfer) {
+  try {
+    upsertTransfer(await api.retryFileRenameSourceDelete(transfer.id));
+  } catch (error) {
+    toast(String(error), 5000);
+  }
+}
+
 async function cancelTransfer(transfer: FileTransfer) {
   if (!["queued", "running"].includes(transfer.status)) return;
   try {
@@ -514,6 +578,8 @@ function transferPercent(transfer: FileTransfer): number {
 
 function transferStatusText(transfer: FileTransfer): string {
   if (transfer.direction === "upload" && transfer.status === "running") return text.value.transferUploading;
+  if (transfer.direction === "copy" && transfer.status === "running") return text.value.transferCopying;
+  if (transfer.direction === "rename" && transfer.status === "running") return text.value.transferRenaming;
   return text.value.transferStatus[transfer.status];
 }
 
@@ -615,7 +681,7 @@ onBeforeUnmount(() => {
                 <th class="hidden w-24 px-3 py-2 font-medium md:table-cell">{{ text.type }}</th>
                 <th class="hidden w-28 px-3 py-2 text-right font-medium sm:table-cell">{{ text.size }}</th>
                 <th class="hidden w-48 px-3 py-2 font-medium lg:table-cell">{{ text.modified }}</th>
-                <th class="w-20 px-3 py-2 text-right font-medium">{{ text.actions }}</th>
+                <th class="w-36 px-3 py-2 text-right font-medium">{{ text.actions }}</th>
               </tr>
             </thead>
             <tbody>
@@ -642,6 +708,12 @@ onBeforeUnmount(() => {
                 <td class="px-2 py-1 text-right">
                   <Button v-if="entry.kind === 'file'" size="icon" variant="ghost" class="h-7 w-7" :title="text.download" :aria-label="`${text.download}: ${entry.name}`" @click.stop="void downloadEntry(entry)">
                     <Download class="h-3.5 w-3.5" />
+                  </Button>
+                  <Button v-if="entry.kind === 'file'" size="icon" variant="ghost" class="h-7 w-7" :title="text.copy" :aria-label="`${text.copy}: ${entry.name}`" @click.stop="openRemoteOperation(entry, 'copy')">
+                    <Copy class="h-3.5 w-3.5" />
+                  </Button>
+                  <Button v-if="entry.kind === 'file'" size="icon" variant="ghost" class="h-7 w-7" :title="text.rename" :aria-label="`${text.rename}: ${entry.name}`" @click.stop="openRemoteOperation(entry, 'rename')">
+                    <FilePenLine class="h-3.5 w-3.5" />
                   </Button>
                   <Button variant="ghost" size="icon" class="h-7 w-7 text-destructive hover:text-destructive" :disabled="mutating" :title="text.deleteEntry" :aria-label="`${text.deleteEntry}: ${entry.name}`" @click.stop="openDeleteEntry(entry)">
                     <Trash2 class="h-3.5 w-3.5" />
@@ -723,8 +795,12 @@ onBeforeUnmount(() => {
           <div class="min-w-0">
             <div class="flex min-w-0 items-center gap-2 text-xs">
               <Upload v-if="transfer.direction === 'upload'" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <Copy v-else-if="transfer.direction === 'copy'" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <FilePenLine v-else-if="transfer.direction === 'rename'" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <Download v-else class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <span class="truncate font-medium" :title="transfer.localPath">{{ localFileName(transfer.localPath) }}</span>
+              <span class="truncate font-medium" :title="transfer.direction === 'copy' || transfer.direction === 'rename' ? `${transfer.remotePath} -> ${transfer.localPath}` : transfer.localPath">
+                {{ transfer.direction === "copy" || transfer.direction === "rename" ? `${transfer.remotePath} -> ${transfer.localPath}` : localFileName(transfer.localPath) }}
+              </span>
               <span class="shrink-0 text-muted-foreground">{{ transferStatusText(transfer) }}</span>
             </div>
             <div class="mt-1 h-1 overflow-hidden rounded-sm bg-muted">
@@ -734,12 +810,16 @@ onBeforeUnmount(() => {
             <div v-if="transfer.partialDestination" class="mt-0.5 truncate font-mono text-[10px] text-destructive" :title="transfer.partialDestination">{{ text.partialDestination }}: {{ transfer.partialDestination }}</div>
             <div v-if="transfer.abortOutcome" class="mt-0.5 truncate font-mono text-[10px] text-destructive" :title="transfer.abortOutcome">{{ text.abortOutcome }}: {{ transfer.abortOutcome }}</div>
             <div v-if="transfer.publishOutcome" class="mt-0.5 truncate font-mono text-[10px] text-destructive" :title="transfer.publishOutcome">{{ text.publishOutcome }}: {{ transfer.publishOutcome }}</div>
+            <div v-if="transfer.operationOutcome" class="mt-0.5 truncate font-mono text-[10px]" :class="transfer.operationOutcome === 'completed' ? 'text-muted-foreground' : 'text-destructive'" :title="transfer.operationOutcome">{{ text.operationOutcome }}: {{ transfer.operationOutcome }}</div>
           </div>
           <div class="text-right font-mono text-[10px] text-muted-foreground">
             {{ formatSize(transfer.bytesTransferred) }}<span v-if="transfer.totalBytes"> / {{ formatSize(transfer.totalBytes) }}</span>
           </div>
           <Button v-if="['queued', 'running'].includes(transfer.status)" size="icon" variant="ghost" class="h-7 w-7" :title="text.cancelTransfer" :aria-label="text.cancelTransfer" @click="void cancelTransfer(transfer)">
             <X class="h-3.5 w-3.5" />
+          </Button>
+          <Button v-else-if="transfer.operationOutcome === 'copied_source_delete_failed' && transfer.operationPhase === 'delete_uncertain'" size="icon" variant="ghost" class="h-7 w-7" :title="text.retrySourceDelete" :aria-label="text.retrySourceDelete" @click="void retrySourceDelete(transfer)">
+            <RotateCcw class="h-3.5 w-3.5" />
           </Button>
           <span v-else />
         </div>
@@ -818,6 +898,35 @@ onBeforeUnmount(() => {
         <Button :disabled="!directoryPath || mutating" @click="void createDirectory()">
           <Loader2 v-if="mutating" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
           {{ text.createDirectory }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="remoteOperationOpen">
+    <DialogContent class="sm:max-w-md">
+      <DialogHeader
+        ><DialogTitle>{{ remoteOperation === "copy" ? text.copy : text.rename }}</DialogTitle></DialogHeader
+      >
+      <div class="grid gap-3">
+        <div class="grid gap-1.5">
+          <Label for="file-remote-destination">{{ text.destinationPath }}</Label>
+          <Input id="file-remote-destination" v-model="remoteDestinationPath" @keydown.enter.prevent="void startRemoteOperation()" />
+        </div>
+        <div class="flex gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+          <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{{ text.copyRenameRisk }}</span>
+        </div>
+        <label class="flex items-center gap-2 text-sm">
+          <input v-model="replaceDestination" type="checkbox" class="h-4 w-4 accent-primary" />
+          <span>{{ text.replaceDestination }}</span>
+        </label>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="mutating" @click="remoteOperationOpen = false">{{ text.cancel }}</Button>
+        <Button :disabled="!remoteDestinationPath.trim() || mutating" @click="void startRemoteOperation()">
+          <Loader2 v-if="mutating" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          {{ remoteOperation === "copy" ? text.copy : text.rename }}
         </Button>
       </DialogFooter>
     </DialogContent>
