@@ -124,6 +124,7 @@ import type {
   FileMutationResult,
   FileTransfer,
   StartDownloadInput,
+  StartUploadInput,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -345,6 +346,10 @@ export async function deleteFileEntry(_connectionId: string, _path: string, _rec
 }
 
 export async function startFileDownload(_input: StartDownloadInput): Promise<{ transferId: string }> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function startFileUpload(_input: StartUploadInput): Promise<{ transferId: string }> {
   return desktopFileManagerUnavailable();
 }
 

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use super::file_manager_paths::{reject_ftp_command_injection, reject_recursive_delete, RemotePath};
 use dbx_core::connection::AppState;
-use dbx_core::storage::FileConnectionStorageRecord;
+use dbx_core::storage::{FileConnectionStorageRecord, FileTransferStorageRecord};
 use futures::StreamExt;
 use opendal::services::Ftp;
 use opendal::{ErrorKind, Metadata, Operator};
@@ -52,7 +52,7 @@ struct ConnectionRuntime {
     state: Mutex<ConnectionRuntimeState>,
     idle: Notify,
     list_lock: AsyncMutex<()>,
-    mutation_lock: AsyncMutex<()>,
+    mutation_lock: Arc<AsyncMutex<()>>,
 }
 
 struct ConnectionRuntimeState {
@@ -97,6 +97,68 @@ pub(super) struct PreparedFileOperation {
     pub remote_path: String,
     pub cancellation: Arc<CancellationSignal>,
     _lease: OperationLease,
+}
+
+pub(super) struct PreparedFileMutation<'a> {
+    pub operator: Operator,
+    pub revision: i64,
+    pub remote_path: String,
+    pub cancellation: Arc<CancellationSignal>,
+    pub config_json: String,
+    config: FileConnectionConfig,
+    password: Option<String>,
+    mutation_lock: Arc<AsyncMutex<()>>,
+    connection_id: String,
+    runtime: &'a FileManagerRuntime,
+    _lease: OperationLease,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UploadPublishState {
+    Completed,
+    PartialSource,
+    PartialTarget,
+    Unknown,
+}
+
+#[derive(Debug)]
+pub(super) struct UploadPublishResolution {
+    pub state: UploadPublishState,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UploadConflictMode {
+    BestEffortNoClobber,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UploadPolicy {
+    pub mode: UploadConflictMode,
+    pub atomic_no_clobber: bool,
+    pub external_toctou_risk: bool,
+}
+
+impl UploadPolicy {
+    #[cfg(test)]
+    pub(super) const fn best_effort_no_clobber() -> Self {
+        Self { mode: UploadConflictMode::BestEffortNoClobber, atomic_no_clobber: false, external_toctou_risk: true }
+    }
+
+    pub(super) fn validate(self) -> Result<(), String> {
+        if self.mode != UploadConflictMode::BestEffortNoClobber {
+            return Err("Unsupported upload conflict policy".to_string());
+        }
+        if self.atomic_no_clobber || !self.external_toctou_risk {
+            return Err(
+                "FTP uploads require best_effort_no_clobber with atomicNoClobber=false and externalToctouRisk=true"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -556,6 +618,99 @@ impl FileManagerRuntime {
         Ok(PreparedFileOperation { operator, revision, remote_path, cancellation: lease.cancellation(), _lease: lease })
     }
 
+    pub(super) async fn prepare_file_mutation_operation<'a>(
+        &'a self,
+        state: &AppState,
+        connection_id: &str,
+        remote_path: &str,
+        expected_revision: i64,
+    ) -> Result<PreparedFileMutation<'a>, String> {
+        let relative_path = validate_remote_relative_path(remote_path)?;
+        let lease = self.begin_operation(connection_id)?;
+        let cancellation = lease.cancellation();
+        let mutation_lock = lease.entry.mutation_lock.clone();
+        cancellation.ensure_active()?;
+        let record = state
+            .storage
+            .load_file_connection(connection_id)
+            .await?
+            .ok_or_else(|| "File connection not found".to_string())?;
+        if record.revision != expected_revision {
+            return Err(format!(
+                "File connection revision changed while the upload was queued: expected {expected_revision}, current {}",
+                record.revision
+            ));
+        }
+        let revision = record.revision;
+        let config = parse_storage_config(&record).inspect_err(|_| self.evict_revision(connection_id, revision))?;
+        let scope = password_scope(&config)?;
+        let password = state.storage.load_file_connection_password(connection_id, &scope).await?;
+        self.evict_revision(connection_id, revision);
+        let operator = build_operator(&config, password.as_deref())?;
+        let remote_path = configured_entry_path(&config, &relative_path, false);
+        Ok(PreparedFileMutation {
+            operator,
+            revision,
+            remote_path,
+            cancellation,
+            config_json: record.config_json,
+            config,
+            password,
+            mutation_lock,
+            connection_id: connection_id.to_string(),
+            runtime: self,
+            _lease: lease,
+        })
+    }
+
+    pub(super) async fn reconcile_interrupted_upload(
+        &self,
+        state: &AppState,
+        transfer: &FileTransferStorageRecord,
+    ) -> Result<UploadPublishResolution, String> {
+        let expected_revision = transfer
+            .connection_revision
+            .ok_or_else(|| "Interrupted upload has no durable connection revision".to_string())?;
+        let partial = RemotePath::parse(
+            transfer
+                .temp_path
+                .as_deref()
+                .ok_or_else(|| "Interrupted upload has no durable partial path".to_string())?,
+        )?;
+        let target = RemotePath::parse(&transfer.remote_path)?;
+        let expected_size = usize::try_from(
+            transfer.total_bytes.ok_or_else(|| "Interrupted upload has no durable source size".to_string())?,
+        )
+        .map_err(|_| "Upload size is not representable by the FTP client".to_string())?;
+        let lease = self.begin_operation(&transfer.connection_id)?;
+        let cancellation = lease.cancellation();
+        let _mutation_guard = tokio::select! {
+            _ = cancellation.cancelled() => return Err("File connection is being deleted".to_string()),
+            guard = lease.entry.mutation_lock.lock() => guard,
+        };
+        cancellation.ensure_active()?;
+        let current = state
+            .storage
+            .load_file_connection(&transfer.connection_id)
+            .await?
+            .ok_or_else(|| "File connection not found".to_string())?;
+        if current.revision != expected_revision {
+            return Err("File connection revision changed after the interrupted upload".to_string());
+        }
+        let config = parse_storage_config(&current)?;
+        let scope = password_scope(&config)?;
+        let password = state.storage.load_file_connection_password(&transfer.connection_id, &scope).await?;
+        reconcile_ftp_upload_publish(
+            &config,
+            &partial,
+            &target,
+            expected_size,
+            password.as_deref(),
+            "The application exited while upload publish was in progress".to_string(),
+        )
+        .await
+    }
+
     fn operator_for(
         &self,
         record: &FileConnectionStorageRecord,
@@ -601,7 +756,7 @@ impl Default for ConnectionRuntime {
             }),
             idle: Notify::new(),
             list_lock: AsyncMutex::new(()),
-            mutation_lock: AsyncMutex::new(()),
+            mutation_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 }
@@ -609,6 +764,92 @@ impl Default for ConnectionRuntime {
 impl Drop for CachedOperatorRetirement<'_> {
     fn drop(&mut self) {
         self.runtime.evict_revision(self.connection_id, self.revision);
+    }
+}
+
+impl Drop for PreparedFileMutation<'_> {
+    fn drop(&mut self) {
+        self.runtime.evict_revision(&self.connection_id, self.revision);
+    }
+}
+
+impl PreparedFileMutation<'_> {
+    #[cfg(test)]
+    pub(super) fn mutation_lock_is_available(&self) -> bool {
+        self.mutation_lock.try_lock().is_ok()
+    }
+
+    pub(super) async fn delete_owned_upload_partial(&self, path: &str) -> Result<(), String> {
+        let path = RemotePath::parse(path)?;
+        let _mutation_guard = self.mutation_lock.lock().await;
+        delete_ftp_file_if_exists(&self.config, &path, self.password.as_deref()).await
+    }
+
+    pub(super) async fn create_empty_owned_upload_partial(&self, path: &str) -> Result<(), String> {
+        let path = RemotePath::parse(path)?;
+        let _mutation_guard = self.mutation_lock.lock().await;
+        create_empty_ftp_file_exact(&self.config, &path, self.password.as_deref()).await
+    }
+
+    pub(super) async fn publish_owned_upload_partial(
+        &self,
+        state: &AppState,
+        partial_path: &str,
+        target_path: &str,
+        expected_size: i64,
+        policy: UploadPolicy,
+    ) -> Result<UploadPublishResolution, String> {
+        policy.validate()?;
+        let partial = RemotePath::parse(partial_path)?;
+        let target = RemotePath::parse(target_path)?;
+        let expected_size = usize::try_from(expected_size)
+            .map_err(|_| "Upload size is not representable by the FTP client".to_string())?;
+        let _mutation_guard = tokio::select! {
+            _ = self.cancellation.cancelled() => return Err("The file connection was removed before upload publish".to_string()),
+            guard = self.mutation_lock.lock() => guard,
+        };
+        self.cancellation.ensure_active()?;
+        let current = state
+            .storage
+            .load_file_connection(&self.connection_id)
+            .await?
+            .ok_or_else(|| "File connection not found".to_string())?;
+        if current.revision != self.revision || current.config_json != self.config_json {
+            return Err("File connection revision changed before upload publish".to_string());
+        }
+        let mutation = tokio::time::timeout(
+            MUTATION_TIMEOUT,
+            rename_ftp_file_exact(&self.config, &partial, &target, expected_size, self.password.as_deref()),
+        )
+        .await;
+        match mutation {
+            Ok(Ok(())) => Ok(UploadPublishResolution {
+                state: UploadPublishState::Completed,
+                detail: "Upload publish rename completed and was verified".to_string(),
+            }),
+            Ok(Err(error)) => {
+                reconcile_ftp_upload_publish(
+                    &self.config,
+                    &partial,
+                    &target,
+                    expected_size,
+                    self.password.as_deref(),
+                    error,
+                )
+                .await
+            }
+            Err(_) => {
+                reconcile_ftp_upload_publish(
+                    &self.config,
+                    &partial,
+                    &target,
+                    expected_size,
+                    self.password.as_deref(),
+                    "Upload publish rename timed out; mutation response was not observed".to_string(),
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -889,6 +1130,23 @@ async fn delete_ftp_directory_exact(
     delete_ftp_entry_in_session(ftp, config, path, FtpEntryKind::Directory, password).await
 }
 
+async fn delete_ftp_file_if_exists(
+    config: &FileConnectionConfig,
+    path: &RemotePath,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let FileConnectionConfig::Ftp(config) = config;
+    let mut ftp = open_ftp_root_session(config, password).await?;
+    let exists = ftp_file_size_if_exists(&mut ftp, path)
+        .await
+        .map_err(|error| format!("Upload partial classification failed: {}", redact_ftp_error(error, password)))?;
+    if exists.is_none() {
+        let _ = ftp.quit().await;
+        return Ok(());
+    }
+    delete_ftp_entry_in_session(ftp, config, path, FtpEntryKind::File, password).await
+}
+
 #[cfg(test)]
 async fn delete_ftp_file_exact(
     config: &FileConnectionConfig,
@@ -898,6 +1156,204 @@ async fn delete_ftp_file_exact(
     let FileConnectionConfig::Ftp(config) = config;
     let ftp = open_ftp_root_session(config, password).await?;
     delete_ftp_entry_in_session(ftp, config, path, FtpEntryKind::File, password).await
+}
+
+async fn create_empty_ftp_file_exact(
+    config: &FileConnectionConfig,
+    path: &RemotePath,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let FileConnectionConfig::Ftp(config) = config;
+    let mut ftp = open_ftp_root_session(config, password).await?;
+    if ftp_file_size_if_exists(&mut ftp, path)
+        .await
+        .map_err(|error| format!("Empty upload partial preflight failed: {}", redact_ftp_error(error, password)))?
+        .is_some()
+    {
+        let _ = ftp.quit().await;
+        return Err("Operation-owned empty upload partial already exists".to_string());
+    }
+    let mut empty = tokio::io::empty();
+    ftp.put_file(path.as_str(), &mut empty)
+        .await
+        .map_err(|error| format!("Creating empty upload partial failed: {}", redact_ftp_error(error, password)))?;
+    let size = ftp
+        .size(path.as_str())
+        .await
+        .map_err(|error| format!("Empty upload partial verification failed: {}", redact_ftp_error(error, password)))?;
+    let _ = ftp.quit().await;
+    if size == 0 {
+        Ok(())
+    } else {
+        Err("Empty upload partial has an unexpected non-zero size".to_string())
+    }
+}
+
+async fn rename_ftp_file_exact(
+    config: &FileConnectionConfig,
+    source: &RemotePath,
+    target: &RemotePath,
+    expected_size: usize,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let FileConnectionConfig::Ftp(config) = config;
+    let mut ftp = open_ftp_root_session(config, password).await?;
+    if ftp_file_size_if_exists(&mut ftp, target)
+        .await
+        .map_err(|error| format!("Upload publish target preflight failed: {}", redact_ftp_error(error, password)))?
+        .is_some()
+    {
+        let _ = ftp.quit().await;
+        return Err("Remote upload destination already exists".to_string());
+    }
+    let source_size = ftp_file_size_if_exists(&mut ftp, source)
+        .await
+        .map_err(|error| format!("Upload partial preflight failed: {}", redact_ftp_error(error, password)))?;
+    let Some(source_size) = source_size else {
+        let _ = ftp.quit().await;
+        return Err("Operation-owned upload partial is missing".to_string());
+    };
+    if source_size != expected_size {
+        let _ = ftp.quit().await;
+        return Err("Operation-owned upload partial size does not match the validated source".to_string());
+    }
+
+    let mutation = ftp.rename(source.as_str(), target.as_str()).await;
+    let mutation_context = mutation.as_ref().err().map(|error| redact_error(error.to_string(), password));
+    if mutation.as_ref().is_err_and(ftp_session_is_unusable) {
+        drop(ftp);
+        return Err(format!(
+            "{}; upload publish rename outcome is unknown and was not inferred from path existence",
+            mutation_context.unwrap_or_else(|| "Upload publish session disconnected".to_string())
+        ));
+    }
+    if let Err(error) = mutation {
+        let _ = ftp.quit().await;
+        return Err(format!("Upload publish rename failed: {}", redact_ftp_error(error, password)));
+    }
+
+    match verify_ftp_rename_in_session(&mut ftp, config, source, target, expected_size).await {
+        Ok(true) => {
+            let _ = ftp.quit().await;
+            Ok(())
+        }
+        Ok(false) => {
+            let _ = ftp.quit().await;
+            Err("Upload publish rename could not be verified".to_string())
+        }
+        Err(error) if ftp_session_is_unusable(&error) => {
+            drop(ftp);
+            verify_successful_ftp_rename_in_fresh_session(config, source, target, expected_size, password).await
+        }
+        Err(error) => {
+            let _ = ftp.quit().await;
+            Err(format!("Upload publish verification failed: {}", redact_ftp_error(error, password)))
+        }
+    }
+}
+
+async fn verify_ftp_rename_in_session(
+    ftp: &mut AsyncFtpStream,
+    config: &FtpConnectionConfig,
+    source: &RemotePath,
+    target: &RemotePath,
+    expected_size: usize,
+) -> Result<bool, FtpError> {
+    let _ = config;
+    let source_size = ftp_file_size_if_exists(ftp, source).await?;
+    let target_size = ftp_file_size_if_exists(ftp, target).await?;
+    Ok(source_size.is_none() && target_size == Some(expected_size))
+}
+
+async fn verify_successful_ftp_rename_in_fresh_session(
+    config: &FtpConnectionConfig,
+    source: &RemotePath,
+    target: &RemotePath,
+    expected_size: usize,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let mut verify = open_ftp_root_session(config, password)
+        .await
+        .map_err(|error| format!("Successful upload publish could not be verified in a fresh session: {error}"))?;
+    let result =
+        verify_ftp_rename_in_session(&mut verify, config, source, target, expected_size).await.map_err(|error| {
+            format!("Upload publish read-only verification failed: {}", redact_ftp_error(error, password))
+        });
+    let _ = verify.quit().await;
+    match result? {
+        true => Ok(()),
+        false => {
+            Err("Upload publish rename returned success but its target fingerprint could not be verified".to_string())
+        }
+    }
+}
+
+async fn reconcile_ftp_upload_publish(
+    config: &FileConnectionConfig,
+    source: &RemotePath,
+    target: &RemotePath,
+    expected_size: usize,
+    password: Option<&str>,
+    detail: String,
+) -> Result<UploadPublishResolution, String> {
+    let FileConnectionConfig::Ftp(config) = config;
+    let mut ftp = match open_ftp_root_session(config, password).await {
+        Ok(ftp) => ftp,
+        Err(error) => {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::Unknown,
+                detail: format!("{detail}; read-only reconciliation could not connect: {error}"),
+            })
+        }
+    };
+    let source_size = match ftp_file_size_if_exists(&mut ftp, source).await {
+        Ok(size) => size,
+        Err(error) => {
+            let _ = ftp.quit().await;
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::Unknown,
+                detail: format!("{detail}; source reconciliation failed: {}", redact_ftp_error(error, password)),
+            });
+        }
+    };
+    let target_size = match ftp_file_size_if_exists(&mut ftp, target).await {
+        Ok(size) => size,
+        Err(error) => {
+            let _ = ftp.quit().await;
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::Unknown,
+                detail: format!("{detail}; target reconciliation failed: {}", redact_ftp_error(error, password)),
+            });
+        }
+    };
+    let _ = ftp.quit().await;
+    Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
+}
+
+fn resolve_upload_publish_observation(
+    source_size: Option<usize>,
+    target_size: Option<usize>,
+    expected_size: usize,
+    detail: String,
+) -> UploadPublishResolution {
+    if let Some(actual_size) = source_size {
+        let size_detail = if actual_size == expected_size {
+            format!("operation-owned source partial exists with expected size {expected_size}")
+        } else {
+            format!(
+                "operation-owned source partial size mismatch: expected {expected_size}, actual {actual_size}; partial was preserved"
+            )
+        };
+        return UploadPublishResolution {
+            state: UploadPublishState::PartialSource,
+            detail: format!("{detail}; {size_detail}"),
+        };
+    }
+    let state = match target_size {
+        Some(target_size) if target_size == expected_size => UploadPublishState::PartialTarget,
+        _ => UploadPublishState::Unknown,
+    };
+    UploadPublishResolution { state, detail }
 }
 
 async fn delete_ftp_entry_in_session(
@@ -1055,6 +1511,14 @@ async fn ftp_entry_exists_in_session(
         let entry = entry.trim_end_matches('/');
         entry == basename || entry == relative || entry == format!("/{relative}") || entry == rooted
     }))
+}
+
+async fn ftp_file_size_if_exists(ftp: &mut AsyncFtpStream, path: &RemotePath) -> Result<Option<usize>, FtpError> {
+    match ftp.size(path.as_str()).await {
+        Ok(size) => Ok(Some(size)),
+        Err(error) if ftp_error_is_file_unavailable(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn ftp_error_is_file_unavailable(error: &FtpError) -> bool {
@@ -1667,6 +2131,22 @@ mod tests {
 
     fn ftp_session_establishment_count() -> usize {
         FTP_SESSION_ESTABLISHMENT_COUNT.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn mismatched_owned_upload_source_is_partial_source_when_target_is_absent() {
+        let resolution = resolve_upload_publish_observation(Some(7), None, 9, "publish response lost".to_string());
+        assert_eq!(resolution.state, UploadPublishState::PartialSource);
+        assert!(resolution.detail.contains("expected 9, actual 7"), "{}", resolution.detail);
+        assert!(resolution.detail.contains("preserved"), "{}", resolution.detail);
+    }
+
+    #[test]
+    fn mismatched_owned_upload_source_is_partial_source_when_target_is_present() {
+        let resolution = resolve_upload_publish_observation(Some(7), Some(9), 9, "publish response lost".to_string());
+        assert_eq!(resolution.state, UploadPublishState::PartialSource);
+        assert!(resolution.detail.contains("expected 9, actual 7"), "{}", resolution.detail);
+        assert!(resolution.detail.contains("preserved"), "{}", resolution.detail);
     }
 
     #[test]

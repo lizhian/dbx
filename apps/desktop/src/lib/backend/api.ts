@@ -75,6 +75,7 @@ export const statFileEntry = forward("statFileEntry");
 export const createFileDirectory = forward("createFileDirectory");
 export const deleteFileEntry = forward("deleteFileEntry");
 export const startFileDownload = forward("startFileDownload");
+export const startFileUpload = forward("startFileUpload");
 export const getFileTransfer = forward("getFileTransfer");
 export const listFileTransfers = forward("listFileTransfers");
 export const cancelFileTransfer = forward("cancelFileTransfer");

@@ -6,6 +6,7 @@ import type { FileConnection, FileManagerEntry, FileTransfer } from "@/lib/backe
 
 const mocks = vi.hoisted(() => ({
   cancelFileTransfer: vi.fn(),
+  confirmUploadRisk: vi.fn(),
   closeFileListCursor: vi.fn(),
   createFileDirectory: vi.fn(),
   deleteFileConnection: vi.fn(),
@@ -16,9 +17,11 @@ const mocks = vi.hoisted(() => ({
   listFileEntriesNext: vi.fn(),
   listFileTransfers: vi.fn(),
   listenFileTransferProgress: vi.fn(),
+  openDialog: vi.fn(),
   saveDialog: vi.fn(),
   saveFileConnection: vi.fn(),
   startFileDownload: vi.fn(),
+  startFileUpload: vi.fn(),
   statFileEntry: vi.fn(),
   testFileConnection: vi.fn(),
   toast: vi.fn(),
@@ -36,7 +39,7 @@ function passthrough(tag: string): Component {
 }
 
 vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ save: mocks.saveDialog }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.openDialog, save: mocks.saveDialog }));
 vi.mock("@lucide/vue", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@lucide/vue")>();
   const Icon = passthrough("span");
@@ -83,6 +86,7 @@ vi.mock("@/lib/backend/api", () => ({
   listenFileTransferProgress: mocks.listenFileTransferProgress,
   saveFileConnection: mocks.saveFileConnection,
   startFileDownload: mocks.startFileDownload,
+  startFileUpload: mocks.startFileUpload,
   statFileEntry: mocks.statFileEntry,
   testFileConnection: mocks.testFileConnection,
 }));
@@ -104,6 +108,16 @@ const connection: FileConnection = {
   updatedAt: "2026-07-25T08:00:00Z",
 };
 
+const secondConnection: FileConnection = {
+  ...connection,
+  id: "ftp-2",
+  name: "Other files",
+  config: {
+    ...connection.config,
+    endpoint: "ftp://other.example:21",
+  },
+};
+
 const remoteEntry: FileManagerEntry = {
   path: "a%2Fb",
   name: "remote.bin",
@@ -111,6 +125,14 @@ const remoteEntry: FileManagerEntry = {
   size: 100,
   lastModified: null,
 };
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
 
 function transfer(id: string, status: FileTransfer["status"], overrides: Partial<FileTransfer> = {}): FileTransfer {
   return {
@@ -147,6 +169,8 @@ async function mountPage() {
 }
 
 beforeEach(() => {
+  vi.stubGlobal("confirm", mocks.confirmUploadRisk);
+  mocks.confirmUploadRisk.mockReturnValue(true);
   mocks.progressListener = null;
   mocks.closeFileListCursor.mockResolvedValue(undefined);
   mocks.listFileConnections.mockResolvedValue([connection]);
@@ -164,6 +188,7 @@ afterEach(() => {
   app = undefined;
   root = undefined;
   vi.useRealTimers();
+  vi.unstubAllGlobals();
   vi.clearAllMocks();
 });
 
@@ -234,15 +259,19 @@ describe("FileManagerPage transfer lifecycle", () => {
 
   it("recovers a missed terminal event through the transfer query poll", async () => {
     vi.useFakeTimers();
-    const running = transfer("missed", "running", { bytesTransferred: 40 });
+    const running = transfer("missed", "running", {
+      direction: "upload",
+      bytesTransferred: 40,
+    });
     const completed = transfer("missed", "completed", {
+      direction: "upload",
       bytesTransferred: 100,
       completedAt: "2026-07-25T08:03:00Z",
     });
     mocks.listFileTransfers.mockResolvedValueOnce([running]).mockResolvedValueOnce([completed]);
 
     await mountPage();
-    expect(root?.textContent).toContain("fileManager.transferRunning");
+    expect(root?.textContent).toContain("fileManager.transferUploading");
     expect(mocks.progressListener).toBeTypeOf("function");
 
     await vi.advanceTimersByTimeAsync(2_000);
@@ -251,8 +280,132 @@ describe("FileManagerPage transfer lifecycle", () => {
 
     expect(root?.textContent).toContain("fileManager.transferCompleted");
     expect(root?.textContent).toContain("100 B / 100 B");
+    await vi.waitFor(() => expect(mocks.listFileEntries).toHaveBeenCalledTimes(2));
 
     await vi.advanceTimersByTimeAsync(4_000);
     expect(mocks.listFileTransfers).toHaveBeenCalledTimes(2);
+  });
+
+  it("binds a deferred upload dialog to the connection and directory where it was opened", async () => {
+    const uploadSelection = deferred<string | null>();
+    const directory: FileManagerEntry = {
+      path: "captured",
+      name: "captured",
+      kind: "directory",
+      size: 0,
+      lastModified: null,
+    };
+    const running = transfer("captured-upload", "running", {
+      direction: "upload",
+      connectionId: connection.id,
+      remotePath: "captured/local.bin",
+      localPath: "/tmp/local.bin",
+    });
+    mocks.listFileConnections.mockResolvedValue([connection, secondConnection]);
+    mocks.listFileEntries.mockResolvedValueOnce({ entries: [directory], cursor: null }).mockResolvedValue({ entries: [], cursor: null });
+    mocks.openDialog.mockReturnValue(uploadSelection.promise);
+    mocks.startFileUpload.mockResolvedValue({ transferId: running.id });
+    mocks.getFileTransfer.mockResolvedValue(running);
+
+    await mountPage();
+
+    const directoryRow = Array.from(root?.querySelectorAll("tbody tr") ?? []).find((element) => element.textContent?.includes(directory.name));
+    directoryRow?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await vi.waitFor(() =>
+      expect(mocks.listFileEntries).toHaveBeenNthCalledWith(2, connection.id, directory.path, {
+        pageSize: 200,
+      }),
+    );
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.upload"]')?.click();
+    await vi.waitFor(() => expect(mocks.openDialog).toHaveBeenCalledOnce());
+
+    root?.querySelector<HTMLButtonElement>(`button[aria-label="${secondConnection.name}"]`)?.click();
+    await vi.waitFor(() =>
+      expect(mocks.listFileEntries).toHaveBeenNthCalledWith(3, secondConnection.id, "", {
+        pageSize: 200,
+      }),
+    );
+
+    uploadSelection.resolve("/tmp/local.bin");
+    await vi.waitFor(() =>
+      expect(mocks.startFileUpload).toHaveBeenCalledWith({
+        connectionId: connection.id,
+        localPath: "/tmp/local.bin",
+        remotePath: "captured/local.bin",
+        policy: {
+          mode: "best_effort_no_clobber",
+          atomicNoClobber: false,
+          externalToctouRisk: true,
+        },
+      }),
+    );
+  });
+
+  it("starts an upload into the current directory, renders partial state, and refreshes after completion", async () => {
+    const running = transfer("upload", "running", {
+      direction: "upload",
+      remotePath: "local.bin",
+      localPath: "/tmp/local.bin",
+      bytesTransferred: 10,
+    });
+    mocks.openDialog.mockResolvedValue("/tmp/local.bin");
+    mocks.startFileUpload.mockResolvedValue({ transferId: running.id });
+    mocks.getFileTransfer.mockResolvedValue(running);
+
+    await mountPage();
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.upload"]')?.click();
+
+    await vi.waitFor(() => expect(mocks.startFileUpload).toHaveBeenCalledOnce());
+    expect(mocks.startFileUpload).toHaveBeenCalledWith({
+      connectionId: connection.id,
+      localPath: "/tmp/local.bin",
+      remotePath: "local.bin",
+      policy: {
+        mode: "best_effort_no_clobber",
+        atomicNoClobber: false,
+        externalToctouRisk: true,
+      },
+    });
+    expect(mocks.confirmUploadRisk).toHaveBeenCalledOnce();
+    expect(root?.textContent).toContain("fileManager.transferUploading");
+
+    mocks.progressListener?.(
+      transfer("upload", "partial", {
+        direction: "upload",
+        remotePath: "local.bin",
+        localPath: "/tmp/local.bin",
+        bytesTransferred: 40,
+        partialDestination: ".dbx-upload-upload-random.part",
+        abortOutcome: "unsupported",
+        publishOutcome: "partial_source",
+      }),
+    );
+    await nextTick();
+    expect(root?.textContent).toContain("fileManager.transferPartial");
+    expect(root?.textContent).toContain(".dbx-upload-upload-random.part");
+    expect(root?.textContent).toContain("unsupported");
+    expect(root?.textContent).toContain("partial_source");
+
+    mocks.progressListener?.(
+      transfer("upload", "completed", {
+        direction: "upload",
+        remotePath: "local.bin",
+        localPath: "/tmp/local.bin",
+        bytesTransferred: 100,
+      }),
+    );
+    await vi.waitFor(() => expect(mocks.listFileEntries).toHaveBeenCalledTimes(2));
+  });
+
+  it("does not start an upload when the FTP no-clobber risk is declined", async () => {
+    mocks.openDialog.mockResolvedValue("/tmp/declined.bin");
+    mocks.confirmUploadRisk.mockReturnValue(false);
+
+    await mountPage();
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.upload"]')?.click();
+
+    await vi.waitFor(() => expect(mocks.confirmUploadRisk).toHaveBeenCalledOnce());
+    expect(mocks.startFileUpload).not.toHaveBeenCalled();
   });
 });

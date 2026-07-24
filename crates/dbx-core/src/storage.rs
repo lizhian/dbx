@@ -138,6 +138,11 @@ pub struct FileTransferStorageRecord {
     pub temp_path: Option<String>,
     #[serde(skip_serializing)]
     pub temp_identity: Option<String>,
+    #[serde(skip_serializing)]
+    pub connection_revision: Option<i64>,
+    pub partial_destination: Option<String>,
+    pub abort_outcome: Option<String>,
+    pub publish_outcome: Option<String>,
     pub status: String,
     pub bytes_transferred: i64,
     pub total_bytes: Option<i64>,
@@ -325,6 +330,10 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         local_directory_identity TEXT NOT NULL DEFAULT '',
         temp_path TEXT,
         temp_identity TEXT,
+        connection_revision INTEGER,
+        partial_destination TEXT,
+        abort_outcome TEXT,
+        publish_outcome TEXT,
         status TEXT NOT NULL,
         bytes_transferred INTEGER NOT NULL DEFAULT 0,
         total_bytes INTEGER,
@@ -724,6 +733,85 @@ impl Storage {
         .await
     }
 
+    pub async fn create_file_upload_transfer(
+        &self,
+        id: String,
+        connection_id: String,
+        remote_path: String,
+        local_path: String,
+        local_directory_identity: String,
+        source_fingerprint: String,
+        total_bytes: i64,
+        connection_revision: i64,
+    ) -> Result<FileTransferStorageRecord, String> {
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO file_transfers (
+                    id, connection_id, direction, remote_path, local_path,
+                    local_directory_identity, temp_identity, connection_revision,
+                    status, bytes_transferred, total_bytes,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, 'upload', ?3, ?4, ?5, ?6, ?7, 'queued', 0, ?8, ?9, ?9)",
+                params![
+                    id,
+                    connection_id,
+                    remote_path,
+                    local_path,
+                    local_directory_identity,
+                    source_fingerprint,
+                    connection_revision,
+                    total_bytes,
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
+    pub async fn start_file_upload_transfer(
+        &self,
+        id: &str,
+        partial_path: String,
+        source_fingerprint: String,
+        total_bytes: i64,
+        expected_connection_revision: i64,
+    ) -> Result<FileTransferStorageRecord, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let changed = conn
+                .execute(
+                    "UPDATE file_transfers
+                 SET status = CASE WHEN status = 'cancelling' THEN status ELSE 'running' END,
+                     bytes_transferred = 0, temp_path = ?2, updated_at = ?6
+                 WHERE id = ?1
+                   AND status IN ('queued', 'cancelling')
+                   AND total_bytes = ?3
+                   AND temp_identity = ?4
+                   AND connection_revision = ?5
+                   AND EXISTS (
+                       SELECT 1
+                       FROM file_connections
+                       WHERE file_connections.id = file_transfers.connection_id
+                         AND file_connections.revision = ?5
+                   )",
+                    params![id, partial_path, total_bytes, source_fingerprint, expected_connection_revision, now],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err(
+                    "Upload could not start because its queued source proof or file connection revision changed"
+                        .to_string(),
+                );
+            }
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
     pub async fn update_file_transfer(
         &self,
         id: &str,
@@ -789,6 +877,45 @@ impl Storage {
         .await
     }
 
+    pub async fn finish_file_upload_transfer(
+        &self,
+        id: &str,
+        status: String,
+        bytes_transferred: i64,
+        total_bytes: Option<i64>,
+        error: Option<String>,
+        partial_destination: Option<String>,
+        abort_outcome: Option<String>,
+        publish_outcome: Option<String>,
+    ) -> Result<FileTransferStorageRecord, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE file_transfers
+                 SET status = ?2, bytes_transferred = ?3, total_bytes = ?4,
+                     error = ?5, partial_destination = ?6, abort_outcome = ?7,
+                     publish_outcome = ?8, updated_at = ?9, completed_at = ?9
+                 WHERE id = ?1
+                   AND status IN ('queued', 'running', 'cancelling', 'publishing')",
+                params![
+                    id,
+                    status,
+                    bytes_transferred,
+                    total_bytes,
+                    error,
+                    partial_destination,
+                    abort_outcome,
+                    publish_outcome,
+                    now
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
     pub async fn get_file_transfer(&self, id: &str) -> Result<Option<FileTransferStorageRecord>, String> {
         let id = id.to_string();
         self.with_conn(move |conn| {
@@ -844,7 +971,8 @@ impl Storage {
                      error = 'The application exited before the transfer completed',
                      updated_at = ?1,
                      completed_at = ?1
-                 WHERE status IN ('queued', 'running', 'cancelling')",
+                 WHERE direction != 'upload'
+                   AND status IN ('queued', 'running', 'cancelling')",
                 [&now],
             )
             .map_err(|error| error.to_string())?;
@@ -857,7 +985,8 @@ impl Storage {
 
 const FILE_TRANSFER_SELECT: &str = "SELECT
     id, connection_id, direction, remote_path, local_path, local_directory_identity,
-    temp_path, temp_identity, status,
+    temp_path, temp_identity, connection_revision, partial_destination,
+    abort_outcome, publish_outcome, status,
     bytes_transferred, total_bytes, error, created_at, updated_at, completed_at
     FROM file_transfers";
 
@@ -871,13 +1000,17 @@ fn map_file_transfer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTransf
         local_directory_identity: row.get(5)?,
         temp_path: row.get(6)?,
         temp_identity: row.get(7)?,
-        status: row.get(8)?,
-        bytes_transferred: row.get(9)?,
-        total_bytes: row.get(10)?,
-        error: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
-        completed_at: row.get(14)?,
+        connection_revision: row.get(8)?,
+        partial_destination: row.get(9)?,
+        abort_outcome: row.get(10)?,
+        publish_outcome: row.get(11)?,
+        status: row.get(12)?,
+        bytes_transferred: row.get(13)?,
+        total_bytes: row.get(14)?,
+        error: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        completed_at: row.get(18)?,
     })
 }
 
@@ -1007,7 +1140,14 @@ fn ensure_file_transfer_columns_sync(conn: &Connection) -> Result<(), String> {
         .collect::<Result<HashSet<_>, _>>()
         .map_err(|e| e.to_string())?;
     drop(stmt);
-    for (name, definition) in [("local_directory_identity", "TEXT NOT NULL DEFAULT ''"), ("temp_identity", "TEXT")] {
+    for (name, definition) in [
+        ("local_directory_identity", "TEXT NOT NULL DEFAULT ''"),
+        ("temp_identity", "TEXT"),
+        ("connection_revision", "INTEGER"),
+        ("partial_destination", "TEXT"),
+        ("abort_outcome", "TEXT"),
+        ("publish_outcome", "TEXT"),
+    ] {
         if !existing.contains(name) {
             conn.execute(&format!("ALTER TABLE file_transfers ADD COLUMN {name} {definition}"), [])
                 .map_err(|e| e.to_string())?;
@@ -5928,6 +6068,10 @@ mod tests {
             .unwrap();
         assert_eq!(created.local_directory_identity, "directory-identity");
         assert_eq!(created.temp_identity, None);
+        assert_eq!(created.connection_revision, None);
+        assert_eq!(created.partial_destination, None);
+        assert_eq!(created.abort_outcome, None);
+        assert_eq!(created.publish_outcome, None);
         std::fs::remove_file(&db).ok();
     }
 
@@ -5983,7 +6127,6 @@ mod tests {
         assert_eq!(late_progress.status, "cancelling");
         assert_eq!(late_progress.bytes_transferred, 8);
         assert_eq!(late_progress.temp_identity.as_deref(), Some("temp-identity"));
-
         let terminal = storage
             .update_file_transfer(
                 "transfer-1",
@@ -6001,6 +6144,118 @@ mod tests {
         assert!(terminal.completed_at.is_some());
         assert_eq!(storage.get_file_transfer("transfer-1").await.unwrap(), Some(terminal.clone()));
         assert_eq!(storage.list_file_transfers(Some("ftp-1"), 100).await.unwrap(), vec![terminal]);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn upload_create_and_terminal_outcome_are_each_atomic() {
+        let db = temp_db_path("file-upload-atomic");
+        let storage = Storage::open(&db).await.unwrap();
+        storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP".into(),
+                "ftp".into(),
+                "{}".into(),
+                None,
+                "ftp-scope".into(),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let queued = storage
+            .create_file_upload_transfer(
+                "upload-1".into(),
+                "ftp-1".into(),
+                "remote/file.bin".into(),
+                "/tmp/file.bin".into(),
+                "dir-identity".into(),
+                "source-fingerprint".into(),
+                12,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status, "queued");
+        assert_eq!(queued.total_bytes, Some(12));
+        assert_eq!(queued.temp_identity.as_deref(), Some("source-fingerprint"));
+        assert_eq!(queued.connection_revision, Some(1));
+
+        let running = storage
+            .start_file_upload_transfer(
+                "upload-1",
+                "remote/.dbx-upload-upload-1-random.part".into(),
+                "source-fingerprint".into(),
+                12,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(running.status, "running");
+        let terminal = storage
+            .finish_file_upload_transfer(
+                "upload-1",
+                "partial".into(),
+                8,
+                Some(12),
+                Some("cleanup failed".into()),
+                Some("remote/.dbx-upload-upload-1-random.part".into()),
+                Some("unsupported".into()),
+                Some("partial_source".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.status, "partial");
+        assert_eq!(terminal.partial_destination.as_deref(), Some("remote/.dbx-upload-upload-1-random.part"));
+        assert_eq!(terminal.abort_outcome.as_deref(), Some("unsupported"));
+        assert_eq!(terminal.publish_outcome.as_deref(), Some("partial_source"));
+        assert!(terminal.completed_at.is_some());
+
+        let late = storage.request_file_transfer_cancel("upload-1").await.unwrap();
+        assert_eq!(late, terminal);
+
+        let queued_after_edit = storage
+            .create_file_upload_transfer(
+                "upload-after-edit".into(),
+                "ftp-1".into(),
+                "remote/after-edit.bin".into(),
+                "/tmp/after-edit.bin".into(),
+                "dir-identity".into(),
+                "source-fingerprint".into(),
+                12,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued_after_edit.connection_revision, Some(1));
+        storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP edited".into(),
+                "ftp".into(),
+                "{\"endpoint\":\"changed\"}".into(),
+                None,
+                "ftp-scope".into(),
+                false,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        let error = storage
+            .start_file_upload_transfer(
+                "upload-after-edit",
+                "remote/.dbx-upload-upload-after-edit-random.part".into(),
+                "source-fingerprint".into(),
+                12,
+                1,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("connection revision changed"), "{error}");
+        let still_queued = storage.get_file_transfer("upload-after-edit").await.unwrap().unwrap();
+        assert_eq!(still_queued.status, "queued");
+        assert_eq!(still_queued.connection_revision, Some(1));
         std::fs::remove_file(&db).ok();
     }
 

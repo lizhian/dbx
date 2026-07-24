@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { save } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type { UnlistenFn } from "@tauri-apps/api/event";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Download, File, Folder, FolderPlus, Loader2, Pencil, Plus, RefreshCcw, Server, Trash2, X, XCircle } from "@lucide/vue";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Download, File, Folder, FolderPlus, Loader2, Pencil, Plus, RefreshCcw, Server, Trash2, Upload, X, XCircle } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -68,6 +68,8 @@ const text = computed(() => ({
   loadedCount: t("fileManager.loadedCount"),
   actions: t("fileManager.actions"),
   download: t("fileManager.download"),
+  upload: t("fileManager.upload"),
+  uploadRiskConfirm: (path: string) => t("fileManager.uploadRiskConfirm", { path }),
   transfers: t("fileManager.transfers"),
   noTransfers: t("fileManager.noTransfers"),
   cancelTransfer: t("fileManager.cancelTransfer"),
@@ -79,7 +81,12 @@ const text = computed(() => ({
     completed: t("fileManager.transferCompleted"),
     failed: t("fileManager.transferFailed"),
     cancelled: t("fileManager.transferCancelled"),
+    partial: t("fileManager.transferPartial"),
   } satisfies Record<FileTransferStatus, string>,
+  transferUploading: t("fileManager.transferUploading"),
+  partialDestination: t("fileManager.partialDestination"),
+  abortOutcome: t("fileManager.abortOutcome"),
+  publishOutcome: t("fileManager.publishOutcome"),
 }));
 
 const connections = ref<FileConnection[]>([]);
@@ -418,6 +425,7 @@ function formatSize(bytes: number): string {
 
 function upsertTransfer(transfer: FileTransfer) {
   const index = transfers.value.findIndex((item) => item.id === transfer.id);
+  const previous = index >= 0 ? transfers.value[index] : undefined;
   if (index >= 0) {
     transfers.value.splice(index, 1, transfer);
   } else {
@@ -425,11 +433,24 @@ function upsertTransfer(transfer: FileTransfer) {
   }
   transfers.value.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   transfers.value = transfers.value.slice(0, 100);
+  if (transfer.direction === "upload" && transfer.status === "completed" && previous?.status !== "completed" && transfer.connectionId === selectedId.value) {
+    void refreshDirectory();
+  }
 }
 
 async function refreshTransfers() {
   try {
-    transfers.value = await api.listFileTransfers();
+    const previous = new Map(transfers.value.map((transfer) => [transfer.id, transfer]));
+    const refreshed = await api.listFileTransfers();
+    transfers.value = refreshed;
+    if (
+      refreshed.some((transfer) => {
+        const prior = previous.get(transfer.id);
+        return transfer.direction === "upload" && transfer.status === "completed" && prior !== undefined && prior.status !== "completed" && transfer.connectionId === selectedId.value;
+      })
+    ) {
+      void refreshDirectory();
+    }
   } catch (error) {
     toast(String(error), 5000);
   }
@@ -451,6 +472,32 @@ async function downloadEntry(entry: FileManagerEntry) {
   }
 }
 
+async function uploadFile() {
+  const connectionId = selectedId.value;
+  const targetDirectory = currentPath.value;
+  if (!connectionId) return;
+  const selected = await open({ multiple: false, directory: false });
+  if (typeof selected !== "string") return;
+  const name = localFileName(selected);
+  const remotePath = targetDirectory ? `${targetDirectory}/${name}` : name;
+  if (!globalThis.confirm(text.value.uploadRiskConfirm(remotePath))) return;
+  try {
+    const started = await api.startFileUpload({
+      connectionId,
+      localPath: selected,
+      remotePath,
+      policy: {
+        mode: "best_effort_no_clobber",
+        atomicNoClobber: false,
+        externalToctouRisk: true,
+      },
+    });
+    upsertTransfer(await api.getFileTransfer(started.transferId));
+  } catch (error) {
+    toast(String(error), 5000);
+  }
+}
+
 async function cancelTransfer(transfer: FileTransfer) {
   if (!["queued", "running"].includes(transfer.status)) return;
   try {
@@ -463,6 +510,11 @@ async function cancelTransfer(transfer: FileTransfer) {
 function transferPercent(transfer: FileTransfer): number {
   if (!transfer.totalBytes) return transfer.status === "completed" ? 100 : 0;
   return Math.min(100, Math.round((transfer.bytesTransferred / transfer.totalBytes) * 100));
+}
+
+function transferStatusText(transfer: FileTransfer): string {
+  if (transfer.direction === "upload" && transfer.status === "running") return text.value.transferUploading;
+  return text.value.transferStatus[transfer.status];
 }
 
 function localFileName(path: string): string {
@@ -527,6 +579,9 @@ onBeforeUnmount(() => {
     <section class="flex min-w-0 flex-1 flex-col">
       <div class="flex h-10 items-center gap-1 border-b px-2">
         <span class="min-w-0 flex-1 truncate px-1 text-sm font-medium">{{ selectedConnection?.name ?? text.title }}</span>
+        <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="!selectedConnection || loadingEntries" :title="text.upload" :aria-label="text.upload" @click="void uploadFile()">
+          <Upload class="h-3.5 w-3.5" />
+        </Button>
         <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="!selectedConnection || loadingEntries || mutating" :title="text.createDirectory" :aria-label="text.createDirectory" @click="openCreateDirectory">
           <FolderPlus class="h-3.5 w-3.5" />
         </Button>
@@ -667,14 +722,18 @@ onBeforeUnmount(() => {
         <div v-for="transfer in transfers.slice(0, 8)" :key="transfer.id" class="grid min-h-12 grid-cols-[minmax(0,1fr)_7rem_2rem] items-center gap-3 border-b px-3 py-1.5">
           <div class="min-w-0">
             <div class="flex min-w-0 items-center gap-2 text-xs">
-              <Download class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <Upload v-if="transfer.direction === 'upload'" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <Download v-else class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               <span class="truncate font-medium" :title="transfer.localPath">{{ localFileName(transfer.localPath) }}</span>
-              <span class="shrink-0 text-muted-foreground">{{ text.transferStatus[transfer.status] }}</span>
+              <span class="shrink-0 text-muted-foreground">{{ transferStatusText(transfer) }}</span>
             </div>
             <div class="mt-1 h-1 overflow-hidden rounded-sm bg-muted">
-              <div class="h-full bg-primary transition-[width] duration-200" :class="{ 'bg-destructive': transfer.status === 'failed', 'bg-muted-foreground': transfer.status === 'cancelled' }" :style="{ width: `${transferPercent(transfer)}%` }" />
+              <div class="h-full bg-primary transition-[width] duration-200" :class="{ 'bg-destructive': ['failed', 'partial'].includes(transfer.status), 'bg-muted-foreground': transfer.status === 'cancelled' }" :style="{ width: `${transferPercent(transfer)}%` }" />
             </div>
             <div v-if="transfer.error" class="mt-0.5 truncate text-[10px] text-destructive" :title="transfer.error">{{ transfer.error }}</div>
+            <div v-if="transfer.partialDestination" class="mt-0.5 truncate font-mono text-[10px] text-destructive" :title="transfer.partialDestination">{{ text.partialDestination }}: {{ transfer.partialDestination }}</div>
+            <div v-if="transfer.abortOutcome" class="mt-0.5 truncate font-mono text-[10px] text-destructive" :title="transfer.abortOutcome">{{ text.abortOutcome }}: {{ transfer.abortOutcome }}</div>
+            <div v-if="transfer.publishOutcome" class="mt-0.5 truncate font-mono text-[10px] text-destructive" :title="transfer.publishOutcome">{{ text.publishOutcome }}: {{ transfer.publishOutcome }}</div>
           </div>
           <div class="text-right font-mono text-[10px] text-muted-foreground">
             {{ formatSize(transfer.bytesTransferred) }}<span v-if="transfer.totalBytes"> / {{ formatSize(transfer.totalBytes) }}</span>

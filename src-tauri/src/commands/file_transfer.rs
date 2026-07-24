@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::future::Future;
 use std::io;
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use cap_fs_ext::{
     ambient_authority, DirExt, FollowSymlinks, MetadataExt as CapabilityMetadataExt, OpenOptionsFollowExt,
 };
@@ -18,18 +21,22 @@ use futures::io::AsyncReadExt as FuturesAsyncReadExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewWindow};
 use tauri_plugin_fs::FsExt;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::file_manager::{
-    validate_remote_relative_path, CancellationSignal, FileManagerRuntime, PreparedFileOperation,
+    validate_remote_relative_path, CancellationSignal, FileManagerRuntime, PreparedFileMutation, PreparedFileOperation,
+    UploadPolicy, UploadPublishResolution, UploadPublishState,
 };
 
 const DOWNLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const UPLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const GLOBAL_TRANSFER_LIMIT: usize = 8;
 const CONNECTION_TRANSFER_LIMIT: usize = 4;
+const GLOBAL_UPLOAD_HANDLE_LIMIT: usize = 32;
+const CONNECTION_UPLOAD_HANDLE_LIMIT: usize = 8;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const GLOBAL_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const IO_PROGRESS_WATCHDOG: Duration = Duration::from_secs(30);
@@ -46,6 +53,14 @@ struct TestRemoteReaderBarrier {
 
 #[cfg(test)]
 static TEST_REMOTE_READER_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_UPLOAD_AFTER_CHUNK_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_UPLOAD_AFTER_CLOSE_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -76,6 +91,7 @@ pub struct FileTransferRuntime {
 struct ActiveTransfer {
     connection_id: String,
     cancellation: CancellationToken,
+    upload: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -84,6 +100,15 @@ pub struct StartDownloadInput {
     pub connection_id: String,
     pub remote_path: String,
     pub local_path: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartUploadInput {
+    pub connection_id: String,
+    pub local_path: String,
+    pub remote_path: String,
+    pub policy: UploadPolicy,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +129,19 @@ struct DownloadOutcome {
     total_bytes: Option<i64>,
 }
 
+struct UploadOutcome {
+    bytes_transferred: i64,
+    total_bytes: Option<i64>,
+    publish_outcome: Option<String>,
+}
+
+struct UploadFailure {
+    failure: TransferFailure,
+    partial_destination: Option<String>,
+    abort_outcome: Option<String>,
+    publish_outcome: Option<String>,
+}
+
 struct CreateTempCompletion {
     file: std::fs::File,
     identity: String,
@@ -114,6 +152,40 @@ struct CreateTempCompletion {
 struct ValidatedLocalDestination {
     path: PathBuf,
     directory_identity: String,
+}
+
+#[derive(Debug)]
+struct ValidatedLocalSource {
+    path: PathBuf,
+    directory_identity: String,
+    identity: String,
+    fingerprint: String,
+    total_bytes: i64,
+    file: std::fs::File,
+    verification_file: Arc<std::fs::File>,
+}
+
+#[derive(Clone, Debug)]
+struct UploadSourceProof {
+    path: PathBuf,
+    directory_identity: String,
+    identity: String,
+    fingerprint: String,
+    total_bytes: i64,
+    verification_file: Arc<std::fs::File>,
+}
+
+impl ValidatedLocalSource {
+    fn proof(&self) -> UploadSourceProof {
+        UploadSourceProof {
+            path: self.path.clone(),
+            directory_identity: self.directory_identity.clone(),
+            identity: self.identity.clone(),
+            fingerprint: self.fingerprint.clone(),
+            total_bytes: self.total_bytes,
+            verification_file: self.verification_file.clone(),
+        }
+    }
 }
 
 struct AnchoredDestination {
@@ -175,7 +247,27 @@ impl FileTransferRuntime {
         self.active
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(transfer_id, ActiveTransfer { connection_id, cancellation });
+            .insert(transfer_id, ActiveTransfer { connection_id, cancellation, upload: false });
+    }
+
+    fn register_upload(
+        &self,
+        transfer_id: String,
+        connection_id: String,
+        cancellation: CancellationToken,
+    ) -> Result<(), String> {
+        let mut active = self.active.lock().unwrap_or_else(|error| error.into_inner());
+        let global_uploads = active.values().filter(|transfer| transfer.upload).count();
+        let connection_uploads =
+            active.values().filter(|transfer| transfer.upload && transfer.connection_id == connection_id).count();
+        if global_uploads >= GLOBAL_UPLOAD_HANDLE_LIMIT {
+            return Err("Too many active or queued uploads; wait for an upload to finish".to_string());
+        }
+        if connection_uploads >= CONNECTION_UPLOAD_HANDLE_LIMIT {
+            return Err("Too many active or queued uploads for this connection".to_string());
+        }
+        active.insert(transfer_id, ActiveTransfer { connection_id, cancellation, upload: true });
+        Ok(())
     }
 
     fn cancellation(&self, transfer_id: &str) -> Option<CancellationToken> {
@@ -217,12 +309,12 @@ impl FileTransferRuntime {
         true
     }
 
-    async fn ensure_recovered(&self, state: &AppState) -> Result<(), String> {
+    async fn ensure_recovered(&self, state: &AppState, file_manager: &FileManagerRuntime) -> Result<(), String> {
         self.recovery
             .get_or_try_init(|| async {
                 let interrupted = state.storage.recover_interrupted_file_transfers().await?;
                 for transfer in interrupted {
-                    recover_interrupted_transfer(state, &transfer).await?;
+                    recover_interrupted_transfer(state, file_manager, &transfer).await?;
                 }
                 Ok(())
             })
@@ -240,7 +332,8 @@ impl Default for FileTransferRuntime {
 pub(crate) async fn recover_interrupted_downloads(app: AppHandle) {
     let state = app.state::<Arc<AppState>>().inner().clone();
     let runtime = app.state::<FileTransferRuntime>();
-    if let Err(error) = runtime.ensure_recovered(&state).await {
+    let file_manager = app.state::<FileManagerRuntime>();
+    if let Err(error) = runtime.ensure_recovered(&state, file_manager.inner()).await {
         log::error!("Failed to recover interrupted file downloads at startup: {error}");
     }
 }
@@ -263,7 +356,8 @@ async fn start_download_inner<R: Runtime>(
     runtime: &FileTransferRuntime,
     input: StartDownloadInput,
 ) -> Result<StartTransferResult, String> {
-    runtime.ensure_recovered(state).await?;
+    let file_manager = app.state::<FileManagerRuntime>();
+    runtime.ensure_recovered(state, file_manager.inner()).await?;
     let remote_path = validate_remote_relative_path(&input.remote_path)?;
     let local = validate_local_destination(Path::new(&input.local_path)).await?;
     let fs_scope = window
@@ -299,20 +393,90 @@ async fn start_download_inner<R: Runtime>(
 }
 
 #[tauri::command]
+pub async fn start_upload(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, Arc<AppState>>,
+    runtime: State<'_, FileTransferRuntime>,
+    input: StartUploadInput,
+) -> Result<StartTransferResult, String> {
+    start_upload_inner(app, window, state.inner(), runtime.inner(), input).await
+}
+
+async fn start_upload_inner<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: &Arc<AppState>,
+    runtime: &FileTransferRuntime,
+    input: StartUploadInput,
+) -> Result<StartTransferResult, String> {
+    let file_manager = app.state::<FileManagerRuntime>();
+    runtime.ensure_recovered(state, file_manager.inner()).await?;
+    input.policy.validate()?;
+    let remote_path = validate_remote_relative_path(&input.remote_path)?;
+    let local_path = validate_local_source_path(Path::new(&input.local_path))?;
+    let fs_scope = window
+        .try_fs_scope()
+        .ok_or_else(|| "File-system authorization is unavailable; choose the source file again".to_string())?;
+    validate_local_upload_authorization(&fs_scope, &local_path)?;
+    let connection = state
+        .storage
+        .load_file_connection(&input.connection_id)
+        .await?
+        .ok_or_else(|| "File connection not found".to_string())?;
+    let local = validate_local_source(&local_path).await?;
+
+    let transfer_id = Uuid::new_v4().to_string();
+    let cancellation = CancellationToken::new();
+    runtime.register_upload(transfer_id.clone(), input.connection_id.clone(), cancellation.clone())?;
+    let queued = match state
+        .storage
+        .create_file_upload_transfer(
+            transfer_id.clone(),
+            input.connection_id.clone(),
+            remote_path,
+            local.path.to_string_lossy().into_owned(),
+            local.directory_identity.clone(),
+            local.fingerprint.clone(),
+            local.total_bytes,
+            connection.revision,
+        )
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            runtime.unregister(&transfer_id);
+            return Err(error);
+        }
+    };
+    emit_transfer(&app, &queued);
+    let worker_id = transfer_id.clone();
+    let connection_id = input.connection_id;
+    let policy = input.policy;
+    tokio::spawn(async move {
+        run_upload_worker(app, worker_id, connection_id, cancellation, local, policy).await;
+    });
+
+    Ok(StartTransferResult { transfer_id })
+}
+
+#[tauri::command]
 pub async fn get_file_transfer(
     state: State<'_, Arc<AppState>>,
     runtime: State<'_, FileTransferRuntime>,
+    file_manager: State<'_, FileManagerRuntime>,
     transfer_id: String,
 ) -> Result<FileTransferStorageRecord, String> {
-    get_file_transfer_inner(state.inner(), runtime.inner(), &transfer_id).await
+    get_file_transfer_inner(state.inner(), runtime.inner(), file_manager.inner(), &transfer_id).await
 }
 
 async fn get_file_transfer_inner(
     state: &Arc<AppState>,
     runtime: &FileTransferRuntime,
+    file_manager: &FileManagerRuntime,
     transfer_id: &str,
 ) -> Result<FileTransferStorageRecord, String> {
-    runtime.ensure_recovered(state).await?;
+    runtime.ensure_recovered(state, file_manager).await?;
     state.storage.get_file_transfer(transfer_id).await?.ok_or_else(|| "File transfer not found".to_string())
 }
 
@@ -320,17 +484,19 @@ async fn get_file_transfer_inner(
 pub async fn list_file_transfers(
     state: State<'_, Arc<AppState>>,
     runtime: State<'_, FileTransferRuntime>,
+    file_manager: State<'_, FileManagerRuntime>,
     connection_id: Option<String>,
 ) -> Result<Vec<FileTransferStorageRecord>, String> {
-    list_file_transfers_inner(state.inner(), runtime.inner(), connection_id.as_deref()).await
+    list_file_transfers_inner(state.inner(), runtime.inner(), file_manager.inner(), connection_id.as_deref()).await
 }
 
 async fn list_file_transfers_inner(
     state: &Arc<AppState>,
     runtime: &FileTransferRuntime,
+    file_manager: &FileManagerRuntime,
     connection_id: Option<&str>,
 ) -> Result<Vec<FileTransferStorageRecord>, String> {
-    runtime.ensure_recovered(state).await?;
+    runtime.ensure_recovered(state, file_manager).await?;
     state.storage.list_file_transfers(connection_id, 100).await
 }
 
@@ -339,18 +505,20 @@ pub async fn cancel_file_transfer(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     runtime: State<'_, FileTransferRuntime>,
+    file_manager: State<'_, FileManagerRuntime>,
     transfer_id: String,
 ) -> Result<FileTransferStorageRecord, String> {
-    cancel_file_transfer_inner(&app, state.inner(), runtime.inner(), &transfer_id).await
+    cancel_file_transfer_inner(&app, state.inner(), runtime.inner(), file_manager.inner(), &transfer_id).await
 }
 
 async fn cancel_file_transfer_inner<R: Runtime>(
     app: &AppHandle<R>,
     state: &Arc<AppState>,
     runtime: &FileTransferRuntime,
+    file_manager: &FileManagerRuntime,
     transfer_id: &str,
 ) -> Result<FileTransferStorageRecord, String> {
-    runtime.ensure_recovered(state).await?;
+    runtime.ensure_recovered(state, file_manager).await?;
     let record = state.storage.request_file_transfer_cancel(transfer_id).await?;
     if record.status == "cancelling" {
         emit_transfer(app, &record);
@@ -448,6 +616,639 @@ async fn run_download_worker<R: Runtime>(
     runtime.unregister(&transfer_id);
 }
 
+async fn run_upload_worker<R: Runtime>(
+    app: AppHandle<R>,
+    transfer_id: String,
+    connection_id: String,
+    cancellation: CancellationToken,
+    local: ValidatedLocalSource,
+    policy: UploadPolicy,
+) {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let runtime = app.state::<FileTransferRuntime>();
+    let file_manager = app.state::<FileManagerRuntime>();
+    let progress = Arc::new(TransferProgressSnapshot::new());
+    progress.record_total(Some(local.total_bytes));
+
+    let result = async {
+        let initial = transfer_record_for_worker(&state, &transfer_id).await.map_err(UploadFailure::from)?;
+        let (_connection_permit, _global_permit) =
+            acquire_transfer_permits(&runtime, &connection_id, &cancellation).await.map_err(UploadFailure::from)?;
+        let current = transfer_record_for_worker(&state, &transfer_id).await.map_err(UploadFailure::from)?;
+        if current.remote_path != initial.remote_path || current.local_path != initial.local_path {
+            return Err(UploadFailure::from(local_failure("File transfer paths changed while queued")));
+        }
+        let expected_revision = initial
+            .connection_revision
+            .ok_or_else(|| UploadFailure::from(local_failure("Queued upload has no durable connection revision")))?;
+        if current.connection_revision != Some(expected_revision) {
+            return Err(UploadFailure::from(local_failure("File transfer connection revision changed while queued")));
+        }
+        let partial_relative = upload_partial_path(&current.remote_path, &transfer_id);
+        let running = state
+            .storage
+            .start_file_upload_transfer(
+                &transfer_id,
+                partial_relative.clone(),
+                local.fingerprint.clone(),
+                local.total_bytes,
+                expected_revision,
+            )
+            .await
+            .map_err(local_failure)
+            .map_err(UploadFailure::from)?;
+        emit_transfer(&app, &running);
+        if running.status == "cancelling" || cancellation.is_cancelled() {
+            return Err(UploadFailure::from(upload_cancelled_failure()));
+        }
+        let prepared = tokio::select! {
+            _ = cancellation.cancelled() => return Err(UploadFailure::from(upload_cancelled_failure())),
+            prepared = file_manager.prepare_file_mutation_operation(
+                &state,
+                &connection_id,
+                &current.remote_path,
+                expected_revision,
+            ) => {
+                prepared.map_err(remote_failure).map_err(UploadFailure::from)?
+            }
+        };
+        let partial_configured = sibling_remote_path(&prepared.remote_path, &partial_relative);
+        let result = execute_upload(
+            UploadExecutionContext {
+                app: &app,
+                state: &state,
+                runtime: &runtime,
+                transfer_id: &transfer_id,
+                prepared: &prepared,
+                target_relative: &current.remote_path,
+                partial_relative: &partial_relative,
+                partial_configured: &partial_configured,
+                cancellation: &cancellation,
+                progress_snapshot: progress.clone(),
+                policy,
+            },
+            local,
+        )
+        .await;
+        result.inspect_err(|failure| {
+            if failure.failure.invalidate_operator {
+                file_manager.evict_revision(&connection_id, prepared.revision);
+            }
+        })
+    }
+    .await;
+
+    finalize_upload_result(&app, &state, &transfer_id, result, &progress).await;
+    runtime.unregister(&transfer_id);
+}
+
+struct UploadExecutionContext<'a, 'runtime, R: Runtime> {
+    app: &'a AppHandle<R>,
+    state: &'a AppState,
+    runtime: &'a FileTransferRuntime,
+    transfer_id: &'a str,
+    prepared: &'a PreparedFileMutation<'runtime>,
+    target_relative: &'a str,
+    partial_relative: &'a str,
+    partial_configured: &'a str,
+    cancellation: &'a CancellationToken,
+    progress_snapshot: Arc<TransferProgressSnapshot>,
+    policy: UploadPolicy,
+}
+
+async fn execute_upload<R: Runtime>(
+    context: UploadExecutionContext<'_, '_, R>,
+    local: ValidatedLocalSource,
+) -> Result<UploadOutcome, UploadFailure> {
+    let UploadExecutionContext {
+        app,
+        state,
+        runtime,
+        transfer_id,
+        prepared,
+        target_relative,
+        partial_relative,
+        partial_configured,
+        cancellation,
+        progress_snapshot,
+        policy,
+    } = context;
+    ensure_remote_target_absent(&prepared.operator, &prepared.remote_path).await.map_err(UploadFailure::from)?;
+    if local.total_bytes == 0 {
+        return execute_empty_upload(
+            app,
+            state,
+            transfer_id,
+            prepared,
+            target_relative,
+            partial_relative,
+            local,
+            cancellation,
+            policy,
+        )
+        .await;
+    }
+    let mut writer = tokio::select! {
+        _ = cancellation.cancelled() => return Err(UploadFailure::from(upload_cancelled_failure())),
+        _ = prepared.cancellation.cancelled() => {
+            return Err(UploadFailure::from(TransferFailure {
+                status: "cancelled",
+                message: "The file connection was removed while the upload was queued".to_string(),
+                invalidate_operator: true,
+            }))
+        },
+        result = tokio::time::timeout(
+            IO_PROGRESS_WATCHDOG,
+            prepared.operator.writer_with(partial_configured).append(true).chunk(UPLOAD_BUFFER_SIZE).concurrent(1),
+        ) => {
+            result
+                .map_err(|_| remote_failure("Opening the remote upload timed out"))
+                .and_then(|result| result.map_err(|error| remote_failure(error.to_string())))
+                .map_err(UploadFailure::from)?
+        }
+    };
+
+    let proof = local.proof();
+    let file = local.file;
+    let mut source = tokio::fs::File::from_std(file);
+    let mut buffer = vec![0_u8; UPLOAD_BUFFER_SIZE];
+    let mut bytes_transferred = 0_i64;
+    let mut last_progress = Instant::now();
+    let deadline = tokio::time::Instant::now() + DOWNLOAD_OPERATION_TIMEOUT;
+
+    let body_result = async {
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(remote_failure("Upload operation timed out"));
+            }
+            let count = tokio::select! {
+                _ = cancellation.cancelled() => return Err(upload_cancelled_active_failure()),
+                _ = prepared.cancellation.cancelled() => {
+                    return Err(TransferFailure {
+                        status: "cancelled",
+                        message: "The file connection was removed while the upload was running".to_string(),
+                        invalidate_operator: true,
+                    })
+                },
+                result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, source.read(&mut buffer)) => {
+                    result
+                        .map_err(|_| local_failure("Local upload read made no progress before the I/O watchdog expired"))?
+                        .map_err(|error| local_failure(format!("Failed to read the upload source: {error}")))?
+                }
+            };
+            if count == 0 {
+                break;
+            }
+            let chunk = Bytes::copy_from_slice(&buffer[..count]);
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(upload_cancelled_active_failure()),
+                _ = prepared.cancellation.cancelled() => {
+                    return Err(TransferFailure {
+                        status: "cancelled",
+                        message: "The file connection was removed while the upload was running".to_string(),
+                        invalidate_operator: true,
+                    })
+                },
+                result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.write(chunk)) => {
+                    result
+                        .map_err(|_| remote_failure("Remote upload write made no progress before the I/O watchdog expired"))?
+                        .map_err(|error| remote_failure(error.to_string()))?;
+                }
+            }
+            bytes_transferred =
+                bytes_transferred.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
+            progress_snapshot.record_bytes(bytes_transferred);
+            wait_at_test_upload_after_chunk_barrier().await;
+            if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                let progress = state
+                    .storage
+                    .update_file_transfer(
+                        transfer_id,
+                        "running".to_string(),
+                        bytes_transferred,
+                        Some(proof.total_bytes),
+                        Some(partial_relative.to_string()),
+                        Some(proof.fingerprint.clone()),
+                        None,
+                        false,
+                    )
+                    .await
+                    .map_err(local_failure)?;
+                if progress.status == "running" && runtime.should_emit_progress() {
+                    emit_transfer(app, &progress);
+                }
+                last_progress = Instant::now();
+            }
+        }
+
+        verify_upload_source_unchanged(&proof, bytes_transferred).map_err(local_failure)?;
+        ensure_remote_target_absent(&prepared.operator, &prepared.remote_path).await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(failure) = body_result {
+        return Err(abort_upload(writer, prepared, partial_relative, failure).await);
+    }
+
+    match tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.close()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(abort_upload(writer, prepared, partial_relative, remote_failure(error.to_string())).await);
+        }
+        Err(_) => {
+            return Err(abort_upload(
+                writer,
+                prepared,
+                partial_relative,
+                remote_failure("Closing the remote upload timed out"),
+            )
+            .await);
+        }
+    }
+    wait_at_test_upload_after_close_barrier().await;
+
+    publish_closed_upload(
+        app,
+        state,
+        ClosedUploadContext {
+            transfer_id,
+            prepared,
+            target_relative,
+            partial_relative,
+            proof: &proof,
+            bytes_transferred,
+            cancellation,
+            policy,
+        },
+    )
+    .await
+}
+
+async fn execute_empty_upload<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    transfer_id: &str,
+    prepared: &PreparedFileMutation<'_>,
+    target_relative: &str,
+    partial_relative: &str,
+    local: ValidatedLocalSource,
+    cancellation: &CancellationToken,
+    policy: UploadPolicy,
+) -> Result<UploadOutcome, UploadFailure> {
+    let proof = local.proof();
+    if cancellation.is_cancelled() {
+        return Err(UploadFailure::from(upload_cancelled_failure()));
+    }
+    if prepared.cancellation.is_cancelled() {
+        return Err(UploadFailure::from(TransferFailure {
+            status: "cancelled",
+            message: "The file connection was removed before the empty upload started".to_string(),
+            invalidate_operator: true,
+        }));
+    }
+    verify_upload_source_unchanged(&proof, 0).map_err(local_failure).map_err(UploadFailure::from)?;
+    wait_at_test_upload_after_chunk_barrier().await;
+    if let Err(error) =
+        tokio::time::timeout(IO_PROGRESS_WATCHDOG, prepared.create_empty_owned_upload_partial(partial_relative))
+            .await
+            .map_err(|_| "Creating the empty operation-owned upload partial timed out".to_string())
+            .and_then(|result| result)
+    {
+        return Err(cleanup_closed_upload_partial(
+            prepared,
+            partial_relative,
+            remote_failure(format!("Failed to create the empty upload partial: {error}")),
+        )
+        .await);
+    }
+    publish_closed_upload(
+        app,
+        state,
+        ClosedUploadContext {
+            transfer_id,
+            prepared,
+            target_relative,
+            partial_relative,
+            proof: &proof,
+            bytes_transferred: 0,
+            cancellation,
+            policy,
+        },
+    )
+    .await
+}
+
+struct ClosedUploadContext<'a> {
+    transfer_id: &'a str,
+    prepared: &'a PreparedFileMutation<'a>,
+    target_relative: &'a str,
+    partial_relative: &'a str,
+    proof: &'a UploadSourceProof,
+    bytes_transferred: i64,
+    cancellation: &'a CancellationToken,
+    policy: UploadPolicy,
+}
+
+async fn publish_closed_upload<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    context: ClosedUploadContext<'_>,
+) -> Result<UploadOutcome, UploadFailure> {
+    let ClosedUploadContext {
+        transfer_id,
+        prepared,
+        target_relative,
+        partial_relative,
+        proof,
+        bytes_transferred,
+        cancellation,
+        policy,
+    } = context;
+    if let Err(error) = verify_upload_source_unchanged(proof, bytes_transferred) {
+        return Err(cleanup_closed_upload_partial(prepared, partial_relative, local_failure(error)).await);
+    }
+    if cancellation.is_cancelled() {
+        return Err(cleanup_closed_upload_partial(prepared, partial_relative, upload_cancelled_active_failure()).await);
+    }
+    if prepared.cancellation.is_cancelled() {
+        return Err(cleanup_closed_upload_partial(
+            prepared,
+            partial_relative,
+            TransferFailure {
+                status: "cancelled",
+                message: "The file connection was removed after the upload closed and before publish".to_string(),
+                invalidate_operator: true,
+            },
+        )
+        .await);
+    }
+    let publishing = match state
+        .storage
+        .update_file_transfer(
+            transfer_id,
+            "publishing".to_string(),
+            bytes_transferred,
+            Some(proof.total_bytes),
+            Some(partial_relative.to_string()),
+            Some(proof.fingerprint.clone()),
+            None,
+            false,
+        )
+        .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            return Err(cleanup_closed_upload_partial(
+                prepared,
+                partial_relative,
+                local_failure(format!("Failed to persist upload publishing state: {error}")),
+            )
+            .await)
+        }
+    };
+    emit_transfer(app, &publishing);
+    if publishing.status == "cancelling" || cancellation.is_cancelled() {
+        return Err(cleanup_closed_upload_partial(prepared, partial_relative, upload_cancelled_active_failure()).await);
+    }
+    if prepared.cancellation.is_cancelled() {
+        return Err(cleanup_closed_upload_partial(
+            prepared,
+            partial_relative,
+            TransferFailure {
+                status: "cancelled",
+                message: "The file connection was removed before upload publish".to_string(),
+                invalidate_operator: true,
+            },
+        )
+        .await);
+    }
+    match prepared
+        .publish_owned_upload_partial(state, partial_relative, target_relative, proof.total_bytes, policy)
+        .await
+    {
+        Ok(UploadPublishResolution { state: UploadPublishState::Completed, .. }) => Ok(UploadOutcome {
+            bytes_transferred,
+            total_bytes: Some(proof.total_bytes),
+            publish_outcome: Some("completed".to_string()),
+        }),
+        Ok(UploadPublishResolution { state: UploadPublishState::PartialSource, detail }) => Err(UploadFailure {
+            failure: partial_failure(format!("Upload publish was not completed: {detail}")),
+            partial_destination: Some(partial_relative.to_string()),
+            abort_outcome: Some("not_applicable_after_close".to_string()),
+            publish_outcome: Some("partial_source".to_string()),
+        }),
+        Ok(UploadPublishResolution { state: UploadPublishState::PartialTarget, detail }) => Err(UploadFailure {
+            failure: partial_failure(format!("Upload publish target exists but ownership is unproven: {detail}")),
+            partial_destination: Some(target_relative.to_string()),
+            abort_outcome: Some("not_applicable_after_close".to_string()),
+            publish_outcome: Some("partial_target_unproven".to_string()),
+        }),
+        Ok(UploadPublishResolution { state: UploadPublishState::Unknown, detail }) => Err(UploadFailure {
+            failure: partial_failure(format!("Upload publish outcome is unknown: {detail}")),
+            partial_destination: None,
+            abort_outcome: Some("not_applicable_after_close".to_string()),
+            publish_outcome: Some("unknown".to_string()),
+        }),
+        Err(error) => {
+            let status = if cancellation.is_cancelled() || prepared.cancellation.is_cancelled() {
+                upload_cancelled_active_failure()
+            } else {
+                remote_failure(format!("Failed to publish the uploaded file: {error}"))
+            };
+            Err(cleanup_closed_upload_partial(prepared, partial_relative, status).await)
+        }
+    }
+}
+
+async fn ensure_remote_target_absent(operator: &opendal::Operator, path: &str) -> Result<(), TransferFailure> {
+    match tokio::time::timeout(IO_PROGRESS_WATCHDOG, operator.stat(path)).await {
+        Ok(Ok(_)) => Err(remote_failure("Remote upload destination already exists")),
+        Ok(Err(error)) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
+        Ok(Err(error)) => Err(remote_failure(error.to_string())),
+        Err(_) => Err(remote_failure("Checking the remote upload destination timed out")),
+    }
+}
+
+async fn abort_upload(
+    writer: opendal::Writer,
+    prepared: &PreparedFileMutation<'_>,
+    partial_relative: &str,
+    failure: TransferFailure,
+) -> UploadFailure {
+    abort_upload_control_flow(writer, partial_relative, failure, IO_PROGRESS_WATCHDOG, || {
+        prepared.delete_owned_upload_partial(partial_relative)
+    })
+    .await
+}
+
+#[derive(Debug)]
+enum UploadAbortError {
+    Unsupported,
+    Failed(String),
+}
+
+trait AbortableUpload {
+    fn abort(&mut self) -> Pin<Box<dyn Future<Output = Result<(), UploadAbortError>> + Send + '_>>;
+}
+
+impl AbortableUpload for opendal::Writer {
+    fn abort(&mut self) -> Pin<Box<dyn Future<Output = Result<(), UploadAbortError>> + Send + '_>> {
+        Box::pin(async move {
+            opendal::Writer::abort(self).await.map_err(|error| {
+                if error.kind() == opendal::ErrorKind::Unsupported {
+                    UploadAbortError::Unsupported
+                } else {
+                    UploadAbortError::Failed(error.to_string())
+                }
+            })
+        })
+    }
+}
+
+async fn abort_upload_control_flow<A, Cleanup, CleanupFuture>(
+    mut writer: A,
+    partial_relative: &str,
+    mut failure: TransferFailure,
+    watchdog: Duration,
+    cleanup: Cleanup,
+) -> UploadFailure
+where
+    A: AbortableUpload,
+    Cleanup: FnOnce() -> CleanupFuture,
+    CleanupFuture: Future<Output = Result<(), String>>,
+{
+    let abort = tokio::time::timeout(watchdog, writer.abort()).await;
+    let abort_outcome = match abort {
+        Ok(Ok(())) => return resolve_successful_upload_abort(failure),
+        Ok(Err(UploadAbortError::Unsupported)) => "unsupported".to_string(),
+        Ok(Err(UploadAbortError::Failed(error))) => format!("failed: {}", sanitize_error(&error)),
+        Err(_) => {
+            failure.invalidate_operator = true;
+            "timed_out".to_string()
+        }
+    };
+    drop(writer);
+
+    let cleanup = tokio::time::timeout(watchdog, cleanup())
+        .await
+        .map_err(|_| "operation-owned partial cleanup timed out".to_string())
+        .and_then(|result| result);
+    resolve_upload_cleanup(failure, abort_outcome, cleanup, partial_relative)
+}
+
+fn resolve_successful_upload_abort(failure: TransferFailure) -> UploadFailure {
+    UploadFailure {
+        failure,
+        partial_destination: None,
+        abort_outcome: Some("succeeded".to_string()),
+        publish_outcome: None,
+    }
+}
+
+async fn cleanup_closed_upload_partial(
+    prepared: &PreparedFileMutation<'_>,
+    partial_relative: &str,
+    failure: TransferFailure,
+) -> UploadFailure {
+    let cleanup = tokio::time::timeout(IO_PROGRESS_WATCHDOG, prepared.delete_owned_upload_partial(partial_relative))
+        .await
+        .map_err(|_| "operation-owned partial cleanup timed out".to_string())
+        .and_then(|result| result);
+    resolve_upload_cleanup(failure, "not_applicable_after_close".to_string(), cleanup, partial_relative)
+}
+
+fn resolve_upload_cleanup(
+    mut failure: TransferFailure,
+    abort_outcome: String,
+    cleanup: Result<(), String>,
+    partial_relative: &str,
+) -> UploadFailure {
+    match cleanup {
+        Ok(()) => UploadFailure {
+            failure,
+            partial_destination: None,
+            abort_outcome: Some(format!("{abort_outcome}; operation_owned_partial_cleaned")),
+            publish_outcome: None,
+        },
+        Err(error) => {
+            failure.status = "partial";
+            failure.invalidate_operator = true;
+            failure.message = format!(
+                "{}; operation-owned partial cleanup failed safely: {}",
+                failure.message,
+                sanitize_error(&error)
+            );
+            UploadFailure {
+                failure,
+                partial_destination: Some(partial_relative.to_string()),
+                abort_outcome: Some(abort_outcome),
+                publish_outcome: None,
+            }
+        }
+    }
+}
+
+async fn finalize_upload_result<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    transfer_id: &str,
+    result: Result<UploadOutcome, UploadFailure>,
+    progress: &TransferProgressSnapshot,
+) {
+    let latest = state.storage.get_file_transfer(transfer_id).await.ok().flatten();
+    let (status, bytes_transferred, total_bytes, error, partial_destination, abort_outcome, publish_outcome) =
+        match result {
+            Ok(outcome) => {
+                ("completed", outcome.bytes_transferred, outcome.total_bytes, None, None, None, outcome.publish_outcome)
+            }
+            Err(upload) => (
+                upload.failure.status,
+                progress.bytes().max(latest.as_ref().map_or(0, |record| record.bytes_transferred)),
+                progress.total().or_else(|| latest.as_ref().and_then(|record| record.total_bytes)),
+                Some(sanitize_error(&upload.failure.message)),
+                upload.partial_destination,
+                upload.abort_outcome,
+                upload.publish_outcome,
+            ),
+        };
+    match state
+        .storage
+        .finish_file_upload_transfer(
+            transfer_id,
+            status.to_string(),
+            bytes_transferred,
+            total_bytes,
+            error,
+            partial_destination,
+            abort_outcome,
+            publish_outcome,
+        )
+        .await
+    {
+        Ok(record) => emit_transfer(app, &record),
+        Err(error) => log::error!("Failed to persist terminal file transfer state: {error}"),
+    }
+}
+
+impl From<TransferFailure> for UploadFailure {
+    fn from(failure: TransferFailure) -> Self {
+        Self { failure, partial_destination: None, abort_outcome: None, publish_outcome: None }
+    }
+}
+
+fn upload_partial_path(remote_path: &str, transfer_id: &str) -> String {
+    let name = format!(".dbx-upload-{transfer_id}-{}.part", Uuid::new_v4());
+    remote_path.rsplit_once('/').map_or(name.clone(), |(parent, _)| format!("{parent}/{name}"))
+}
+
+fn sibling_remote_path(final_path: &str, sibling_relative: &str) -> String {
+    let sibling_name = sibling_relative.rsplit('/').next().unwrap_or(sibling_relative);
+    final_path
+        .rsplit_once('/')
+        .map_or_else(|| sibling_name.to_string(), |(parent, _)| format!("{parent}/{sibling_name}"))
+}
+
 async fn finalize_download_result<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
@@ -458,7 +1259,8 @@ async fn finalize_download_result<R: Runtime>(
     let latest = state.storage.get_file_transfer(transfer_id).await.ok().flatten();
     if result.is_err() && latest.as_ref().is_some_and(|record| record.status == "publishing") {
         if let Some(record) = latest.as_ref() {
-            if let Err(error) = recover_interrupted_transfer(state, record).await {
+            let file_manager = app.state::<FileManagerRuntime>();
+            if let Err(error) = recover_interrupted_transfer(state, file_manager.inner(), record).await {
                 log::error!("Failed to reconcile publishing file transfer: {error}");
             }
         }
@@ -794,6 +1596,64 @@ async fn wait_at_test_remote_reader_barrier() {
 
 #[cfg(not(test))]
 async fn wait_at_test_remote_reader_barrier() {}
+
+#[cfg(test)]
+fn install_test_upload_after_chunk_barrier() -> TestRemoteReaderBarrier {
+    let barrier = TestRemoteReaderBarrier {
+        opened: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *TEST_UPLOAD_AFTER_CHUNK_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn wait_at_test_upload_after_chunk_barrier() {
+    let barrier = TEST_UPLOAD_AFTER_CHUNK_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.opened.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn wait_at_test_upload_after_chunk_barrier() {}
+
+#[cfg(test)]
+fn install_test_upload_after_close_barrier() -> TestRemoteReaderBarrier {
+    let barrier = TestRemoteReaderBarrier {
+        opened: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *TEST_UPLOAD_AFTER_CLOSE_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn wait_at_test_upload_after_close_barrier() {
+    let barrier = TEST_UPLOAD_AFTER_CLOSE_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.opened.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn wait_at_test_upload_after_close_barrier() {}
 
 #[cfg(test)]
 fn install_test_blocking_barrier(
@@ -1304,7 +2164,234 @@ fn validate_local_authorization(scope: &tauri::fs::Scope, path: &Path) -> Result
     }
 }
 
-async fn recover_interrupted_transfer(state: &AppState, transfer: &FileTransferStorageRecord) -> Result<(), String> {
+async fn validate_local_source(path: &Path) -> Result<ValidatedLocalSource, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || validate_local_source_sync(&path)).await.map_err(|error| error.to_string())?
+}
+
+fn validate_local_source_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("Local upload source must be an absolute path".to_string());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir))
+    {
+        return Err("Local upload source cannot contain '.' or '..' path segments".to_string());
+    }
+    if path.file_name().is_none() {
+        return Err("Local upload source must name a file".to_string());
+    }
+    Ok(path.to_path_buf())
+}
+
+fn validate_local_source_sync(path: &Path) -> Result<ValidatedLocalSource, String> {
+    let path = validate_local_source_path(path)?;
+    let parent = path.parent().ok_or_else(|| "Local upload source parent is required".to_string())?;
+    let name = single_file_name(&path, "Local upload source")?;
+    let directory = open_absolute_directory_nofollow(parent)
+        .map_err(|error| format!("Local upload source parent is unavailable or unsafe: {error}"))?;
+    let path_metadata =
+        directory.symlink_metadata(&name).map_err(|error| format!("Local upload source is unavailable: {error}"))?;
+    if path_metadata.file_type().is_symlink() {
+        return Err("Local upload source cannot be a symbolic link".to_string());
+    }
+    if !path_metadata.is_file() {
+        return Err("Local upload source must be a regular file".to_string());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let file = directory
+        .open_with(&name, &options)
+        .map_err(|error| format!("Failed to open upload source safely: {error}"))?;
+    let opened_metadata =
+        file.metadata().map_err(|error| format!("Failed to inspect the opened upload source: {error}"))?;
+    if metadata_identity(&path_metadata) != metadata_identity(&opened_metadata) {
+        return Err("Local upload source changed while it was being opened".to_string());
+    }
+    let total_bytes =
+        i64::try_from(opened_metadata.len()).map_err(|_| "Local upload source is too large".to_string())?;
+    let directory_identity =
+        directory_identity(&directory).map_err(|error| format!("Failed to identify upload source parent: {error}"))?;
+    let file = file.into_std();
+    let verification_file = Arc::new(
+        file.try_clone().map_err(|error| format!("Failed to retain upload source verification handle: {error}"))?,
+    );
+    let fingerprint = source_fingerprint_for_open_file(&file)?;
+    Ok(ValidatedLocalSource {
+        path,
+        directory_identity,
+        identity: metadata_identity(&opened_metadata),
+        fingerprint,
+        total_bytes,
+        file,
+        verification_file,
+    })
+}
+
+fn verify_upload_source_unchanged(proof: &UploadSourceProof, bytes_transferred: i64) -> Result<(), String> {
+    let parent = proof.path.parent().ok_or_else(|| "Local upload source parent is required".to_string())?;
+    let name = single_file_name(&proof.path, "Local upload source")?;
+    let directory = open_absolute_directory_nofollow(parent)
+        .map_err(|error| format!("Local upload source parent changed or became unsafe: {error}"))?;
+    if directory_identity(&directory).map_err(|error| format!("Failed to verify upload source parent: {error}"))?
+        != proof.directory_identity
+    {
+        return Err("Upload source parent changed while the transfer was running".to_string());
+    }
+    let path_metadata = directory.symlink_metadata(&name).map_err(|error| {
+        format!("Local upload source changed or disappeared while the transfer was running: {error}")
+    })?;
+    let final_fingerprint = source_fingerprint_for_open_file(&proof.verification_file)?;
+    if path_metadata.file_type().is_symlink()
+        || !path_metadata.is_file()
+        || metadata_identity(&path_metadata) != proof.identity
+        || bytes_transferred != proof.total_bytes
+        || final_fingerprint != proof.fingerprint
+    {
+        return Err("Upload source changed while the transfer was running; the remote partial will not be published"
+            .to_string());
+    }
+    Ok(())
+}
+
+fn source_fingerprint_for_open_file(file: &std::fs::File) -> Result<String, String> {
+    let metadata =
+        file.metadata().map_err(|error| format!("Failed to inspect the opened upload source handle: {error}"))?;
+    let change_token = source_change_token_for_open_file(file, &metadata)?;
+    Ok(source_fingerprint(metadata.len(), metadata.modified().ok(), change_token))
+}
+
+fn source_fingerprint(length: u64, modified: Option<std::time::SystemTime>, change_token: String) -> String {
+    let modified = modified
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| format!("{}:{}", value.as_secs(), value.subsec_nanos()))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{length}:{modified}:{change_token}")
+}
+
+#[cfg(unix)]
+fn source_change_token_for_open_file(_file: &std::fs::File, metadata: &std::fs::Metadata) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(format!("ctime:{}:{}", metadata.ctime(), metadata.ctime_nsec()))
+}
+
+#[cfg(windows)]
+fn source_change_token_for_open_file(file: &std::fs::File, _metadata: &std::fs::Metadata) -> Result<String, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO};
+
+    let mut basic_info = FILE_BASIC_INFO::default();
+    let result = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut basic_info as *mut FILE_BASIC_INFO).cast(),
+            u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>())
+                .map_err(|_| "Windows FILE_BASIC_INFO size is not representable".to_string())?,
+        )
+    };
+    if result == 0 {
+        return Err(format!(
+            "Failed to read the upload source Windows change token: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(format!("change_time:{}", basic_info.ChangeTime))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn source_change_token_for_open_file(_file: &std::fs::File, _metadata: &std::fs::Metadata) -> Result<String, String> {
+    Err("Upload source change-token verification is unsupported on this platform".to_string())
+}
+
+fn validate_local_upload_authorization(scope: &tauri::fs::Scope, path: &Path) -> Result<(), String> {
+    if scope.is_allowed(path) {
+        Ok(())
+    } else {
+        Err("Local upload source is not authorized; choose it with the open dialog".to_string())
+    }
+}
+
+async fn recover_interrupted_transfer(
+    state: &AppState,
+    file_manager: &FileManagerRuntime,
+    transfer: &FileTransferStorageRecord,
+) -> Result<(), String> {
+    if transfer.direction == "upload" {
+        let owned_partial =
+            transfer.temp_path.as_deref().filter(|path| is_owned_upload_partial(transfer, path)).map(str::to_string);
+        let (status, partial_destination, abort_outcome, publish_outcome, error) = if transfer.status == "publishing"
+            && owned_partial.is_some()
+        {
+            match file_manager.reconcile_interrupted_upload(state, transfer).await {
+                Ok(UploadPublishResolution { state: UploadPublishState::PartialSource, detail }) => (
+                    "partial",
+                    owned_partial,
+                    Some("not_applicable_after_close".to_string()),
+                    Some("partial_source".to_string()),
+                    format!("Interrupted upload publish left its operation-owned source partial: {detail}"),
+                ),
+                Ok(UploadPublishResolution { state: UploadPublishState::PartialTarget, detail }) => (
+                    "partial",
+                    Some(transfer.remote_path.clone()),
+                    Some("not_applicable_after_close".to_string()),
+                    Some("partial_target_unproven".to_string()),
+                    format!("Interrupted upload publish left an unproven target: {detail}"),
+                ),
+                Ok(UploadPublishResolution { state: UploadPublishState::Unknown, detail }) => (
+                    "partial",
+                    None,
+                    Some("not_applicable_after_close".to_string()),
+                    Some("unknown".to_string()),
+                    format!("Interrupted upload publish outcome is unknown: {detail}"),
+                ),
+                Ok(UploadPublishResolution { state: UploadPublishState::Completed, .. }) => {
+                    unreachable!("read-only interrupted publish reconciliation cannot prove ownership")
+                }
+                Err(error) => (
+                    "partial",
+                    owned_partial,
+                    Some("not_applicable_after_close".to_string()),
+                    Some("unknown".to_string()),
+                    format!("Interrupted upload publish could not be reconciled safely: {error}"),
+                ),
+            }
+        } else if let Some(path) = owned_partial {
+            (
+                    "partial",
+                    Some(path.clone()),
+                    Some("not_attempted_after_application_exit".to_string()),
+                    None,
+                    format!(
+                        "The application exited before the upload completed; operation-owned remote partial may remain at {path}"
+                    ),
+                )
+        } else {
+            (
+                "failed",
+                None,
+                Some("not_attempted_after_application_exit".to_string()),
+                None,
+                "The application exited before the upload created an owned remote partial".to_string(),
+            )
+        };
+        state
+            .storage
+            .finish_file_upload_transfer(
+                &transfer.id,
+                status.to_string(),
+                transfer.bytes_transferred,
+                transfer.total_bytes,
+                Some(error),
+                partial_destination,
+                abort_outcome,
+                publish_outcome,
+            )
+            .await?;
+        return Ok(());
+    }
     let Some(temp_path) = transfer.temp_path.as_deref() else {
         if transfer.status == "publishing" {
             state
@@ -1432,6 +2519,19 @@ async fn recover_interrupted_transfer(state: &AppState, transfer: &FileTransferS
     Ok(())
 }
 
+fn is_owned_upload_partial(transfer: &FileTransferStorageRecord, partial_path: &str) -> bool {
+    if transfer.direction != "upload" {
+        return false;
+    }
+    let target_parent = transfer.remote_path.rsplit_once('/').map(|(parent, _)| parent);
+    let partial_parent = partial_path.rsplit_once('/').map(|(parent, _)| parent);
+    if target_parent != partial_parent {
+        return false;
+    }
+    let name = partial_path.rsplit('/').next().unwrap_or(partial_path);
+    name.starts_with(&format!(".dbx-upload-{}-", transfer.id)) && name.ends_with(".part")
+}
+
 fn is_owned_temp_path(transfer: &FileTransferStorageRecord, temp_path: &Path) -> bool {
     if transfer.direction != "download" {
         return false;
@@ -1458,8 +2558,20 @@ fn cancelled_active_failure() -> TransferFailure {
     TransferFailure { status: "cancelled", message: "Download cancelled".to_string(), invalidate_operator: true }
 }
 
+fn upload_cancelled_failure() -> TransferFailure {
+    TransferFailure { status: "cancelled", message: "Upload cancelled".to_string(), invalidate_operator: false }
+}
+
+fn upload_cancelled_active_failure() -> TransferFailure {
+    TransferFailure { status: "cancelled", message: "Upload cancelled".to_string(), invalidate_operator: true }
+}
+
 fn remote_failure(message: impl ToString) -> TransferFailure {
     TransferFailure { status: "failed", message: message.to_string(), invalidate_operator: true }
+}
+
+fn partial_failure(message: impl ToString) -> TransferFailure {
+    TransferFailure { status: "partial", message: message.to_string(), invalidate_operator: true }
 }
 
 fn local_failure(message: impl ToString) -> TransferFailure {
@@ -1498,6 +2610,31 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum FakeAbortBehavior {
+        Success,
+        Unsupported,
+        Failed,
+        Stalled,
+    }
+
+    struct FakeAbortableUpload {
+        behavior: FakeAbortBehavior,
+    }
+
+    impl AbortableUpload for FakeAbortableUpload {
+        fn abort(&mut self) -> Pin<Box<dyn Future<Output = Result<(), UploadAbortError>> + Send + '_>> {
+            Box::pin(async move {
+                match self.behavior {
+                    FakeAbortBehavior::Success => Ok(()),
+                    FakeAbortBehavior::Unsupported => Err(UploadAbortError::Unsupported),
+                    FakeAbortBehavior::Failed => Err(UploadAbortError::Failed("injected abort failure".to_string())),
+                    FakeAbortBehavior::Stalled => std::future::pending().await,
+                }
+            })
+        }
+    }
+
     struct DiskFullWriter;
 
     impl AsyncWrite for DiskFullWriter {
@@ -1516,6 +2653,40 @@ mod tests {
 
     struct DiskFullAfterFirstWrite {
         writes: usize,
+    }
+
+    #[test]
+    fn upload_policy_is_required_and_rejects_replace_or_false_safety_claims() {
+        let valid = serde_json::json!({
+            "connectionId": "ftp-1",
+            "localPath": "/tmp/source.bin",
+            "remotePath": "source.bin",
+            "policy": {
+                "mode": "best_effort_no_clobber",
+                "atomicNoClobber": false,
+                "externalToctouRisk": true
+            }
+        });
+        let parsed: StartUploadInput = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(parsed.policy, UploadPolicy::best_effort_no_clobber());
+        parsed.policy.validate().unwrap();
+
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("policy");
+        assert!(serde_json::from_value::<StartUploadInput>(missing).is_err());
+
+        let mut replace = valid.clone();
+        replace["policy"]["mode"] = serde_json::json!("replace");
+        assert!(serde_json::from_value::<StartUploadInput>(replace).is_err());
+
+        let mut unknown = valid.clone();
+        unknown["policy"]["overwrite"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<StartUploadInput>(unknown).is_err());
+
+        let mut false_atomic_claim = valid;
+        false_atomic_claim["policy"]["atomicNoClobber"] = serde_json::json!(true);
+        let parsed: StartUploadInput = serde_json::from_value(false_atomic_claim).unwrap();
+        assert!(parsed.policy.validate().unwrap_err().contains("atomicNoClobber=false"));
     }
 
     impl AsyncWrite for DiskFullAfterFirstWrite {
@@ -1590,6 +2761,10 @@ mod tests {
         directory_identity(&directory).unwrap()
     }
 
+    async fn recover_test_transfer(state: &AppState, transfer: &FileTransferStorageRecord) {
+        recover_interrupted_transfer(state, &FileManagerRuntime::default(), transfer).await.unwrap();
+    }
+
     #[tokio::test]
     async fn local_destination_must_be_absolute_new_and_not_symlinked() {
         assert!(validate_local_destination(Path::new("relative/file.bin")).await.is_err());
@@ -1618,6 +2793,200 @@ mod tests {
         assert!(validate_local_authorization(&scope, &target).is_ok());
         assert!(scope.is_allowed(&target), "nonexistent authorized target must remain matchable");
         drop(app);
+    }
+
+    #[tokio::test]
+    async fn local_upload_source_requires_absolute_regular_nofollow_file() {
+        assert!(validate_local_source(Path::new("relative/file.bin")).await.unwrap_err().contains("absolute"));
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        assert!(validate_local_source(&parent).await.unwrap_err().contains("regular file"));
+        let source = parent.join("source.bin");
+        tokio::fs::write(&source, b"payload").await.unwrap();
+        let validated = validate_local_source(&source).await.unwrap();
+        assert_eq!(validated.path, source);
+        assert_eq!(validated.total_bytes, 7);
+        assert_eq!(validated.directory_identity, canonical_directory_identity(&parent));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let link = parent.join("source-link.bin");
+            symlink(&source, &link).unwrap();
+            assert!(validate_local_source(&link).await.unwrap_err().contains("symbolic link"));
+        }
+    }
+
+    #[test]
+    fn local_upload_source_requires_dialog_scope_authorization() {
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().canonicalize().unwrap().join("source.bin");
+        std::fs::write(&source, b"payload").unwrap();
+        let scope = app.fs_scope();
+        assert!(validate_local_upload_authorization(&scope, &source).unwrap_err().contains("not authorized"));
+        scope.allow_file(&source).unwrap();
+        assert!(validate_local_upload_authorization(&scope, &source).is_ok());
+        drop(app);
+    }
+
+    #[tokio::test]
+    async fn opened_upload_handle_remains_bound_and_path_replacement_is_rejected() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let source = parent.join("source.bin");
+        let moved = parent.join("opened-source.bin");
+        tokio::fs::write(&source, b"original").await.unwrap();
+        let validated = validate_local_source(&source).await.unwrap();
+
+        tokio::fs::rename(&source, &moved).await.unwrap();
+        tokio::fs::write(&source, b"attacker").await.unwrap();
+        let mut opened = &validated.file;
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"original");
+        assert!(verify_upload_source_unchanged(&validated.proof(), 8).unwrap_err().contains("changed"));
+    }
+
+    #[tokio::test]
+    async fn upload_source_truncation_growth_and_modification_are_rejected() {
+        async fn assert_changed(initial: &[u8], replacement: &[u8], transferred: i64) {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().canonicalize().unwrap().join("source.bin");
+            tokio::fs::write(&source, initial).await.unwrap();
+            let validated = validate_local_source(&source).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            tokio::fs::write(&source, replacement).await.unwrap();
+            assert!(verify_upload_source_unchanged(&validated.proof(), transferred).unwrap_err().contains("changed"));
+        }
+
+        assert_changed(b"original", b"short", 5).await;
+        assert_changed(b"original", b"original-longer", 15).await;
+        assert_changed(b"original", b"modified", 8).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_source_same_size_rewrite_is_rejected_after_mtime_is_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().canonicalize().unwrap().join("source.bin");
+        tokio::fs::write(&source, b"original").await.unwrap();
+        let validated = validate_local_source(&source).await.unwrap();
+        let original_modified = validated.file.metadata().unwrap().modified().unwrap();
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::fs::write(&source, b"modified").await.unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+
+        assert_eq!(validated.file.metadata().unwrap().modified().unwrap(), original_modified);
+        assert!(verify_upload_source_unchanged(&validated.proof(), 8).unwrap_err().contains("changed"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_upload_source_change_token_comes_from_the_open_file_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.bin");
+        std::fs::write(&source, b"original").unwrap();
+        let file = std::fs::File::open(&source).unwrap();
+        let metadata = file.metadata().unwrap();
+        let initial = source_change_token_for_open_file(&file, &metadata).unwrap();
+
+        std::thread::sleep(Duration::from_millis(2));
+        std::fs::write(&source, b"modified").unwrap();
+        let changed = source_change_token_for_open_file(&file, &file.metadata().unwrap()).unwrap();
+
+        assert_ne!(initial, changed);
+        assert!(initial.starts_with("change_time:"));
+    }
+
+    #[tokio::test]
+    async fn upload_abort_control_flow_covers_success_failure_unsupported_and_timeout() {
+        let cleanup_called = Arc::new(AtomicBool::new(false));
+        let cleanup_probe = cleanup_called.clone();
+        let succeeded = abort_upload_control_flow(
+            FakeAbortableUpload { behavior: FakeAbortBehavior::Success },
+            "dir/.dbx-upload-transfer-random.part",
+            upload_cancelled_active_failure(),
+            Duration::from_millis(10),
+            move || async move {
+                cleanup_probe.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(succeeded.failure.status, "cancelled");
+        assert_eq!(succeeded.partial_destination, None);
+        assert_eq!(succeeded.abort_outcome.as_deref(), Some("succeeded"));
+        assert!(!cleanup_called.load(Ordering::Acquire));
+
+        let cleanup_called = Arc::new(AtomicBool::new(false));
+        let cleanup_probe = cleanup_called.clone();
+        let unsupported_cleaned = abort_upload_control_flow(
+            FakeAbortableUpload { behavior: FakeAbortBehavior::Unsupported },
+            "dir/.dbx-upload-transfer-random.part",
+            upload_cancelled_active_failure(),
+            Duration::from_millis(10),
+            move || async move {
+                cleanup_probe.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(unsupported_cleaned.failure.status, "cancelled");
+        assert_eq!(unsupported_cleaned.partial_destination, None);
+        assert_eq!(unsupported_cleaned.abort_outcome.as_deref(), Some("unsupported; operation_owned_partial_cleaned"));
+        assert!(cleanup_called.load(Ordering::Acquire));
+
+        let cleanup_called = Arc::new(AtomicBool::new(false));
+        let cleanup_probe = cleanup_called.clone();
+        let failed_uncleaned = abort_upload_control_flow(
+            FakeAbortableUpload { behavior: FakeAbortBehavior::Failed },
+            "dir/.dbx-upload-transfer-random.part",
+            remote_failure("write failed"),
+            Duration::from_millis(10),
+            move || async move {
+                cleanup_probe.store(true, Ordering::Release);
+                Err("injected cleanup failure".to_string())
+            },
+        )
+        .await;
+        assert_eq!(failed_uncleaned.failure.status, "partial");
+        assert_eq!(failed_uncleaned.partial_destination.as_deref(), Some("dir/.dbx-upload-transfer-random.part"));
+        assert_eq!(failed_uncleaned.abort_outcome.as_deref(), Some("failed: injected abort failure"));
+        assert!(failed_uncleaned.failure.invalidate_operator);
+        assert!(failed_uncleaned.failure.message.contains("cleanup failed safely"));
+        assert!(cleanup_called.load(Ordering::Acquire));
+
+        let cleanup_called = Arc::new(AtomicBool::new(false));
+        let cleanup_probe = cleanup_called.clone();
+        let timed_out = abort_upload_control_flow(
+            FakeAbortableUpload { behavior: FakeAbortBehavior::Stalled },
+            "dir/.dbx-upload-transfer-random.part",
+            remote_failure("write timed out"),
+            Duration::from_millis(1),
+            move || async move {
+                cleanup_probe.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(timed_out.failure.status, "failed");
+        assert_eq!(timed_out.partial_destination, None);
+        assert_eq!(timed_out.abort_outcome.as_deref(), Some("timed_out; operation_owned_partial_cleaned"));
+        assert!(timed_out.failure.invalidate_operator);
+        assert!(cleanup_called.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1657,6 +3026,39 @@ mod tests {
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
         let runtime = app.state::<FileTransferRuntime>();
         let _global_barrier = runtime.global_limit.clone().acquire_many_owned(8).await.unwrap();
+        let authorized_secret = parent.join("authorized-secret.bin");
+        std::fs::write(&authorized_secret, b"secret").unwrap();
+        let unauthorized_existing = start_upload_inner(
+            app.handle().clone(),
+            window.clone(),
+            &state,
+            runtime.inner(),
+            StartUploadInput {
+                connection_id: "ftp-command".to_string(),
+                local_path: authorized_secret.to_string_lossy().into_owned(),
+                remote_path: "secret.bin".to_string(),
+                policy: UploadPolicy::best_effort_no_clobber(),
+            },
+        )
+        .await
+        .unwrap_err();
+        let unauthorized_missing = start_upload_inner(
+            app.handle().clone(),
+            window.clone(),
+            &state,
+            runtime.inner(),
+            StartUploadInput {
+                connection_id: "ftp-command".to_string(),
+                local_path: parent.join("missing-secret.bin").to_string_lossy().into_owned(),
+                remote_path: "secret.bin".to_string(),
+                policy: UploadPolicy::best_effort_no_clobber(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unauthorized_existing, unauthorized_missing);
+        assert!(unauthorized_existing.contains("not authorized"));
+
         let target = parent.join("raw-path.bin");
         let input = || StartDownloadInput {
             connection_id: "ftp-command".to_string(),
@@ -1677,7 +3079,9 @@ mod tests {
         assert!(serialized.get("bytes").is_none());
         assert!(serialized.get("bytesTransferred").is_none());
 
-        let persisted = get_file_transfer_inner(&state, runtime.inner(), &started.transfer_id).await.unwrap();
+        let file_manager = app.state::<FileManagerRuntime>();
+        let persisted =
+            get_file_transfer_inner(&state, runtime.inner(), file_manager.inner(), &started.transfer_id).await.unwrap();
         assert_eq!(persisted.remote_path, "a%2Fb");
         assert_eq!(persisted.status, "queued");
         let serialized = serde_json::to_value(&persisted).unwrap();
@@ -1685,14 +3089,22 @@ mod tests {
         assert!(serialized.get("tempPath").is_none());
         assert!(serialized.get("tempIdentity").is_none());
 
-        let cancelling =
-            cancel_file_transfer_inner(app.handle(), &state, runtime.inner(), &started.transfer_id).await.unwrap();
+        let cancelling = cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            runtime.inner(),
+            file_manager.inner(),
+            &started.transfer_id,
+        )
+        .await
+        .unwrap();
         assert_eq!(cancelling.status, "cancelling");
         let terminal = wait_for_transfer_status(&state.storage, &started.transfer_id, &["cancelled"]).await;
         assert_eq!(terminal.bytes_transferred, 0);
-        let queried = get_file_transfer_inner(&state, runtime.inner(), &started.transfer_id).await.unwrap();
+        let queried =
+            get_file_transfer_inner(&state, runtime.inner(), file_manager.inner(), &started.transfer_id).await.unwrap();
         assert_eq!(queried.status, "cancelled");
-        assert!(list_file_transfers_inner(&state, runtime.inner(), Some("ftp-command"))
+        assert!(list_file_transfers_inner(&state, runtime.inner(), file_manager.inner(), Some("ftp-command"))
             .await
             .unwrap()
             .iter()
@@ -1880,6 +3292,10 @@ mod tests {
             local_directory_identity: "identity".to_string(),
             temp_path: None,
             temp_identity: None,
+            connection_revision: None,
+            partial_destination: None,
+            abort_outcome: None,
+            publish_outcome: None,
             status: "running".to_string(),
             bytes_transferred: 10,
             total_bytes: Some(20),
@@ -1892,6 +3308,56 @@ mod tests {
         assert!(is_owned_temp_path(&transfer, &owned));
         assert!(!is_owned_temp_path(&transfer, &target.parent().unwrap().join(".dbx-download-other-random.part")));
         assert!(!is_owned_temp_path(&transfer, &target.parent().unwrap().join("../outside.part")));
+    }
+
+    #[tokio::test]
+    async fn upload_crash_recovery_reports_only_an_owned_remote_partial() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let state = AppState::new(storage);
+        state
+            .storage
+            .create_file_transfer(
+                "upload-crash".into(),
+                "connection-1".into(),
+                "upload".into(),
+                "reports/final.csv".into(),
+                parent.join("source.csv").to_string_lossy().into_owned(),
+                canonical_directory_identity(&parent),
+            )
+            .await
+            .unwrap();
+        let owned_partial = "reports/.dbx-upload-upload-crash-random.part";
+        state
+            .storage
+            .update_file_transfer(
+                "upload-crash",
+                "running".into(),
+                11,
+                Some(20),
+                Some(owned_partial.into()),
+                Some("source-fingerprint".into()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        assert_eq!(interrupted.len(), 1);
+        recover_test_transfer(&state, &interrupted[0]).await;
+        let recovered = state.storage.get_file_transfer("upload-crash").await.unwrap().unwrap();
+        assert_eq!(recovered.status, "partial");
+        assert_eq!(recovered.partial_destination.as_deref(), Some(owned_partial));
+        assert_eq!(recovered.abort_outcome.as_deref(), Some("not_attempted_after_application_exit"));
+        assert!(recovered.error.as_deref().unwrap().contains(owned_partial));
+
+        let non_owned = FileTransferStorageRecord {
+            temp_path: Some("reports/.dbx-upload-someone-else-random.part".into()),
+            ..interrupted[0].clone()
+        };
+        assert!(!is_owned_upload_partial(&non_owned, non_owned.temp_path.as_deref().unwrap()));
     }
 
     #[tokio::test]
@@ -1933,7 +3399,7 @@ mod tests {
 
         let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
         assert_eq!(interrupted.len(), 1);
-        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+        recover_test_transfer(&state, &interrupted[0]).await;
         assert!(!owned.exists());
         assert_eq!(tokio::fs::read(&unrelated).await.unwrap(), b"unrelated");
         let recovered = state.storage.get_file_transfer("transfer-1").await.unwrap().unwrap();
@@ -1978,7 +3444,7 @@ mod tests {
             .unwrap();
 
         let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
-        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+        recover_test_transfer(&state, &interrupted[0]).await;
         assert_eq!(tokio::fs::read(&owned).await.unwrap(), b"partial");
         let recovered = state.storage.get_file_transfer("transfer-create-window").await.unwrap().unwrap();
         assert_eq!(recovered.status, "failed");
@@ -2031,7 +3497,7 @@ mod tests {
 
         let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
         assert_eq!(interrupted[0].status, "publishing");
-        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+        recover_test_transfer(&state, &interrupted[0]).await;
         let recovered = state.storage.get_file_transfer("transfer-publishing").await.unwrap().unwrap();
         assert_eq!(recovered.status, "completed");
         assert_eq!(std::fs::read(target).unwrap(), b"complete payload");
@@ -2084,7 +3550,7 @@ mod tests {
         std::fs::remove_file(&temp_path).unwrap();
         std::fs::write(&target, b"user replacement").unwrap();
         let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
-        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+        recover_test_transfer(&state, &interrupted[0]).await;
 
         let recovered = state.storage.get_file_transfer("transfer-publishing-mismatch").await.unwrap().unwrap();
         assert_eq!(recovered.status, "failed");
@@ -2149,7 +3615,7 @@ mod tests {
             .await
             .unwrap();
         let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
-        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+        recover_test_transfer(&state, &interrupted[0]).await;
         assert_eq!(std::fs::read(attacker_temp).unwrap(), b"do not delete");
         assert_eq!(state.storage.get_file_transfer("transfer-swap").await.unwrap().unwrap().status, "failed");
     }
@@ -2200,6 +3666,57 @@ mod tests {
         assert_eq!(runtime.connection_limit("ftp-1").available_permits(), 4);
         assert!(!cancelled_failure().invalidate_operator);
         assert!(cancelled_active_failure().invalidate_operator);
+    }
+
+    #[test]
+    fn upload_handle_admission_is_bounded_globally_and_per_connection() {
+        let runtime = FileTransferRuntime::default();
+        for index in 0..CONNECTION_UPLOAD_HANDLE_LIMIT {
+            runtime.register_upload(format!("same-{index}"), "ftp-1".to_string(), CancellationToken::new()).unwrap();
+        }
+        assert!(runtime
+            .register_upload("same-overflow".to_string(), "ftp-1".to_string(), CancellationToken::new())
+            .unwrap_err()
+            .contains("this connection"));
+        for index in CONNECTION_UPLOAD_HANDLE_LIMIT..GLOBAL_UPLOAD_HANDLE_LIMIT {
+            runtime
+                .register_upload(format!("global-{index}"), format!("ftp-{index}"), CancellationToken::new())
+                .unwrap();
+        }
+        assert!(runtime
+            .register_upload("global-overflow".to_string(), "another".to_string(), CancellationToken::new())
+            .unwrap_err()
+            .contains("Too many active"));
+    }
+
+    #[tokio::test]
+    async fn prepared_upload_does_not_hold_the_connection_mutation_lock_during_data_flow() {
+        use super::super::file_manager::{password_scope, FileConnectionConfig, FtpConnectionConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let config = FileConnectionConfig::Ftp(FtpConnectionConfig {
+            endpoint: "ftp://127.0.0.1:9".to_string(),
+            root: "/".to_string(),
+            username: "dbx".to_string(),
+        });
+        storage
+            .save_file_connection(
+                "ftp-lock".into(),
+                "FTP lock".into(),
+                "ftp".into(),
+                serde_json::to_string(&config).unwrap(),
+                Some("password".into()),
+                password_scope(&config).unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = AppState::new(storage);
+        let runtime = FileManagerRuntime::default();
+        let prepared = runtime.prepare_file_mutation_operation(&state, "ftp-lock", "target.bin", 1).await.unwrap();
+        assert!(prepared.mutation_lock_is_available());
     }
 
     #[tokio::test]
@@ -2348,19 +3865,22 @@ mod tests {
         let state = Arc::new(AppState::new(storage));
         let app = tauri::test::mock_builder()
             .manage(state.clone())
+            .manage(FileManagerRuntime::default())
             .manage(FileTransferRuntime::default())
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
         finalize_download_result(app.handle(), &state, "disk-full", Err(failure), &progress).await;
 
         let runtime = app.state::<FileTransferRuntime>();
-        let terminal = get_file_transfer_inner(&state, runtime.inner(), "disk-full").await.unwrap();
+        let file_manager = app.state::<FileManagerRuntime>();
+        let terminal =
+            get_file_transfer_inner(&state, runtime.inner(), file_manager.inner(), "disk-full").await.unwrap();
         assert_eq!(terminal.bytes_transferred, 1_024);
         assert_eq!(terminal.total_bytes, Some(2_048));
         assert_eq!(terminal.status, "failed");
         assert!(!temp_path.exists());
         assert!(!target.exists());
-        assert!(list_file_transfers_inner(&state, runtime.inner(), Some("connection-1"))
+        assert!(list_file_transfers_inner(&state, runtime.inner(), file_manager.inner(), Some("connection-1"))
             .await
             .unwrap()
             .iter()
@@ -2491,6 +4011,47 @@ mod tests {
         (cancellation, worker)
     }
 
+    async fn create_upload_worker_transfer<R>(
+        app: &tauri::App<R>,
+        transfer_id: &str,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> (CancellationToken, tokio::task::JoinHandle<()>)
+    where
+        R: Runtime,
+    {
+        let local = validate_local_source(local_path).await.unwrap();
+        let state = app.state::<Arc<AppState>>();
+        let connection = state.storage.load_file_connection("ftp-contract").await.unwrap().unwrap();
+        state
+            .storage
+            .create_file_upload_transfer(
+                transfer_id.to_string(),
+                "ftp-contract".into(),
+                remote_path.to_string(),
+                local.path.to_string_lossy().into_owned(),
+                local.directory_identity.clone(),
+                local.fingerprint.clone(),
+                local.total_bytes,
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        app.state::<FileTransferRuntime>()
+            .register_upload(transfer_id.to_string(), "ftp-contract".into(), cancellation.clone())
+            .unwrap();
+        let worker = tokio::spawn(run_upload_worker(
+            app.handle().clone(),
+            transfer_id.to_string(),
+            "ftp-contract".into(),
+            cancellation.clone(),
+            local,
+            UploadPolicy::best_effort_no_clobber(),
+        ));
+        (cancellation, worker)
+    }
+
     fn assert_no_owned_temp(directory: &Path, transfer_id: &str) {
         let prefix = format!(".dbx-download-{transfer_id}-");
         let residuals = std::fs::read_dir(directory)
@@ -2500,6 +4061,431 @@ mod tests {
             .filter(|name| name.starts_with(&prefix) && name.ends_with(".part"))
             .collect::<Vec<_>>();
         assert!(residuals.is_empty(), "residual temporary files: {residuals:?}");
+    }
+
+    fn assert_no_remote_upload_partial(container: &str, transfer_id: &str) {
+        let prefix = format!(".dbx-upload-{transfer_id}-");
+        let output = Command::new("docker")
+            .args(["exec", container, "find", "/ftp/dbx", "-type", "f", "-name", &format!("{prefix}*.part"), "-print"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "docker find failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(output.stdout.is_empty(), "residual remote partial: {}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    async fn build_ftp_contract_app(
+    ) -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, opendal::Operator, tempfile::TempDir, String) {
+        use super::super::file_manager::{build_operator, password_scope, FileConnectionConfig, FtpConnectionConfig};
+
+        let endpoint = std::env::var("DBX_TEST_FTP_ENDPOINT").expect("DBX_TEST_FTP_ENDPOINT is required");
+        let username = std::env::var("DBX_TEST_FTP_USERNAME").unwrap_or_else(|_| "dbx".to_string());
+        let password = std::env::var("DBX_TEST_FTP_PASSWORD").unwrap_or_else(|_| "dbx-password".to_string());
+        let container = std::env::var("DBX_TEST_FTP_CONTAINER").expect("DBX_TEST_FTP_CONTAINER is required");
+        let config =
+            FileConnectionConfig::Ftp(FtpConnectionConfig { endpoint, root: "/ftp/dbx".to_string(), username });
+        let operator = build_operator(&config, Some(&password)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let scope = password_scope(&config).unwrap();
+        storage
+            .save_file_connection(
+                "ftp-contract".into(),
+                "FTP contract".into(),
+                "ftp".into(),
+                serde_json::to_string(&config).unwrap(),
+                Some(password),
+                scope,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        (app, state, operator, directory, container)
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/ftp-contract.sh with a pinned FTP image"]
+    async fn fixed_ftp_upload_contract() {
+        let (app, state, operator, directory, container) = build_ftp_contract_app().await;
+        let source_directory = directory.path().canonicalize().unwrap();
+        let payload = (0..(UPLOAD_BUFFER_SIZE + 257)).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+
+        let success_source = source_directory.join("upload-success.bin");
+        tokio::fs::write(&success_source, &payload).await.unwrap();
+        let (_, success_worker) =
+            create_upload_worker_transfer(&app, "ftp-upload-success", "upload-success.bin", &success_source).await;
+        success_worker.await.unwrap();
+        let success = state.storage.get_file_transfer("ftp-upload-success").await.unwrap().unwrap();
+        assert_eq!(success.status, "completed", "{success:?}");
+        assert_eq!(success.bytes_transferred, i64::try_from(payload.len()).unwrap());
+        assert_eq!(operator.read("ftp/dbx/upload-success.bin").await.unwrap().to_vec(), payload);
+        assert_no_remote_upload_partial(&container, "ftp-upload-success");
+
+        let empty_source = source_directory.join("upload-empty.bin");
+        tokio::fs::write(&empty_source, []).await.unwrap();
+        let (_, empty_worker) =
+            create_upload_worker_transfer(&app, "ftp-upload-empty", "upload-empty.bin", &empty_source).await;
+        empty_worker.await.unwrap();
+        let empty = state.storage.get_file_transfer("ftp-upload-empty").await.unwrap().unwrap();
+        assert_eq!(empty.status, "completed", "{empty:?}");
+        assert_eq!(empty.bytes_transferred, 0);
+        assert_eq!(operator.stat("ftp/dbx/upload-empty.bin").await.unwrap().content_length(), 0);
+        assert_no_remote_upload_partial(&container, "ftp-upload-empty");
+
+        let empty_changed_source = source_directory.join("upload-empty-changed.bin");
+        tokio::fs::write(&empty_changed_source, []).await.unwrap();
+        let empty_changed_barrier = install_test_upload_after_chunk_barrier();
+        let (_, empty_changed_worker) = create_upload_worker_transfer(
+            &app,
+            "ftp-upload-empty-changed",
+            "upload-empty-changed.bin",
+            &empty_changed_source,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), empty_changed_barrier.opened.notified())
+            .await
+            .expect("empty upload must reach its pre-create barrier");
+        tokio::fs::write(&empty_changed_source, b"changed").await.unwrap();
+        empty_changed_barrier.release.notify_one();
+        empty_changed_worker.await.unwrap();
+        let empty_changed = state.storage.get_file_transfer("ftp-upload-empty-changed").await.unwrap().unwrap();
+        assert_eq!(empty_changed.status, "failed", "{empty_changed:?}");
+        assert!(empty_changed.error.as_deref().is_some_and(|error| error.contains("source changed")));
+        assert_eq!(
+            operator.stat("ftp/dbx/upload-empty-changed.bin").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert_no_remote_upload_partial(&container, "ftp-upload-empty-changed");
+
+        let cancel_source = source_directory.join("upload-cancel.bin");
+        tokio::fs::write(&cancel_source, vec![7_u8; UPLOAD_BUFFER_SIZE * 2 + 17]).await.unwrap();
+        let cancel_barrier = install_test_upload_after_chunk_barrier();
+        let (cancel_token, cancel_worker) =
+            create_upload_worker_transfer(&app, "ftp-upload-cancel", "upload-cancel.bin", &cancel_source).await;
+        tokio::time::timeout(Duration::from_secs(10), cancel_barrier.opened.notified())
+            .await
+            .expect("upload must reach the first-chunk barrier");
+        state.storage.request_file_transfer_cancel("ftp-upload-cancel").await.unwrap();
+        cancel_token.cancel();
+        cancel_barrier.release.notify_one();
+        cancel_worker.await.unwrap();
+        let cancelled = state.storage.get_file_transfer("ftp-upload-cancel").await.unwrap().unwrap();
+        assert_eq!(cancelled.status, "cancelled", "{cancelled:?}");
+        assert_eq!(cancelled.partial_destination, None);
+        assert_eq!(cancelled.abort_outcome.as_deref(), Some("unsupported; operation_owned_partial_cleaned"));
+        assert!(cancelled.bytes_transferred > 0);
+        assert!(cancelled.bytes_transferred <= i64::try_from(UPLOAD_BUFFER_SIZE).unwrap());
+        assert_eq!(operator.stat("ftp/dbx/upload-cancel.bin").await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        assert_no_remote_upload_partial(&container, "ftp-upload-cancel");
+
+        let after_close_source = source_directory.join("upload-cancel-after-close.bin");
+        tokio::fs::write(&after_close_source, b"closed upload cancellation").await.unwrap();
+        let after_close_barrier = install_test_upload_after_close_barrier();
+        let (after_close_token, after_close_worker) = create_upload_worker_transfer(
+            &app,
+            "ftp-upload-cancel-after-close",
+            "upload-cancel-after-close.bin",
+            &after_close_source,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), after_close_barrier.opened.notified())
+            .await
+            .expect("upload must reach the post-close barrier");
+        state.storage.request_file_transfer_cancel("ftp-upload-cancel-after-close").await.unwrap();
+        after_close_token.cancel();
+        after_close_barrier.release.notify_one();
+        after_close_worker.await.unwrap();
+        let after_close = state.storage.get_file_transfer("ftp-upload-cancel-after-close").await.unwrap().unwrap();
+        assert_eq!(after_close.status, "cancelled", "{after_close:?}");
+        assert_eq!(after_close.partial_destination, None);
+        assert_eq!(
+            operator.stat("ftp/dbx/upload-cancel-after-close.bin").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert_no_remote_upload_partial(&container, "ftp-upload-cancel-after-close");
+
+        let changed_source = source_directory.join("upload-changed.bin");
+        tokio::fs::write(&changed_source, vec![3_u8; UPLOAD_BUFFER_SIZE * 2 + 17]).await.unwrap();
+        let changed_barrier = install_test_upload_after_chunk_barrier();
+        let (_, changed_worker) =
+            create_upload_worker_transfer(&app, "ftp-upload-changed", "upload-changed.bin", &changed_source).await;
+        tokio::time::timeout(Duration::from_secs(10), changed_barrier.opened.notified())
+            .await
+            .expect("upload must reach the source-change barrier");
+        tokio::fs::write(&changed_source, vec![5_u8; UPLOAD_BUFFER_SIZE * 2 + 17]).await.unwrap();
+        changed_barrier.release.notify_one();
+        changed_worker.await.unwrap();
+        let changed = state.storage.get_file_transfer("ftp-upload-changed").await.unwrap().unwrap();
+        assert_eq!(changed.status, "failed", "{changed:?}");
+        assert!(changed.error.as_deref().is_some_and(|error| error.contains("source changed")));
+        assert_eq!(changed.partial_destination, None);
+        assert_eq!(changed.abort_outcome.as_deref(), Some("unsupported; operation_owned_partial_cleaned"));
+        assert_eq!(operator.stat("ftp/dbx/upload-changed.bin").await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        assert_no_remote_upload_partial(&container, "ftp-upload-changed");
+
+        let revision_source = source_directory.join("upload-revision.bin");
+        tokio::fs::write(&revision_source, vec![6_u8; UPLOAD_BUFFER_SIZE * 2 + 17]).await.unwrap();
+        let revision_barrier = install_test_upload_after_chunk_barrier();
+        let (_, revision_worker) =
+            create_upload_worker_transfer(&app, "ftp-upload-revision", "upload-revision.bin", &revision_source).await;
+        tokio::time::timeout(Duration::from_secs(10), revision_barrier.opened.notified())
+            .await
+            .expect("upload must reach the revision-change barrier");
+        let current = state.storage.load_file_connection("ftp-contract").await.unwrap().unwrap();
+        let current_config: super::super::file_manager::FileConnectionConfig =
+            serde_json::from_str(&current.config_json).unwrap();
+        let current_scope = super::super::file_manager::password_scope(&current_config).unwrap();
+        state
+            .storage
+            .save_file_connection(
+                current.id,
+                current.name,
+                current.kind,
+                current.config_json,
+                None,
+                current_scope,
+                false,
+                Some(current.revision),
+            )
+            .await
+            .unwrap();
+        revision_barrier.release.notify_one();
+        revision_worker.await.unwrap();
+        let revision = state.storage.get_file_transfer("ftp-upload-revision").await.unwrap().unwrap();
+        assert_eq!(revision.status, "failed", "{revision:?}");
+        assert!(revision.error.as_deref().is_some_and(|error| error.contains("revision changed")));
+        assert_eq!(revision.partial_destination, None);
+        assert_eq!(
+            operator.stat("ftp/dbx/upload-revision.bin").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert_no_remote_upload_partial(&container, "ftp-upload-revision");
+
+        let recovery_id = "ftp-upload-publishing-recovery";
+        let recovery_partial = format!(".dbx-upload-{recovery_id}-random.part");
+        let recovery_payload = b"recovery!";
+        let recovery_fixture = Command::new("docker")
+            .args([
+                "exec",
+                &container,
+                "sh",
+                "-c",
+                &format!(
+                    "printf recovery > /ftp/dbx/{recovery_partial}; printf external > /ftp/dbx/upload-recovery-target.bin"
+                ),
+            ])
+            .status()
+            .unwrap();
+        assert!(recovery_fixture.success());
+        let recovery_connection = state.storage.load_file_connection("ftp-contract").await.unwrap().unwrap();
+        state
+            .storage
+            .create_file_upload_transfer(
+                recovery_id.into(),
+                "ftp-contract".into(),
+                "upload-recovery-target.bin".into(),
+                source_directory.join("recovery-source.bin").to_string_lossy().into_owned(),
+                canonical_directory_identity(&source_directory),
+                "recovery-source-fingerprint".into(),
+                i64::try_from(recovery_payload.len()).unwrap(),
+                recovery_connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .start_file_upload_transfer(
+                recovery_id,
+                recovery_partial.clone(),
+                "recovery-source-fingerprint".into(),
+                i64::try_from(recovery_payload.len()).unwrap(),
+                recovery_connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_transfer(
+                recovery_id,
+                "publishing".into(),
+                i64::try_from(recovery_payload.len()).unwrap(),
+                Some(i64::try_from(recovery_payload.len()).unwrap()),
+                Some(recovery_partial.clone()),
+                Some("recovery-source-fingerprint".into()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        let interrupted = interrupted.iter().find(|transfer| transfer.id == recovery_id).unwrap();
+        recover_interrupted_transfer(&state, app.state::<FileManagerRuntime>().inner(), interrupted).await.unwrap();
+        let recovered = state.storage.get_file_transfer(recovery_id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, "partial");
+        assert_eq!(recovered.partial_destination.as_deref(), Some(recovery_partial.as_str()));
+        assert_eq!(recovered.publish_outcome.as_deref(), Some("partial_source"));
+        assert!(recovered.error.as_deref().is_some_and(|error| error.contains("expected 9, actual 8")));
+        operator.delete(&format!("ftp/dbx/{recovery_partial}")).await.unwrap();
+        operator.delete("ftp/dbx/upload-recovery-target.bin").await.unwrap();
+
+        let readonly = Command::new("docker")
+            .args([
+                "exec",
+                &container,
+                "sh",
+                "-c",
+                "mkdir -p /ftp/dbx/readonly && chown root:root /ftp/dbx/readonly && chmod 0555 /ftp/dbx/readonly",
+            ])
+            .status()
+            .unwrap();
+        assert!(readonly.success());
+        let denied_source = source_directory.join("upload-denied.bin");
+        let denied_payload = b"permission denied fixture";
+        tokio::fs::write(&denied_source, denied_payload).await.unwrap();
+        let (_, denied_worker) =
+            create_upload_worker_transfer(&app, "ftp-upload-denied", "readonly/upload-denied.bin", &denied_source)
+                .await;
+        denied_worker.await.unwrap();
+        let denied = state.storage.get_file_transfer("ftp-upload-denied").await.unwrap().unwrap();
+        assert_eq!(denied.status, "failed", "{denied:?}");
+        assert_eq!(denied.bytes_transferred, i64::try_from(denied_payload.len()).unwrap());
+        assert_ne!(denied.status, "completed");
+        assert_eq!(
+            operator.stat("ftp/dbx/readonly/upload-denied.bin").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert_no_remote_upload_partial(&container, "ftp-upload-denied");
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/ftp-contract.sh with two pinned FTP services"]
+    async fn fixed_ftp_upload_queued_revision_contract() {
+        use super::super::file_manager::{build_operator, password_scope, FileConnectionConfig, FtpConnectionConfig};
+
+        let (app, state, primary_operator, directory, primary_container) = build_ftp_contract_app().await;
+        let source_directory = directory.path().canonicalize().unwrap();
+        let mut barriers = Vec::new();
+        let mut workers = Vec::new();
+        for index in 0..CONNECTION_TRANSFER_LIMIT {
+            let source = source_directory.join(format!("queue-holder-{index}.bin"));
+            tokio::fs::write(&source, vec![u8::try_from(index + 1).unwrap(); UPLOAD_BUFFER_SIZE + 17]).await.unwrap();
+            let barrier = install_test_upload_after_chunk_barrier();
+            let (_, worker) = create_upload_worker_transfer(
+                &app,
+                &format!("ftp-upload-queue-holder-{index}"),
+                &format!("queue-holder-{index}.bin"),
+                &source,
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(10), barrier.opened.notified())
+                .await
+                .expect("holder upload must occupy a connection permit");
+            barriers.push(barrier);
+            workers.push(worker);
+        }
+
+        let queued_id = "ftp-upload-queued-revision";
+        let queued_source = source_directory.join("queued-revision.bin");
+        tokio::fs::write(&queued_source, b"must never reach either FTP service").await.unwrap();
+        let (_, queued_worker) =
+            create_upload_worker_transfer(&app, queued_id, "queued-revision.bin", &queued_source).await;
+        tokio::task::yield_now().await;
+        let queued = state.storage.get_file_transfer(queued_id).await.unwrap().unwrap();
+        assert_eq!(queued.status, "queued", "{queued:?}");
+
+        let secondary_endpoint =
+            std::env::var("DBX_TEST_FTP_SECONDARY_ENDPOINT").expect("secondary FTP endpoint is required");
+        let secondary_container =
+            std::env::var("DBX_TEST_FTP_SECONDARY_CONTAINER").expect("secondary FTP container is required");
+        let current = state.storage.load_file_connection("ftp-contract").await.unwrap().unwrap();
+        let secondary_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
+            endpoint: secondary_endpoint,
+            root: "/ftp/dbx".to_string(),
+            username: "dbx".to_string(),
+        });
+        state
+            .storage
+            .save_file_connection(
+                current.id,
+                current.name,
+                current.kind,
+                serde_json::to_string(&secondary_config).unwrap(),
+                Some("dbx-password".to_string()),
+                password_scope(&secondary_config).unwrap(),
+                true,
+                Some(current.revision),
+            )
+            .await
+            .unwrap();
+
+        for barrier in barriers {
+            barrier.release.notify_one();
+        }
+        for worker in workers {
+            worker.await.unwrap();
+        }
+        queued_worker.await.unwrap();
+
+        let failed = state.storage.get_file_transfer(queued_id).await.unwrap().unwrap();
+        assert_eq!(failed.status, "failed", "{failed:?}");
+        assert_eq!(failed.bytes_transferred, 0);
+        assert!(failed.error.as_deref().is_some_and(|error| error.contains("connection revision changed")));
+        assert_eq!(
+            primary_operator.stat("ftp/dbx/queued-revision.bin").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert_no_remote_upload_partial(&primary_container, queued_id);
+
+        let secondary_operator = build_operator(&secondary_config, Some("dbx-password")).unwrap();
+        assert_eq!(
+            secondary_operator.stat("ftp/dbx/queued-revision.bin").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert_no_remote_upload_partial(&secondary_container, queued_id);
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/ftp-contract.sh with a pinned FTP image"]
+    async fn fixed_ftp_upload_disconnect_contract() {
+        let (app, state, operator, directory, container) = build_ftp_contract_app().await;
+        let source = directory.path().canonicalize().unwrap().join("upload-disconnect.bin");
+        tokio::fs::write(&source, vec![9_u8; UPLOAD_BUFFER_SIZE * 2 + 17]).await.unwrap();
+        let barrier = install_test_upload_after_chunk_barrier();
+        let (_, worker) =
+            create_upload_worker_transfer(&app, "ftp-upload-disconnect", "upload-disconnect.bin", &source).await;
+        tokio::time::timeout(Duration::from_secs(10), barrier.opened.notified())
+            .await
+            .expect("upload must reach the disconnect barrier");
+        assert_eq!(
+            operator.stat("ftp/dbx/upload-disconnect.bin").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        let killed = tokio::task::spawn_blocking(move || Command::new("docker").args(["kill", &container]).status())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(killed.success());
+        barrier.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(45), worker)
+            .await
+            .expect("disconnected upload must terminate within its watchdog")
+            .unwrap();
+        let disconnected = state.storage.get_file_transfer("ftp-upload-disconnect").await.unwrap().unwrap();
+        assert_eq!(disconnected.status, "partial", "{disconnected:?}");
+        assert_ne!(disconnected.status, "completed");
+        assert!(disconnected
+            .partial_destination
+            .as_deref()
+            .is_some_and(|path| path.starts_with(".dbx-upload-ftp-upload-disconnect-") && path.ends_with(".part")));
+        assert!(disconnected.abort_outcome.as_deref().is_some_and(|outcome| outcome.starts_with("unsupported")));
+        assert!(disconnected.error.as_deref().is_some_and(|error| error.contains("cleanup failed safely")));
     }
 
     #[tokio::test]

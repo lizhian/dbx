@@ -245,18 +245,21 @@ export interface FileMutationResult {
   outcome: "completed" | "no_op";
 }
 
-export type FileTransferStatus = "queued" | "running" | "cancelling" | "publishing" | "completed" | "failed" | "cancelled";
+export type FileTransferStatus = "queued" | "running" | "cancelling" | "publishing" | "completed" | "failed" | "cancelled" | "partial";
 
 export interface FileTransfer {
   id: string;
   connectionId: string;
-  direction: "download";
+  direction: "download" | "upload";
   remotePath: string;
   localPath: string;
   status: FileTransferStatus;
   bytesTransferred: number;
   totalBytes?: number | null;
   error?: string | null;
+  partialDestination?: string | null;
+  abortOutcome?: string | null;
+  publishOutcome?: string | null;
   createdAt: string;
   updatedAt: string;
   completedAt?: string | null;
@@ -266,6 +269,19 @@ export interface StartDownloadInput {
   connectionId: string;
   remotePath: string;
   localPath: string;
+}
+
+export interface StartUploadInput {
+  connectionId: string;
+  localPath: string;
+  remotePath: string;
+  policy: FileUploadPolicy;
+}
+
+export interface FileUploadPolicy {
+  mode: "best_effort_no_clobber";
+  atomicNoClobber: false;
+  externalToctouRisk: true;
 }
 
 export interface SavedSqlSyncEntry {
@@ -1378,6 +1394,10 @@ export async function deleteFileEntry(connectionId: string, path: string, recurs
 
 export async function startFileDownload(input: StartDownloadInput): Promise<{ transferId: string }> {
   return invoke("start_download", { input });
+}
+
+export async function startFileUpload(input: StartUploadInput): Promise<{ transferId: string }> {
+  return invoke("start_upload", { input });
 }
 
 export async function getFileTransfer(transferId: string): Promise<FileTransfer> {

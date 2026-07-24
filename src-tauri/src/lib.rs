@@ -1386,6 +1386,7 @@ pub fn run() {
             commands::file_manager::create_file_directory,
             commands::file_manager::delete_file_entry,
             commands::file_transfer::start_download,
+            commands::file_transfer::start_upload,
             commands::file_transfer::get_file_transfer,
             commands::file_transfer::list_file_transfers,
             commands::file_transfer::cancel_file_transfer,
