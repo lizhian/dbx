@@ -10,7 +10,7 @@ const tabBar = readFileSync(new URL("../../apps/desktop/src/components/layout/Ap
 const english = readFileSync(new URL("../../apps/desktop/src/i18n/locales/en.ts", import.meta.url), "utf8");
 
 test("file manager frontend uses the dedicated Tauri command contract", () => {
-  for (const command of ["list_file_connections", "save_file_connection", "delete_file_connection", "test_file_connection", "list_file_entries", "list_file_entries_next", "close_file_list_cursor", "stat_file_entry"]) {
+  for (const command of ["list_file_connections", "save_file_connection", "delete_file_connection", "test_file_connection", "list_file_entries", "list_file_entries_next", "close_file_list_cursor", "stat_file_entry", "create_file_directory", "delete_file_entry"]) {
     assert.match(tauriBackend, new RegExp(`invoke\\("${command}"`));
   }
   assert.doesNotMatch(tauriBackend, /list_file_root|listFileRoot/);
@@ -28,6 +28,8 @@ test("FTP connection editor exposes CRUD, staged testing, root browsing, and pla
   assert.match(page, /api\.listFileEntriesNext/);
   assert.match(page, /api\.closeFileListCursor/);
   assert.match(page, /api\.statFileEntry/);
+  assert.match(page, /api\.createFileDirectory/);
+  assert.match(page, /api\.deleteFileEntry/);
 });
 
 test("file manager is mounted as an independent special page", () => {
@@ -48,4 +50,12 @@ test("file manager reports root errors, prevents duplicate deletion, and exposes
   assert.match(tabBar, /data-file-manager-tab[\s\S]+role="tab"/);
   assert.match(tabBar, /@keydown\.enter\.self\.prevent="emit\('activate-file-manager'\)"/);
   assert.match(tabBar, /@keydown\.space\.self\.prevent="emit\('activate-file-manager'\)"/);
+});
+
+test("file mutations expose accessible create and guarded delete controls", () => {
+  assert.match(page, /:aria-label="text\.createDirectory"/);
+  assert.match(page, /:aria-label="`\$\{text\.deleteEntry\}: \$\{entry\.name\}`"/);
+  assert.match(page, /api\.deleteFileEntry\(connectionId, entry\.path, false\)/);
+  assert.match(page, /!directoryPath\.value \|\| mutating/);
+  assert.match(english, /Only files and empty directories can be deleted/);
 });

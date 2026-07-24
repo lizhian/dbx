@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, File, Folder, Loader2, Pencil, Plus, RefreshCcw, Server, Trash2, X, XCircle } from "@lucide/vue";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, File, Folder, FolderPlus, Loader2, Pencil, Plus, RefreshCcw, Server, Trash2, X, XCircle } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -34,6 +34,12 @@ const text = computed(() => ({
   edit: t("fileManager.edit"),
   delete: t("fileManager.delete"),
   deleteConfirm: t("fileManager.deleteConfirm"),
+  createDirectory: t("fileManager.createDirectory"),
+  directoryPath: t("fileManager.directoryPath"),
+  directoryPathHint: t("fileManager.directoryPathHint"),
+  deleteEntry: t("fileManager.deleteEntry"),
+  deleteEntryConfirm: (name: string) => t("fileManager.deleteEntryConfirm", { name }),
+  operationComplete: t("fileManager.operationComplete"),
   loadError: t("fileManager.loadError"),
   testSuccess: t("fileManager.testSuccess"),
   refresh: t("fileManager.refresh"),
@@ -58,6 +64,7 @@ const text = computed(() => ({
   etag: "ETag",
   version: t("fileManager.version"),
   loadedCount: t("fileManager.loadedCount"),
+  actions: t("fileManager.actions"),
 }));
 
 const connections = ref<FileConnection[]>([]);
@@ -75,11 +82,16 @@ const loadingMore = ref(false);
 const loadingStat = ref(false);
 const editorOpen = ref(false);
 const deleteOpen = ref(false);
+const createDirectoryOpen = ref(false);
+const entryDeleteOpen = ref(false);
 const saving = ref(false);
 const testing = ref(false);
 const deleting = ref(false);
+const mutating = ref(false);
 const testResult = ref<FileConnectionTestResult | null>(null);
 const editingId = ref<string | null>(null);
+const pendingDeleteEntry = ref<FileManagerEntry | null>(null);
+const directoryPath = ref("");
 const clearPassword = ref(false);
 const form = ref({ name: "", endpoint: "ftp://localhost:21", root: "/", username: "", password: "" });
 let connectionsGeneration = 0;
@@ -335,6 +347,50 @@ async function deleteConnection() {
   }
 }
 
+function openCreateDirectory() {
+  directoryPath.value = "";
+  createDirectoryOpen.value = true;
+}
+
+async function createDirectory() {
+  if (!selectedId.value || !directoryPath.value || mutating.value) return;
+  mutating.value = true;
+  try {
+    await api.createFileDirectory(selectedId.value, directoryPath.value);
+    createDirectoryOpen.value = false;
+    toast(text.value.operationComplete, 2000);
+    await refreshDirectory();
+  } catch (error) {
+    toast(String(error), 5000);
+  } finally {
+    mutating.value = false;
+  }
+}
+
+function openDeleteEntry(entry: FileManagerEntry) {
+  pendingDeleteEntry.value = entry;
+  entryDeleteOpen.value = true;
+}
+
+async function deleteEntry() {
+  const connectionId = selectedId.value;
+  const entry = pendingDeleteEntry.value;
+  if (!connectionId || !entry || mutating.value) return;
+  mutating.value = true;
+  try {
+    await api.deleteFileEntry(connectionId, entry.path, false);
+    entryDeleteOpen.value = false;
+    pendingDeleteEntry.value = null;
+    toast(text.value.operationComplete, 2000);
+    clearSelection();
+    await refreshDirectory();
+  } catch (error) {
+    toast(String(error), 5000);
+  } finally {
+    mutating.value = false;
+  }
+}
+
 function formatSize(bytes: number): string {
   if (!bytes) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -353,11 +409,11 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="flex h-full min-h-0 bg-background">
-    <aside class="flex w-64 shrink-0 flex-col border-r bg-muted/10">
-      <div class="flex h-10 items-center justify-between border-b px-3">
+    <aside class="flex w-12 shrink-0 flex-col border-r bg-muted/10 sm:w-64">
+      <div class="flex h-10 items-center justify-between border-b px-2 sm:px-3">
         <div class="flex min-w-0 items-center gap-2 text-sm font-medium">
-          <Server class="h-4 w-4 shrink-0" />
-          <span class="truncate">{{ text.title }}</span>
+          <Server class="hidden h-4 w-4 shrink-0 sm:block" />
+          <span class="hidden truncate sm:inline">{{ text.title }}</span>
         </div>
         <Button size="icon" variant="ghost" class="h-7 w-7" :title="text.add" :aria-label="text.add" @click="openCreate">
           <Plus class="h-4 w-4" />
@@ -369,21 +425,26 @@ onBeforeUnmount(() => {
           v-for="connection in connections"
           :key="connection.id"
           type="button"
-          class="mb-0.5 flex w-full min-w-0 items-center gap-2 rounded px-2 py-2 text-left text-sm hover:bg-muted"
+          class="mb-0.5 flex w-full min-w-0 items-center justify-center gap-2 rounded px-2 py-2 text-left text-sm hover:bg-muted sm:justify-start"
           :class="selectedId === connection.id ? 'bg-accent text-accent-foreground' : ''"
+          :title="connection.name"
+          :aria-label="connection.name"
           @click="void selectConnection(connection.id)"
         >
           <Server class="h-4 w-4 shrink-0 text-muted-foreground" />
-          <span class="min-w-0 flex-1 truncate">{{ connection.name }}</span>
-          <span class="text-[10px] uppercase text-muted-foreground">FTP</span>
+          <span class="hidden min-w-0 flex-1 truncate sm:block">{{ connection.name }}</span>
+          <span class="hidden text-[10px] uppercase text-muted-foreground sm:inline">FTP</span>
         </button>
-        <div v-if="!loadingConnections && !connections.length" class="px-3 py-8 text-center text-xs text-muted-foreground">{{ text.emptyConnections }}</div>
+        <div v-if="!loadingConnections && !connections.length" class="hidden px-3 py-8 text-center text-xs text-muted-foreground sm:block">{{ text.emptyConnections }}</div>
       </div>
     </aside>
 
     <section class="flex min-w-0 flex-1 flex-col">
       <div class="flex h-10 items-center gap-1 border-b px-2">
         <span class="min-w-0 flex-1 truncate px-1 text-sm font-medium">{{ selectedConnection?.name ?? text.title }}</span>
+        <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="!selectedConnection || loadingEntries || mutating" :title="text.createDirectory" :aria-label="text.createDirectory" @click="openCreateDirectory">
+          <FolderPlus class="h-3.5 w-3.5" />
+        </Button>
         <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="!selectedConnection || loadingEntries" :title="text.refresh" :aria-label="text.refresh" @click="void refreshDirectory()">
           <RefreshCcw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingEntries }" />
         </Button>
@@ -410,10 +471,11 @@ onBeforeUnmount(() => {
           <table v-if="selectedConnection" class="w-full table-fixed text-sm">
             <thead class="sticky top-0 z-10 border-b bg-background text-left text-xs text-muted-foreground">
               <tr>
-                <th class="w-[48%] px-3 py-2 font-medium">{{ text.name }}</th>
-                <th class="w-24 px-3 py-2 font-medium">{{ text.type }}</th>
-                <th class="w-28 px-3 py-2 text-right font-medium">{{ text.size }}</th>
-                <th class="w-48 px-3 py-2 font-medium">{{ text.modified }}</th>
+                <th class="w-auto px-3 py-2 font-medium sm:w-[48%]">{{ text.name }}</th>
+                <th class="hidden w-24 px-3 py-2 font-medium md:table-cell">{{ text.type }}</th>
+                <th class="hidden w-28 px-3 py-2 text-right font-medium sm:table-cell">{{ text.size }}</th>
+                <th class="hidden w-48 px-3 py-2 font-medium lg:table-cell">{{ text.modified }}</th>
+                <th class="w-14 px-3 py-2 text-right font-medium">{{ text.actions }}</th>
               </tr>
             </thead>
             <tbody>
@@ -434,9 +496,14 @@ onBeforeUnmount(() => {
                     <span class="truncate" :title="entry.path">{{ entry.name }}</span>
                   </div>
                 </td>
-                <td class="px-3 py-2 text-xs text-muted-foreground">{{ entry.kind }}</td>
-                <td class="px-3 py-2 text-right font-mono text-xs text-muted-foreground">{{ entry.kind === "file" ? formatSize(entry.size) : "" }}</td>
-                <td class="truncate px-3 py-2 text-xs text-muted-foreground">{{ entry.lastModified ? new Date(entry.lastModified).toLocaleString() : "" }}</td>
+                <td class="hidden px-3 py-2 text-xs text-muted-foreground md:table-cell">{{ entry.kind }}</td>
+                <td class="hidden px-3 py-2 text-right font-mono text-xs text-muted-foreground sm:table-cell">{{ entry.kind === "file" ? formatSize(entry.size) : "" }}</td>
+                <td class="hidden truncate px-3 py-2 text-xs text-muted-foreground lg:table-cell">{{ entry.lastModified ? new Date(entry.lastModified).toLocaleString() : "" }}</td>
+                <td class="px-2 py-1 text-right">
+                  <Button variant="ghost" size="icon" class="h-7 w-7 text-destructive hover:text-destructive" :disabled="mutating" :title="text.deleteEntry" :aria-label="`${text.deleteEntry}: ${entry.name}`" @click.stop="openDeleteEntry(entry)">
+                    <Trash2 class="h-3.5 w-3.5" />
+                  </Button>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -452,7 +519,7 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <aside v-if="selectedEntry" data-file-manager-metadata class="w-72 shrink-0 overflow-auto border-l bg-muted/5">
+        <aside v-if="selectedEntry" data-file-manager-metadata class="hidden w-72 shrink-0 overflow-auto border-l bg-muted/5 md:block">
           <div class="flex h-9 items-center border-b px-3">
             <span class="min-w-0 flex-1 truncate text-xs font-medium">{{ text.metadata }}</span>
             <Button variant="ghost" size="icon" class="h-6 w-6" :aria-label="text.cancel" @click="clearSelection">
@@ -560,6 +627,42 @@ onBeforeUnmount(() => {
         <Button variant="outline" :disabled="saving || testing" @click="editorOpen = false">{{ text.cancel }}</Button>
         <Button variant="outline" :disabled="!canSubmit || saving || testing" @click="void testConnection()"> <Loader2 v-if="testing" class="mr-1.5 h-3.5 w-3.5 animate-spin" />{{ text.test }} </Button>
         <Button :disabled="!canSubmit || saving || testing" @click="void saveConnection()"> <Loader2 v-if="saving" class="mr-1.5 h-3.5 w-3.5 animate-spin" />{{ text.save }} </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="createDirectoryOpen">
+    <DialogContent class="sm:max-w-sm">
+      <DialogHeader
+        ><DialogTitle>{{ text.createDirectory }}</DialogTitle></DialogHeader
+      >
+      <div class="grid gap-1.5">
+        <Label for="file-directory-path">{{ text.directoryPath }}</Label>
+        <Input id="file-directory-path" v-model="directoryPath" :placeholder="text.directoryPathHint" @keydown.enter.prevent="void createDirectory()" />
+        <p class="text-xs text-muted-foreground">{{ text.directoryPathHint }}</p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="mutating" @click="createDirectoryOpen = false">{{ text.cancel }}</Button>
+        <Button :disabled="!directoryPath || mutating" @click="void createDirectory()">
+          <Loader2 v-if="mutating" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          {{ text.createDirectory }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="entryDeleteOpen">
+    <DialogContent class="sm:max-w-sm">
+      <DialogHeader
+        ><DialogTitle>{{ text.deleteEntry }}</DialogTitle></DialogHeader
+      >
+      <p class="break-words text-sm text-muted-foreground">{{ text.deleteEntryConfirm(pendingDeleteEntry?.name ?? "") }}</p>
+      <DialogFooter>
+        <Button variant="outline" :disabled="mutating" @click="entryDeleteOpen = false">{{ text.cancel }}</Button>
+        <Button variant="destructive" :disabled="!pendingDeleteEntry || mutating" @click="void deleteEntry()">
+          <Loader2 v-if="mutating" class="mr-1.5 h-3.5 w-3.5 animate-spin" />
+          {{ text.deleteEntry }}
+        </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

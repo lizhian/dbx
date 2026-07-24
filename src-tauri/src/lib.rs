@@ -1381,6 +1381,8 @@ pub fn run() {
             commands::file_manager::list_file_entries_next,
             commands::file_manager::close_file_list_cursor,
             commands::file_manager::stat_file_entry,
+            commands::file_manager::create_file_directory,
+            commands::file_manager::delete_file_entry,
             commands::plugins::list_plugins,
             commands::plugins::list_jdbc_drivers,
             commands::plugins::list_jdbc_maven_bundles,

@@ -5,9 +5,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use super::file_manager_paths::{
+    join_configured_root, plan_directory_delete, reject_recursive_delete, DirectoryDeleteEvidence, DirectoryDeletePlan,
+    DirectoryStorageModel, RemotePath,
+};
 use dbx_core::connection::AppState;
 use dbx_core::storage::FileConnectionStorageRecord;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use opendal::services::Ftp;
 use opendal::{ErrorKind, Metadata, Operator};
 use serde::{Deserialize, Serialize};
@@ -24,6 +28,7 @@ use super::file_manager_list::{
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
@@ -43,6 +48,7 @@ struct ConnectionRuntime {
     state: Mutex<ConnectionRuntimeState>,
     idle: Notify,
     list_lock: AsyncMutex<()>,
+    mutation_lock: AsyncMutex<()>,
 }
 
 struct ConnectionRuntimeState {
@@ -161,6 +167,19 @@ pub struct ConnectionTestStage {
 pub struct FileConnectionTestResult {
     pub success: bool,
     pub stages: Vec<ConnectionTestStage>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileMutationOutcome {
+    Completed,
+    NoOp,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMutationResult {
+    pub outcome: FileMutationOutcome,
 }
 
 #[tauri::command]
@@ -378,6 +397,81 @@ pub async fn stat_file_entry(
     .await
 }
 
+#[tauri::command]
+pub async fn create_file_directory(
+    state: State<'_, std::sync::Arc<AppState>>,
+    runtime: State<'_, FileManagerRuntime>,
+    connection_id: String,
+    path: String,
+) -> Result<FileMutationResult, String> {
+    let path = RemotePath::parse(&path)?;
+    let lease = runtime.begin_operation(&connection_id)?;
+    let record = state
+        .storage
+        .load_file_connection(&connection_id)
+        .await?
+        .ok_or_else(|| "File connection not found".to_string())?;
+    let revision = record.revision;
+    let config = parse_storage_config(&record)?;
+    let scope = password_scope(&config)?;
+    let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
+    let operator = runtime.operator_for(&record, &config, password.as_deref())?;
+    let directory_path = configured_operation_path(&config, &path, true);
+    let cancellation = lease.cancellation();
+
+    let result = run_mutation_operation(&runtime, &connection_id, revision, &cancellation, "Create directory", async {
+        let _mutation_guard = lease.entry.mutation_lock.lock().await;
+        cancellation.ensure_active()?;
+        operator
+            .create_dir(&directory_path)
+            .await
+            .map_err(|error| redact_error(error.to_string(), password.as_deref()))?;
+        let metadata = operator.stat(&directory_path).await.map_err(|error| {
+            format!(
+                "Directory creation could not be verified: {}",
+                redact_error(error.to_string(), password.as_deref())
+            )
+        })?;
+        if !metadata.mode().is_dir() {
+            return Err("Directory creation could not be verified because the target is not a directory".to_string());
+        }
+        Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+    })
+    .await;
+    result
+}
+
+#[tauri::command]
+pub async fn delete_file_entry(
+    state: State<'_, std::sync::Arc<AppState>>,
+    runtime: State<'_, FileManagerRuntime>,
+    connection_id: String,
+    path: String,
+    recursive: Option<bool>,
+) -> Result<FileMutationResult, String> {
+    reject_recursive_delete(recursive.unwrap_or(false))?;
+    let path = RemotePath::parse(&path)?;
+    let lease = runtime.begin_operation(&connection_id)?;
+    let record = state
+        .storage
+        .load_file_connection(&connection_id)
+        .await?
+        .ok_or_else(|| "File connection not found".to_string())?;
+    let revision = record.revision;
+    let config = parse_storage_config(&record)?;
+    let scope = password_scope(&config)?;
+    let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
+    let operator = runtime.operator_for(&record, &config, password.as_deref())?;
+    let cancellation = lease.cancellation();
+
+    run_mutation_operation(&runtime, &connection_id, revision, &cancellation, "Delete", async {
+        let _mutation_guard = lease.entry.mutation_lock.lock().await;
+        cancellation.ensure_active()?;
+        delete_entry(&operator, &config, &path, password.as_deref()).await
+    })
+    .await
+}
+
 impl FileManagerRuntime {
     fn begin_operation(&self, connection_id: &str) -> Result<OperationLease, String> {
         let mut lifecycles = self.lifecycles.lock().unwrap_or_else(|error| error.into_inner());
@@ -479,6 +573,7 @@ impl Default for ConnectionRuntime {
             }),
             idle: Notify::new(),
             list_lock: AsyncMutex::new(()),
+            mutation_lock: AsyncMutex::new(()),
         }
     }
 }
@@ -496,6 +591,14 @@ impl CancellationSignal {
                 return;
             }
             notified.await;
+        }
+    }
+
+    fn ensure_active(&self) -> Result<(), String> {
+        if self.cancelled.load(Ordering::Acquire) {
+            Err("File connection is being deleted".to_string())
+        } else {
+            Ok(())
         }
     }
 }
@@ -619,6 +722,134 @@ where
         runtime.evict_revision(connection_id, revision);
     }
     result
+}
+
+async fn run_mutation_operation<T, F>(
+    runtime: &FileManagerRuntime,
+    connection_id: &str,
+    revision: i64,
+    cancellation: &CancellationSignal,
+    operation: &'static str,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    let result = tokio::select! {
+        _ = cancellation.cancelled() => Err("File connection is being deleted".to_string()),
+        result = tokio::time::timeout(MUTATION_TIMEOUT, future) => {
+            result.map_err(|_| format!("{operation} timed out"))?
+        }
+    };
+    if result.is_err() {
+        runtime.evict_revision(connection_id, revision);
+    }
+    result
+}
+
+async fn delete_entry(
+    operator: &Operator,
+    config: &FileConnectionConfig,
+    path: &RemotePath,
+    password: Option<&str>,
+) -> Result<FileMutationResult, String> {
+    let file_path = configured_operation_path(config, path, false);
+    let directory_path = configured_operation_path(config, path, true);
+    let (metadata, exact_path) = match operator.stat(&file_path).await {
+        Ok(metadata) => {
+            let exact_path = if metadata.mode().is_dir() { directory_path.as_str() } else { file_path.as_str() };
+            (metadata, exact_path)
+        }
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            let metadata =
+                operator.stat(&directory_path).await.map_err(|error| redact_error(error.to_string(), password))?;
+            (metadata, directory_path.as_str())
+        }
+        Err(error) => return Err(redact_error(error.to_string(), password)),
+    };
+
+    if !metadata.mode().is_dir() {
+        operator.delete(exact_path).await.map_err(|error| redact_error(error.to_string(), password))?;
+        return match operator.stat(exact_path).await {
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+            }
+            Ok(_) => Err("File delete was not confirmed because the target still exists".to_string()),
+            Err(error) => {
+                Err(format!("File delete could not be verified: {}", redact_error(error.to_string(), password)))
+            }
+        };
+    }
+
+    let evidence =
+        inspect_directory_delete(operator, &directory_path, DirectoryStorageModel::Hierarchical, password).await?;
+    match plan_directory_delete(DirectoryStorageModel::Hierarchical, evidence)? {
+        DirectoryDeletePlan::DeleteExactDirectory => {
+            // OpenDAL 0.57 maps every FTP RMD 550 response to success. Use the
+            // protocol's exact RMD so a concurrent child cannot be hidden as a
+            // completed delete.
+            delete_ftp_directory_exact(config, path, password).await?;
+            Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+        }
+        DirectoryDeletePlan::DeleteExactMarker => {
+            operator.delete(&directory_path).await.map_err(|error| redact_error(error.to_string(), password))?;
+            Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+        }
+        DirectoryDeletePlan::NoOpVirtualPrefix => Ok(FileMutationResult { outcome: FileMutationOutcome::NoOp }),
+    }
+}
+
+async fn delete_ftp_directory_exact(
+    config: &FileConnectionConfig,
+    path: &RemotePath,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let FileConnectionConfig::Ftp(config) = config;
+    let (host, port) = endpoint_host_port(&config.endpoint)?;
+    let addresses = resolve_addresses(&host, port).await.map_err(|error| format!("DNS stage failed: {error}"))?;
+    let address = connect_first(&addresses).await.map_err(|error| format!("TCP stage failed: {error}"))?;
+    let mut ftp = AsyncFtpStream::connect(address)
+        .await
+        .map_err(|error| format!("Authentication stage failed: {}", redact_error(error.to_string(), password)))?;
+    let (username, resolved_password) = ftp_credentials(config, password);
+    ftp.login(&username, &resolved_password)
+        .await
+        .map_err(|error| format!("Authentication stage failed: {}", redact_error(error.to_string(), password)))?;
+    ftp.cwd(&config.root)
+        .await
+        .map_err(|error| format!("Root stage failed: {}", redact_error(error.to_string(), password)))?;
+    let result = ftp.rmdir(path.as_str()).await;
+    let _ = ftp.quit().await;
+    result.map_err(|error| {
+        format!(
+            "Directory changed, is not empty, or cannot be removed; recursive delete is unsupported: {}",
+            redact_error(error.to_string(), password)
+        )
+    })
+}
+
+async fn inspect_directory_delete(
+    operator: &Operator,
+    directory_path: &str,
+    model: DirectoryStorageModel,
+    password: Option<&str>,
+) -> Result<DirectoryDeleteEvidence, String> {
+    let target = directory_path.trim_end_matches('/');
+    let mut lister =
+        operator.lister(directory_path).await.map_err(|error| redact_error(error.to_string(), password))?;
+    let mut has_children = false;
+    let mut marker_size = None;
+    while let Some(entry) = lister.try_next().await.map_err(|error| redact_error(error.to_string(), password))? {
+        if entry.path().trim_end_matches('/') == target {
+            if model == DirectoryStorageModel::ObjectStore {
+                marker_size = Some(entry.metadata().content_length());
+            }
+        } else {
+            has_children = true;
+            break;
+        }
+    }
+    Ok(DirectoryDeleteEvidence { has_children, marker_size })
 }
 
 async fn test_ftp_connection(input: &FileConnectionInput, password: Option<&str>) -> FileConnectionTestResult {
@@ -968,6 +1199,12 @@ fn file_stat_from_metadata(path: &str, metadata: &Metadata) -> FileStat {
     }
 }
 
+fn configured_operation_path(config: &FileConnectionConfig, path: &RemotePath, directory: bool) -> String {
+    match config {
+        FileConnectionConfig::Ftp(config) => join_configured_root(&config.root, path, directory),
+    }
+}
+
 fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
@@ -1052,6 +1289,7 @@ fn append_skipped_stages(stages: &mut Vec<ConnectionTestStage>, remaining: &[&'s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     fn input(endpoint: &str, root: &str) -> FileConnectionInput {
         FileConnectionInput {
@@ -1065,6 +1303,23 @@ mod tests {
             }),
             secrets: None,
         }
+    }
+
+    async fn direct_ftp(input: &FileConnectionInput, password: &str) -> AsyncFtpStream {
+        let FileConnectionConfig::Ftp(config) = &input.config;
+        let (host, port) = endpoint_host_port(&config.endpoint).unwrap();
+        let addresses = resolve_addresses(&host, port).await.unwrap();
+        let address = connect_first(&addresses).await.unwrap();
+        let mut ftp = AsyncFtpStream::connect(address).await.unwrap();
+        let (username, resolved_password) = ftp_credentials(config, Some(password));
+        ftp.login(&username, &resolved_password).await.unwrap();
+        ftp
+    }
+
+    async fn direct_ftp_write(ftp: &mut AsyncFtpStream, path: &str, content: &[u8]) {
+        let mut stream = ftp.put_with_stream(path).await.unwrap();
+        stream.write_all(content).await.unwrap();
+        ftp.finalize_put_stream(stream).await.unwrap();
     }
 
     #[test]
@@ -1105,6 +1360,66 @@ mod tests {
         drop(guard);
         drop(first);
         drop(second);
+        assert_eq!(runtime.lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn mutations_are_serialized_per_connection_but_not_globally() {
+        let runtime = FileManagerRuntime::default();
+        let first = runtime.begin_operation("ftp-1").unwrap();
+        let second = runtime.begin_operation("ftp-1").unwrap();
+        let other = runtime.begin_operation("ftp-2").unwrap();
+        let guard = first.entry.mutation_lock.try_lock().unwrap();
+        assert!(second.entry.mutation_lock.try_lock().is_err());
+        assert!(other.entry.mutation_lock.try_lock().is_ok());
+        drop(guard);
+        drop(first);
+        drop(second);
+        drop(other);
+        assert_eq!(runtime.lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_mutation_is_cancelled_when_connection_deletion_starts() {
+        let runtime = Arc::new(FileManagerRuntime::default());
+        let acquired = Arc::new(Notify::new());
+
+        let first_runtime = runtime.clone();
+        let first_acquired = acquired.clone();
+        let first_lease = runtime.begin_operation("ftp-1").unwrap();
+        let first_cancellation = first_lease.cancellation();
+        let first = tokio::spawn(async move {
+            let result = run_mutation_operation(&first_runtime, "ftp-1", 1, &first_cancellation, "Mutation", async {
+                let _guard = first_lease.entry.mutation_lock.lock().await;
+                first_acquired.notify_one();
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await;
+            drop(first_lease);
+            result
+        });
+        acquired.notified().await;
+
+        let second_runtime = runtime.clone();
+        let second_lease = runtime.begin_operation("ftp-1").unwrap();
+        let second_cancellation = second_lease.cancellation();
+        let second = tokio::spawn(async move {
+            let result = run_mutation_operation(&second_runtime, "ftp-1", 1, &second_cancellation, "Mutation", async {
+                let _guard = second_lease.entry.mutation_lock.lock().await;
+                second_cancellation.ensure_active()?;
+                std::future::pending::<Result<(), String>>().await
+            })
+            .await;
+            drop(second_lease);
+            result
+        });
+        tokio::task::yield_now().await;
+
+        let deleting = runtime.start_delete("ftp-1").unwrap();
+        tokio::time::timeout(Duration::from_secs(1), deleting.wait_for_idle()).await.unwrap().unwrap();
+        assert!(first.await.unwrap().unwrap_err().contains("being deleted"));
+        assert!(second.await.unwrap().unwrap_err().contains("being deleted"));
+        deleting.finish();
         assert_eq!(runtime.lifecycle_count(), 0);
     }
 
@@ -1241,6 +1556,7 @@ mod tests {
         assert_eq!(updated.revision, 2);
 
         let operator = build_operator(&input.config, Some(&password)).unwrap();
+        let mut direct = direct_ftp(&input, &password).await;
         let list_path = configured_root_list_path(&input.config);
         let entries = operator.list(&list_path).await.unwrap();
         let paths =
@@ -1301,6 +1617,75 @@ mod tests {
         assert_eq!(stat.kind, "directory");
         assert_eq!(stat.name, "/");
         assert_eq!(stat.size, 0);
+
+        let empty_directory = RemotePath::parse("ticket-4-empty").unwrap();
+        operator.create_dir(&configured_operation_path(&input.config, &empty_directory, true)).await.unwrap();
+        assert!(matches!(
+            delete_entry(&operator, &input.config, &empty_directory, Some(&password)).await.unwrap().outcome,
+            FileMutationOutcome::Completed
+        ));
+
+        let removable_file = RemotePath::parse("ticket-4-file.txt").unwrap();
+        let removable_file_path = configured_operation_path(&input.config, &removable_file, false);
+        direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-file.txt", b"delete me").await;
+        assert!(matches!(
+            delete_entry(&operator, &input.config, &removable_file, Some(&password)).await.unwrap().outcome,
+            FileMutationOutcome::Completed
+        ));
+        assert_eq!(operator.stat(&removable_file_path).await.unwrap_err().kind(), ErrorKind::NotFound);
+
+        let nonempty_directory = RemotePath::parse("ticket-4-nonempty").unwrap();
+        let nonempty_directory_path = configured_operation_path(&input.config, &nonempty_directory, true);
+        operator.create_dir(&nonempty_directory_path).await.unwrap();
+        let nonempty_child = format!("{nonempty_directory_path}child.txt");
+        direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-nonempty/child.txt", b"keep me").await;
+        assert!(delete_entry(&operator, &input.config, &nonempty_directory, Some(&password))
+            .await
+            .unwrap_err()
+            .contains("not empty"));
+        operator.stat(&nonempty_child).await.unwrap();
+
+        // Model a remote writer racing the preflight. The exact FTP RMD must
+        // fail once the child exists; no recursive fallback is attempted.
+        let raced_directory = RemotePath::parse("ticket-4-raced").unwrap();
+        let raced_directory_path = configured_operation_path(&input.config, &raced_directory, true);
+        operator.create_dir(&raced_directory_path).await.unwrap();
+        let evidence = inspect_directory_delete(
+            &operator,
+            &raced_directory_path,
+            DirectoryStorageModel::Hierarchical,
+            Some(&password),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plan_directory_delete(DirectoryStorageModel::Hierarchical, evidence).unwrap(),
+            DirectoryDeletePlan::DeleteExactDirectory
+        );
+        let raced_child = format!("{raced_directory_path}concurrent.txt");
+        direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-raced/concurrent.txt", b"created after preflight").await;
+        assert!(delete_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.is_err());
+        operator.stat(&raced_child).await.unwrap();
+
+        for unsafe_path in ["/ftp/dbx/fixture.txt", "../fixture.txt", "%2e%2e/fixture.txt", "safe%2f..%2ffixture.txt"] {
+            assert!(RemotePath::parse(unsafe_path).is_err());
+        }
+        operator.stat(&format!("{list_path}fixture.txt")).await.unwrap();
+
+        direct_ftp_write(&mut direct, "/ftp/dbx/whitespace-proof", b"x").await;
+        direct_ftp_write(&mut direct, "/ftp/dbx/whitespace-proof ", b"yy").await;
+        assert_eq!(direct.size("/ftp/dbx/whitespace-proof").await.unwrap(), 1);
+        assert_eq!(direct.size("/ftp/dbx/whitespace-proof ").await.unwrap(), 2);
+        assert_eq!(operator.stat(&format!("{list_path}whitespace-proof ")).await.unwrap().content_length(), 1);
+        assert!(RemotePath::parse("whitespace-proof ").unwrap_err().contains("storage runtime"));
+
+        operator.delete(&nonempty_child).await.unwrap();
+        delete_ftp_directory_exact(&input.config, &nonempty_directory, Some(&password)).await.unwrap();
+        operator.delete(&raced_child).await.unwrap();
+        delete_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.unwrap();
+        direct.rm("/ftp/dbx/whitespace-proof").await.unwrap();
+        direct.rm("/ftp/dbx/whitespace-proof ").await.unwrap();
+        direct.quit().await.unwrap();
 
         let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: match &input.config {

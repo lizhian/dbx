@@ -241,6 +241,10 @@ export interface FileEntryStat extends FileManagerEntry {
   userMetadata: Record<string, string>;
 }
 
+export interface FileMutationResult {
+  outcome: "completed" | "no_op";
+}
+
 export interface SavedSqlSyncEntry {
   folderName?: string;
   fileName: string;
@@ -1339,6 +1343,14 @@ export async function closeFileListCursor(connectionId: string, cursor: string):
 
 export async function statFileEntry(connectionId: string, path: string): Promise<FileEntryStat> {
   return invoke("stat_file_entry", { connectionId, path });
+}
+
+export async function createFileDirectory(connectionId: string, path: string): Promise<FileMutationResult> {
+  return invoke("create_file_directory", { connectionId, path });
+}
+
+export async function deleteFileEntry(connectionId: string, path: string, recursive = false): Promise<FileMutationResult> {
+  return invoke("delete_file_entry", { connectionId, path, recursive });
 }
 
 export async function loadTunnelProfiles(): Promise<TunnelProfile[]> {

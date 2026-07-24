@@ -121,6 +121,7 @@ import type {
   FileEntryStat,
   FileListOptions,
   FileListPage,
+  FileMutationResult,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -330,6 +331,14 @@ export async function closeFileListCursor(_connectionId: string, _cursor: string
 }
 
 export async function statFileEntry(_connectionId: string, _path: string): Promise<FileEntryStat> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function createFileDirectory(_connectionId: string, _path: string): Promise<FileMutationResult> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function deleteFileEntry(_connectionId: string, _path: string, _recursive = false): Promise<FileMutationResult> {
   return desktopFileManagerUnavailable();
 }
 
