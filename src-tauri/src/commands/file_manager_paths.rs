@@ -7,6 +7,7 @@ pub(super) struct RemotePath(String);
 
 impl RemotePath {
     pub(super) fn parse(input: &str) -> Result<Self, String> {
+        reject_ftp_command_injection(input, "Remote path")?;
         if input.is_empty() {
             return Err("Remote path is required".to_string());
         }
@@ -29,6 +30,14 @@ impl RemotePath {
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+pub(super) fn reject_ftp_command_injection(value: &str, field: &str) -> Result<(), String> {
+    let contains_line_break = |bytes: &[u8]| bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
+    if contains_line_break(value.as_bytes()) || contains_line_break(&percent_decode_str(value).collect::<Vec<_>>()) {
+        return Err(format!("{field} cannot contain CR or LF characters"));
+    }
+    Ok(())
 }
 
 fn validate_path_shadow(path: &[u8]) -> Result<(), String> {
@@ -55,6 +64,7 @@ fn validate_path_shadow(path: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn join_configured_root(root: &str, path: &RemotePath, directory: bool) -> String {
     let root = root.trim_matches('/');
     let mut joined = if root.is_empty() { path.as_str().to_string() } else { format!("{root}/{}", path.as_str()) };
@@ -65,24 +75,28 @@ pub(super) fn join_configured_root(root: &str, path: &RemotePath, directory: boo
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Reserved for object-store directory delete in ticket #8.
 pub(super) enum DirectoryStorageModel {
     Hierarchical,
     ObjectStore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Reserved for object-store directory delete in ticket #8.
 pub(super) struct DirectoryDeleteEvidence {
     pub(super) has_children: bool,
     pub(super) marker_size: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Reserved for object-store directory delete in ticket #8.
 pub(super) enum DirectoryDeletePlan {
     DeleteExactDirectory,
     DeleteExactMarker,
     NoOpVirtualPrefix,
 }
 
+#[allow(dead_code)] // Reserved for object-store directory delete in ticket #8.
 pub(super) fn plan_directory_delete(
     model: DirectoryStorageModel,
     evidence: DirectoryDeleteEvidence,
@@ -136,6 +150,10 @@ mod tests {
             "safe%2f..%2fescape",
             "safe%5cescape",
             "safe%00escape",
+            "safe\r\nDELE victim",
+            "safe\nDELE victim",
+            "safe%0d%0aDELE%20victim",
+            "safe%0ADELE%20victim",
             "file ",
             " file",
         ] {

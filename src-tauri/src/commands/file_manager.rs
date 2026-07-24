@@ -5,13 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use super::file_manager_paths::{
-    join_configured_root, plan_directory_delete, reject_recursive_delete, DirectoryDeleteEvidence, DirectoryDeletePlan,
-    DirectoryStorageModel, RemotePath,
-};
+#[cfg(test)]
+use super::file_manager_paths::join_configured_root;
+use super::file_manager_paths::{reject_ftp_command_injection, reject_recursive_delete, RemotePath};
 use dbx_core::connection::AppState;
 use dbx_core::storage::FileConnectionStorageRecord;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use opendal::services::Ftp;
 use opendal::{ErrorKind, Metadata, Operator};
 use serde::{Deserialize, Serialize};
@@ -963,6 +962,7 @@ async fn ftp_entry_exists_in_session(
 }
 
 async fn open_ftp_root_session(config: &FtpConnectionConfig, password: Option<&str>) -> Result<AsyncFtpStream, String> {
+    validate_ftp_session_arguments(config, password)?;
     let (host, port) = endpoint_host_port(&config.endpoint)?;
     let addresses = resolve_addresses(&host, port).await.map_err(|error| format!("DNS stage failed: {error}"))?;
     let mut last_error = "No address available".to_string();
@@ -1008,40 +1008,16 @@ async fn open_ftp_root_session_once(
     Ok(ftp)
 }
 
-async fn inspect_directory_delete(
-    operator: &Operator,
-    directory_path: &str,
-    model: DirectoryStorageModel,
-    password: Option<&str>,
-) -> Result<DirectoryDeleteEvidence, String> {
-    let target = directory_path.trim_end_matches('/');
-    let mut lister =
-        operator.lister(directory_path).await.map_err(|error| redact_error(error.to_string(), password))?;
-    let mut has_children = false;
-    let mut marker_size = None;
-    while let Some(entry) = lister.try_next().await.map_err(|error| redact_error(error.to_string(), password))? {
-        if entry.path().trim_end_matches('/') == target {
-            if model == DirectoryStorageModel::ObjectStore {
-                marker_size = Some(entry.metadata().content_length());
-            }
-        } else {
-            has_children = true;
-            break;
-        }
-    }
-    Ok(DirectoryDeleteEvidence { has_children, marker_size })
-}
-
 async fn test_ftp_connection(input: &FileConnectionInput, password: Option<&str>) -> FileConnectionTestResult {
     let mut stages = Vec::with_capacity(5);
-    if let Err(error) = validate_input(input) {
+    let FileConnectionConfig::Ftp(config) = &input.config;
+    if let Err(error) = validate_input(input).and_then(|_| validate_ftp_session_arguments(config, password)) {
         stages.push(failed_stage("configuration", error));
         append_skipped_stages(&mut stages, &["dns", "tcp", "authentication", "root"]);
         return FileConnectionTestResult { success: false, stages };
     }
     stages.push(passed_stage("configuration"));
 
-    let FileConnectionConfig::Ftp(config) = &input.config;
     let (host, port) = endpoint_host_port(&config.endpoint).expect("validated endpoint");
     let addresses = match resolve_addresses(&host, port).await {
         Ok(addresses) => addresses,
@@ -1139,6 +1115,7 @@ async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, Str
 
 async fn verify_ftp_root_read_only(config: &FileConnectionConfig, password: Option<&str>) -> Result<(), String> {
     let FileConnectionConfig::Ftp(config) = config;
+    validate_ftp_session_arguments(config, password)?;
     let (host, port) = endpoint_host_port(&config.endpoint)?;
     let addresses = resolve_addresses(&host, port).await.map_err(|error| format!("DNS stage failed: {error}"))?;
     let address = connect_first(&addresses).await.map_err(|error| format!("TCP stage failed: {error}"))?;
@@ -1167,6 +1144,10 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
         FileConnectionConfig::Ftp(config) => {
             endpoint_host_port(&config.endpoint)?;
             normalize_ftp_root(&config.root)?;
+            reject_ftp_command_injection(&config.username, "FTP username")?;
+            if let Some(password) = input.secrets.as_ref().and_then(|secrets| secrets.password.as_deref()) {
+                reject_ftp_command_injection(password, "FTP password")?;
+            }
             Ok(())
         }
     }
@@ -1190,6 +1171,7 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16), String> {
 fn build_operator(config: &FileConnectionConfig, password: Option<&str>) -> Result<Operator, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
+            validate_ftp_session_arguments(config, password)?;
             let (username, resolved_password) = ftp_credentials(config, password);
             let builder =
                 Ftp::default().endpoint(&config.endpoint).root("/").user(&username).password(&resolved_password);
@@ -1205,6 +1187,7 @@ fn normalize_input(input: &mut FileConnectionInput) -> Result<(), String> {
         FileConnectionConfig::Ftp(config) => {
             config.endpoint = config.endpoint.trim().trim_end_matches('/').to_string();
             config.root = normalize_ftp_root(&config.root)?;
+            reject_ftp_command_injection(&config.username, "FTP username")?;
             config.username = config.username.trim().to_string();
         }
     }
@@ -1212,6 +1195,7 @@ fn normalize_input(input: &mut FileConnectionInput) -> Result<(), String> {
 }
 
 fn normalize_ftp_root(root: &str) -> Result<String, String> {
+    reject_ftp_command_injection(root, "FTP root")?;
     let decoded = percent_encoding::percent_decode_str(root.trim())
         .decode_utf8()
         .map_err(|_| "FTP root contains invalid percent-encoded UTF-8".to_string())?;
@@ -1265,6 +1249,7 @@ fn configured_entry_path(config: &FileConnectionConfig, path: &str, is_directory
 fn normalize_relative_remote_path(path: &str, allow_root: bool) -> Result<String, String> {
     // Remote paths are opaque storage keys, not URLs. Keep the raw value for
     // backend lookup and use a decoded byte shadow only for safety checks.
+    reject_ftp_command_injection(path, "Remote path")?;
     if path.trim() != path {
         return Err("Remote path cannot begin or end with whitespace".to_string());
     }
@@ -1379,6 +1364,7 @@ fn file_stat_from_metadata(path: &str, metadata: &Metadata) -> FileStat {
     }
 }
 
+#[cfg(test)]
 fn configured_operation_path(config: &FileConnectionConfig, path: &RemotePath, directory: bool) -> String {
     match config {
         FileConnectionConfig::Ftp(config) => join_configured_root(&config.root, path, directory),
@@ -1389,6 +1375,7 @@ fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
             let (host, port) = endpoint_host_port(&config.endpoint)?;
+            reject_ftp_command_injection(&config.username, "FTP username")?;
             Ok(format!("ftp\n{}\n{port}\n{}", host.to_ascii_lowercase(), config.username))
         }
     }
@@ -1418,6 +1405,12 @@ fn ftp_credentials(config: &FtpConnectionConfig, password: Option<&str>) -> (Str
     } else {
         (config.username.clone(), password.unwrap_or_default().to_string())
     }
+}
+
+fn validate_ftp_session_arguments(config: &FtpConnectionConfig, password: Option<&str>) -> Result<(), String> {
+    reject_ftp_command_injection(&config.root, "FTP root")?;
+    reject_ftp_command_injection(&config.username, "FTP username")?;
+    reject_ftp_command_injection(password.unwrap_or_default(), "FTP password")
 }
 
 fn parse_storage_config(record: &FileConnectionStorageRecord) -> Result<FileConnectionConfig, String> {
@@ -1511,6 +1504,25 @@ mod tests {
             .unwrap_err()
             .contains("path segments"));
         assert_eq!(normalize_ftp_root("//safe///folder/").unwrap(), "/safe/folder");
+    }
+
+    #[test]
+    fn ftp_validation_rejects_raw_and_encoded_command_delimiters() {
+        for injected in ["safe\r\nDELE victim", "safe\nDELE victim", "safe%0d%0aDELE%20victim", "safe%0ADELE%20victim"]
+        {
+            let root_input = input("ftp://example.test:21", &format!("/{injected}"));
+            assert!(validate_input(&root_input).unwrap_err().contains("FTP root"));
+
+            let mut username_input = input("ftp://example.test:21", "/");
+            let FileConnectionConfig::Ftp(config) = &mut username_input.config;
+            config.username = injected.to_string();
+            assert!(validate_input(&username_input).unwrap_err().contains("FTP username"));
+
+            let mut password_input = input("ftp://example.test:21", "/");
+            password_input.secrets =
+                Some(FileConnectionSecrets { password: Some(injected.to_string()), clear_password: false });
+            assert!(validate_input(&password_input).unwrap_err().contains("FTP password"));
+        }
     }
 
     #[tokio::test]
@@ -1797,6 +1809,8 @@ mod tests {
         assert!(normalize_relative_remote_path("safe//file", false).is_err());
         assert!(normalize_relative_remote_path("folder/", false).is_err());
         assert!(normalize_relative_remote_path(" folder /../escape", false).is_err());
+        assert!(normalize_relative_remote_path("safe\r\nDELE victim", false).is_err());
+        assert!(normalize_relative_remote_path("safe%0d%0aDELE%20victim", false).is_err());
     }
 
     #[tokio::test]
@@ -1912,6 +1926,39 @@ mod tests {
         assert_eq!(stat.size, 0);
         drop(operator);
 
+        let injection_victim = "/ftp/dbx/ticket-4-injection-victim";
+        let mut direct = direct_ftp(&input, &password).await;
+        direct_ftp_write(&mut direct, injection_victim, b"must survive").await;
+        direct.quit().await.unwrap();
+
+        for injected_path in
+            ["ticket-4-safe\r\nDELE ticket-4-injection-victim", "ticket-4-safe%0d%0aDELE%20ticket-4-injection-victim"]
+        {
+            assert!(RemotePath::parse(injected_path).unwrap_err().contains("CR or LF"));
+        }
+
+        let FileConnectionConfig::Ftp(base_config) = &input.config;
+        for injected_root in [
+            "/ftp/dbx\r\nDELE /ftp/dbx/ticket-4-injection-victim",
+            "/ftp/dbx%0d%0aDELE%20/ftp/dbx/ticket-4-injection-victim",
+        ] {
+            let mut injected_config = base_config.clone();
+            injected_config.root = injected_root.to_string();
+            let error = match open_ftp_root_session(&injected_config, Some(&password)).await {
+                Ok(mut ftp) => {
+                    let _ = ftp.quit().await;
+                    panic!("injected FTP root reached the protocol session");
+                }
+                Err(error) => error,
+            };
+            assert!(error.contains("FTP root") && error.contains("CR or LF"), "{error}");
+        }
+
+        direct = direct_ftp(&input, &password).await;
+        assert_eq!(direct.size(injection_victim).await.unwrap(), b"must survive".len() as usize);
+        direct.rm(injection_victim).await.unwrap();
+        direct.quit().await.unwrap();
+
         let empty_directory = RemotePath::parse("ticket-4-empty").unwrap();
         create_ftp_directory_exact(&input.config, &empty_directory, Some(&password)).await.unwrap();
         assert!(matches!(
@@ -1921,7 +1968,7 @@ mod tests {
 
         let removable_file = RemotePath::parse("ticket-4-file.txt").unwrap();
         let removable_file_path = configured_operation_path(&input.config, &removable_file, false);
-        let mut direct = direct_ftp(&input, &password).await;
+        direct = direct_ftp(&input, &password).await;
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-file.txt", b"delete me").await;
         direct.quit().await.unwrap();
         assert!(matches!(
@@ -2013,24 +2060,12 @@ mod tests {
         let raced_directory_path = configured_operation_path(&input.config, &raced_directory, true);
         drop(operator);
         create_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.unwrap();
-        operator = build_operator(&input.config, Some(&password)).unwrap();
-        let evidence = inspect_directory_delete(
-            &operator,
-            &raced_directory_path,
-            DirectoryStorageModel::Hierarchical,
-            Some(&password),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            plan_directory_delete(DirectoryStorageModel::Hierarchical, evidence).unwrap(),
-            DirectoryDeletePlan::DeleteExactDirectory
-        );
+        let FileConnectionConfig::Ftp(ftp_config) = &input.config;
+        assert!(!ftp_directory_has_children(ftp_config, &raced_directory, Some(&password)).await.unwrap());
         let raced_child = format!("{raced_directory_path}concurrent.txt");
         direct = direct_ftp(&input, &password).await;
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-raced/concurrent.txt", b"created after preflight").await;
         direct.quit().await.unwrap();
-        drop(operator);
         let raced_delete_error =
             delete_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.unwrap_err();
         assert!(raced_delete_error.contains("recursive delete is unsupported"), "{raced_delete_error}");
