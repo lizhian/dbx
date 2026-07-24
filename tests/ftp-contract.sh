@@ -43,6 +43,11 @@ nc -z 127.0.0.1 "${control_port}"
 docker exec "${container}" sh -c "
   printf 'dbx ftp fixture\n' > /ftp/dbx/fixture.txt
   mkdir -p /ftp/dbx/nested
+  mkdir -p /ftp/dbx/a
+  printf 'literal-percent-space\n' > '/ftp/dbx/a%20b'
+  printf 'actual-space\n' > '/ftp/dbx/a b'
+  printf 'literal-percent-slash\n' > '/ftp/dbx/a%2Fb'
+  printf 'nested-slash\n' > '/ftp/dbx/a/b'
   for index in \$(seq -w 1 205); do
     printf 'page fixture %s\n' \"\${index}\" > \"/ftp/dbx/page-\${index}.txt\"
   done

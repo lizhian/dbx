@@ -85,6 +85,7 @@ const form = ref({ name: "", endpoint: "ftp://localhost:21", root: "/", username
 let connectionsGeneration = 0;
 let rootGeneration = 0;
 let statGeneration = 0;
+let navigationGeneration = 0;
 
 const selectedConnection = computed(() => connections.value.find((connection) => connection.id === selectedId.value));
 const canSubmit = computed(() => !!form.value.name.trim() && !!form.value.endpoint.trim() && form.value.root.startsWith("/"));
@@ -116,12 +117,13 @@ function inputFromForm(): FileConnectionInput {
 
 async function loadConnections(preferredId?: string) {
   const generation = ++connectionsGeneration;
+  const navigation = ++navigationGeneration;
+  rootGeneration += 1;
+  const closePromise = closeActiveCursor();
   loadingConnections.value = true;
   try {
-    rootGeneration += 1;
-    await closeActiveCursor();
-    const loaded = await api.listFileConnections();
-    if (generation !== connectionsGeneration) return;
+    const [loaded] = await Promise.all([api.listFileConnections(), closePromise]);
+    if (generation !== connectionsGeneration || navigation !== navigationGeneration) return;
     connections.value = loaded;
     const nextId = preferredId && connections.value.some((connection) => connection.id === preferredId) ? preferredId : selectedId.value;
     selectedId.value = nextId && connections.value.some((connection) => connection.id === nextId) ? nextId : (connections.value[0]?.id ?? null);
@@ -189,8 +191,11 @@ async function loadDirectory() {
 }
 
 async function refreshDirectory() {
+  const navigation = ++navigationGeneration;
   rootGeneration += 1;
-  await closeActiveCursor();
+  const closePromise = closeActiveCursor();
+  await closePromise;
+  if (navigation !== navigationGeneration) return;
   await loadDirectory();
 }
 
@@ -222,18 +227,24 @@ async function loadMore() {
 
 async function selectConnection(id: string) {
   if (selectedId.value === id) return;
+  const navigation = ++navigationGeneration;
   rootGeneration += 1;
-  await closeActiveCursor();
+  const closePromise = closeActiveCursor();
   selectedId.value = id;
   currentPath.value = "";
+  await closePromise;
+  if (navigation !== navigationGeneration) return;
   await loadDirectory();
 }
 
 async function openDirectory(path: string) {
   if (path === currentPath.value) return;
+  const navigation = ++navigationGeneration;
   rootGeneration += 1;
-  await closeActiveCursor();
+  const closePromise = closeActiveCursor();
   currentPath.value = path;
+  await closePromise;
+  if (navigation !== navigationGeneration) return;
   await loadDirectory();
 }
 
@@ -333,6 +344,7 @@ function formatSize(bytes: number): string {
 
 onMounted(() => void loadConnections());
 onBeforeUnmount(() => {
+  navigationGeneration += 1;
   rootGeneration += 1;
   statGeneration += 1;
   void closeActiveCursor();

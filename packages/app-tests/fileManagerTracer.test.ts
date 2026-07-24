@@ -10,9 +10,10 @@ const tabBar = readFileSync(new URL("../../apps/desktop/src/components/layout/Ap
 const english = readFileSync(new URL("../../apps/desktop/src/i18n/locales/en.ts", import.meta.url), "utf8");
 
 test("file manager frontend uses the dedicated Tauri command contract", () => {
-  for (const command of ["list_file_connections", "save_file_connection", "delete_file_connection", "test_file_connection", "list_file_root"]) {
+  for (const command of ["list_file_connections", "save_file_connection", "delete_file_connection", "test_file_connection", "list_file_entries", "list_file_entries_next", "close_file_list_cursor", "stat_file_entry"]) {
     assert.match(tauriBackend, new RegExp(`invoke\\("${command}"`));
   }
+  assert.doesNotMatch(tauriBackend, /list_file_root|listFileRoot/);
 });
 
 test("FTP connection editor exposes CRUD, staged testing, root browsing, and plaintext warning", () => {
@@ -23,7 +24,10 @@ test("FTP connection editor exposes CRUD, staged testing, root browsing, and pla
   assert.match(page, /api\.saveFileConnection/);
   assert.match(page, /api\.deleteFileConnection/);
   assert.match(page, /api\.testFileConnection/);
-  assert.match(page, /api\.listFileRoot/);
+  assert.match(page, /api\.listFileEntries/);
+  assert.match(page, /api\.listFileEntriesNext/);
+  assert.match(page, /api\.closeFileListCursor/);
+  assert.match(page, /api\.statFileEntry/);
 });
 
 test("file manager is mounted as an independent special page", () => {

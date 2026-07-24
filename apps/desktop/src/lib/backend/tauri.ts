@@ -1325,10 +1325,6 @@ export async function testFileConnection(input: FileConnectionInput): Promise<Fi
   return invoke("test_file_connection", { input });
 }
 
-export async function listFileRoot(connectionId: string): Promise<FileManagerEntry[]> {
-  return (await listFileEntries(connectionId, "")).entries;
-}
-
 export async function listFileEntries(connectionId: string, path: string, options?: FileListOptions): Promise<FileListPage> {
   return invoke("list_file_entries", { connectionId, path, options });
 }

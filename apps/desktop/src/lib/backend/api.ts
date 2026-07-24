@@ -68,7 +68,6 @@ export const listFileConnections = forward("listFileConnections");
 export const saveFileConnection = forward("saveFileConnection");
 export const deleteFileConnection = forward("deleteFileConnection");
 export const testFileConnection = forward("testFileConnection");
-export const listFileRoot = forward("listFileRoot");
 export const listFileEntries = forward("listFileEntries");
 export const listFileEntriesNext = forward("listFileEntriesNext");
 export const closeFileListCursor = forward("closeFileListCursor");

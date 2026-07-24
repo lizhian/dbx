@@ -121,7 +121,6 @@ import type {
   FileEntryStat,
   FileListOptions,
   FileListPage,
-  FileManagerEntry,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -315,10 +314,6 @@ export async function deleteFileConnection(_connectionId: string): Promise<void>
 }
 
 export async function testFileConnection(_input: FileConnectionInput): Promise<FileConnectionTestResult> {
-  return desktopFileManagerUnavailable();
-}
-
-export async function listFileRoot(_connectionId: string): Promise<FileManagerEntry[]> {
   return desktopFileManagerUnavailable();
 }
 

@@ -852,32 +852,41 @@ fn configured_entry_path(config: &FileConnectionConfig, path: &str, is_directory
 }
 
 fn normalize_relative_remote_path(path: &str, allow_root: bool) -> Result<String, String> {
-    let decoded = percent_encoding::percent_decode_str(path)
-        .decode_utf8()
-        .map_err(|_| "Remote path contains invalid percent-encoded UTF-8".to_string())?;
-    if decoded.trim() != decoded {
+    // Remote paths are opaque storage keys, not URLs. Keep the raw value for
+    // backend lookup and use a decoded byte shadow only for safety checks.
+    if path.trim() != path {
         return Err("Remote path cannot begin or end with whitespace".to_string());
     }
-    if decoded.starts_with('/') {
+    if path.starts_with('/') {
         return Err("Remote path must be relative to the configured root".to_string());
     }
-    if decoded.contains('\0') || decoded.contains('\\') {
+    if path.contains('\0') || path.contains('\\') {
         return Err("Remote path contains an invalid character".to_string());
     }
-    if decoded.is_empty() {
+    if path.is_empty() {
         return if allow_root { Ok(String::new()) } else { Err("Remote path is required".to_string()) };
     }
-    let mut normalized = Vec::new();
-    for segment in decoded.split('/') {
+    for segment in path.split('/') {
         if segment.is_empty() {
             return Err("Remote path cannot contain empty path segments".to_string());
         }
-        if matches!(segment, "." | "..") {
-            return Err("Remote path cannot contain '.' or '..' path segments".to_string());
-        }
-        normalized.push(segment);
     }
-    Ok(normalized.join("/"))
+    validate_decoded_path_shadow(path)?;
+    Ok(path.to_string())
+}
+
+fn validate_decoded_path_shadow(path: &str) -> Result<(), String> {
+    let decoded = percent_encoding::percent_decode_str(path).collect::<Vec<_>>();
+    if decoded.first() == Some(&b'/') {
+        return Err("Remote path must be relative to the configured root".to_string());
+    }
+    if decoded.contains(&b'\0') || decoded.contains(&b'\\') {
+        return Err("Remote path contains an invalid character".to_string());
+    }
+    if decoded.split(|byte| *byte == b'/').any(|segment| segment == b"." || segment == b"..") {
+        return Err("Remote path cannot contain '.' or '..' path segments".to_string());
+    }
+    Ok(())
 }
 
 fn list_session_binding(
@@ -982,15 +991,7 @@ fn root_relative_entry_path(list_path: &str, entry_path: &str) -> Result<String,
     if relative.is_empty() || relative.starts_with('/') || relative.contains('\0') || relative.contains('\\') {
         return Err("FTP server returned an invalid entry path".to_string());
     }
-    let decoded = percent_encoding::percent_decode_str(relative)
-        .decode_utf8()
-        .map_err(|_| "FTP server returned an invalid percent-encoded entry path".to_string())?;
-    if decoded.starts_with('/') || decoded.contains('\0') || decoded.contains('\\') {
-        return Err("FTP server returned an invalid encoded entry path".to_string());
-    }
-    if decoded.split('/').any(|segment| matches!(segment, "." | "..")) {
-        return Err("FTP server returned an unsafe entry path".to_string());
-    }
+    validate_decoded_path_shadow(relative).map_err(|_| "FTP server returned an unsafe entry path".to_string())?;
     Ok(relative.to_string())
 }
 
@@ -1178,7 +1179,12 @@ mod tests {
         assert!(normalize_relative_remote_path(" leading/trailing", false).is_err());
         assert!(normalize_relative_remote_path("leading/trailing ", false).is_err());
         assert_eq!(normalize_relative_remote_path("folder /file name.txt", false).unwrap(), "folder /file name.txt");
-        assert_eq!(normalize_relative_remote_path("folder/file%20name.txt", false).unwrap(), "folder/file name.txt");
+        assert_eq!(normalize_relative_remote_path("folder/file%20name.txt", false).unwrap(), "folder/file%20name.txt");
+        assert_eq!(normalize_relative_remote_path("%20leading", false).unwrap(), "%20leading");
+        assert_eq!(normalize_relative_remote_path("trailing%20", false).unwrap(), "trailing%20");
+        assert_eq!(normalize_relative_remote_path("a%2Fb", false).unwrap(), "a%2Fb");
+        assert!(normalize_relative_remote_path("%2Fabsolute", false).is_err());
+        assert!(normalize_relative_remote_path("safe/%2e%2e/escape", false).is_err());
         assert!(normalize_relative_remote_path("safe//file", false).is_err());
         assert!(normalize_relative_remote_path("folder/", false).is_err());
         assert!(normalize_relative_remote_path(" folder /../escape", false).is_err());
@@ -1260,10 +1266,23 @@ mod tests {
             assert!(page.entries.len() <= 50);
             paged_paths.extend(page.entries.iter().map(|entry| entry.path.clone()));
         }
-        assert_eq!(paged_paths.len(), 207);
+        assert_eq!(paged_paths.len(), 211);
         let unique_paths = paged_paths.iter().collect::<std::collections::HashSet<_>>();
         assert_eq!(unique_paths.len(), paged_paths.len());
         assert!(paged_paths.iter().any(|path| path == "nested"));
+        assert!(paged_paths.iter().any(|path| path == "a%20b"));
+        assert!(paged_paths.iter().any(|path| path == "a b"));
+        assert!(paged_paths.iter().any(|path| path == "a%2Fb"));
+        assert!(paged_paths.iter().any(|path| path == "a"));
+
+        let metadata = stat_remote_metadata(&operator, &input.config, "a%20b", Some(&password)).await.unwrap();
+        assert_eq!(metadata.content_length(), b"literal-percent-space\n".len() as u64);
+        let metadata = stat_remote_metadata(&operator, &input.config, "a b", Some(&password)).await.unwrap();
+        assert_eq!(metadata.content_length(), b"actual-space\n".len() as u64);
+        let metadata = stat_remote_metadata(&operator, &input.config, "a%2Fb", Some(&password)).await.unwrap();
+        assert_eq!(metadata.content_length(), b"literal-percent-slash\n".len() as u64);
+        let metadata = stat_remote_metadata(&operator, &input.config, "a/b", Some(&password)).await.unwrap();
+        assert_eq!(metadata.content_length(), b"nested-slash\n".len() as u64);
 
         let metadata = stat_remote_metadata(&operator, &input.config, "fixture.txt", Some(&password)).await.unwrap();
         let stat = file_stat_from_metadata("fixture.txt", &metadata);

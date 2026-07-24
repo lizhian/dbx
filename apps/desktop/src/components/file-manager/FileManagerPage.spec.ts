@@ -44,6 +44,11 @@ const directory = {
   size: 0,
   lastModified: "2026-07-24T00:00:00Z",
 };
+const logsDirectory = {
+  ...directory,
+  path: "logs",
+  name: "logs",
+};
 const file = {
   path: "notes.txt",
   name: "notes.txt",
@@ -167,5 +172,50 @@ describe("FileManagerPage paginated directory browsing", () => {
 
     expect(api.closeFileListCursor).toHaveBeenCalledWith("ftp-1", "stale-primary-cursor");
     expect(document.body.textContent).toContain("Secondary");
+  });
+
+  it("keeps the last connection selection when an earlier cursor close is delayed", async () => {
+    api.listFileEntries.mockResolvedValueOnce({ entries: [directory], cursor: "cursor-root" }).mockResolvedValue({ entries: [file], cursor: null });
+    await mountPage();
+
+    let releaseClose!: () => void;
+    api.closeFileListCursor.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        releaseClose = resolve;
+      }),
+    );
+    buttonWithText("Secondary").click();
+    buttonWithText("Primary").click();
+    await flush();
+    releaseClose();
+    await flush();
+
+    expect(api.listFileEntries.mock.calls).toEqual([
+      ["ftp-1", "", { pageSize: 200 }],
+      ["ftp-1", "", { pageSize: 200 }],
+    ]);
+  });
+
+  it("keeps the last directory selection when an earlier cursor close is delayed", async () => {
+    api.listFileEntries.mockResolvedValueOnce({ entries: [directory, logsDirectory], cursor: "cursor-root" }).mockResolvedValue({ entries: [file], cursor: null });
+    await mountPage();
+
+    let releaseClose!: () => void;
+    api.closeFileListCursor.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        releaseClose = resolve;
+      }),
+    );
+    const rows = Array.from(document.querySelectorAll("tr"));
+    rows.find((candidate) => candidate.textContent?.includes("docs"))?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    rows.find((candidate) => candidate.textContent?.includes("logs"))?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await flush();
+    releaseClose();
+    await flush();
+
+    expect(api.listFileEntries.mock.calls).toEqual([
+      ["ftp-1", "", { pageSize: 200 }],
+      ["ftp-1", "logs", { pageSize: 200 }],
+    ]);
   });
 });

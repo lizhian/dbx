@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use super::file_manager::FileEntry;
@@ -46,7 +47,7 @@ pub struct FileListPage {
 }
 
 pub struct ListSessionRegistry {
-    inner: Mutex<RegistryState>,
+    inner: Arc<Mutex<RegistryState>>,
     idle_ttl: Duration,
     global_limit: usize,
     per_connection_limit: usize,
@@ -100,7 +101,7 @@ impl ListSessionRegistry {
     fn new(idle_ttl: Duration, global_limit: usize, per_connection_limit: usize) -> Self {
         assert!(global_limit > 0);
         assert!(per_connection_limit > 0);
-        Self { inner: Mutex::new(RegistryState::default()), idle_ttl, global_limit, per_connection_limit }
+        Self { inner: Arc::new(Mutex::new(RegistryState::default())), idle_ttl, global_limit, per_connection_limit }
     }
 
     pub fn generation(&self, connection_id: &str) -> u64 {
@@ -150,6 +151,8 @@ impl ListSessionRegistry {
         self.make_room(&mut state, &binding.connection_id);
         let access_sequence = Self::next_sequence(&mut state);
         state.sessions.insert(cursor.clone(), SessionSlot { binding, session, last_access: now, access_sequence });
+        drop(state);
+        self.schedule_expiry(cursor.clone(), access_sequence, now + self.idle_ttl);
         Ok(FileListPage { entries: chunk.entries, cursor: Some(cursor) })
     }
 
@@ -158,7 +161,7 @@ impl ListSessionRegistry {
     }
 
     async fn next_at(&self, cursor: &str, binding: &ListSessionBinding, now: Instant) -> Result<FileListPage, String> {
-        let session = {
+        let (session, access_sequence) = {
             let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
             Self::purge_expired(&mut state, now, self.idle_ttl);
             let Some(slot) = state.sessions.get(cursor) else {
@@ -174,8 +177,9 @@ impl ListSessionRegistry {
                 slot.last_access = now;
                 slot.access_sequence = access_sequence;
             }
-            session
+            (session, access_sequence)
         };
+        self.schedule_expiry(cursor.to_string(), access_sequence, now + self.idle_ttl);
 
         let mut session_guard = session.lock().await;
         {
@@ -209,10 +213,13 @@ impl ListSessionRegistry {
                 return Err(CURSOR_EXPIRED.to_string());
             }
             state.sessions.remove(cursor);
+            let last_access = Instant::now();
             state.sessions.insert(
                 next_cursor.clone(),
-                SessionSlot { binding: binding.clone(), session, last_access: Instant::now(), access_sequence },
+                SessionSlot { binding: binding.clone(), session, last_access, access_sequence },
             );
+            drop(state);
+            self.schedule_expiry(next_cursor.clone(), access_sequence, last_access + self.idle_ttl);
             Ok(FileListPage { entries: chunk.entries, cursor: Some(next_cursor) })
         } else {
             self.remove_if_current(cursor, &session);
@@ -224,21 +231,24 @@ impl ListSessionRegistry {
         let now = Instant::now();
         let mut state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         Self::purge_expired(&mut state, now, self.idle_ttl);
-        match state.sessions.get(cursor) {
+        let access_sequence = match state.sessions.get(cursor) {
             Some(slot) if &slot.binding == binding => {
                 let access_sequence = Self::next_sequence(&mut state);
                 if let Some(slot) = state.sessions.get_mut(cursor) {
                     slot.last_access = now;
                     slot.access_sequence = access_sequence;
                 }
-                Ok(())
+                access_sequence
             }
             Some(_) => {
                 state.sessions.remove(cursor);
-                Err(CURSOR_EXPIRED.to_string())
+                return Err(CURSOR_EXPIRED.to_string());
             }
-            None => Err(CURSOR_EXPIRED.to_string()),
-        }
+            None => return Err(CURSOR_EXPIRED.to_string()),
+        };
+        drop(state);
+        self.schedule_expiry(cursor.to_string(), access_sequence, now + self.idle_ttl);
+        Ok(())
     }
 
     pub fn invalidate_cursor(&self, connection_id: &str, cursor: &str) -> Result<(), String> {
@@ -265,6 +275,20 @@ impl ListSessionRegistry {
         if state.sessions.get(cursor).is_some_and(|slot| Arc::ptr_eq(&slot.session, session)) {
             state.sessions.remove(cursor);
         }
+    }
+
+    fn schedule_expiry(&self, cursor: String, access_sequence: u64, deadline: Instant) {
+        let state = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep_until(deadline).await;
+            let Some(state) = state.upgrade() else {
+                return;
+            };
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.sessions.get(&cursor).is_some_and(|slot| slot.access_sequence == access_sequence) {
+                state.sessions.remove(&cursor);
+            }
+        });
     }
 
     fn make_room(&self, state: &mut RegistryState, connection_id: &str) {
@@ -418,6 +442,38 @@ mod tests {
         let cursor = first.cursor.unwrap();
         let error = registry.next_at(&cursor, &binding, opened_at + Duration::from_secs(300)).await.unwrap_err();
         assert_eq!(error, CURSOR_EXPIRED);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timer_actively_drops_a_session_without_registry_traffic() {
+        let registry = ListSessionRegistry::new(Duration::from_secs(60), 10, 10);
+        let binding = binding("ftp-1", 1, "", 1);
+        let page = registry.open(binding, registry.generation("ftp-1"), entries(2)).await.unwrap();
+        assert!(page.cursor.is_some());
+        assert_eq!(registry.session_count(), 1);
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(registry.session_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cursor_access_renews_idle_ttl_and_stale_timer_cannot_remove_it() {
+        let registry = ListSessionRegistry::new(Duration::from_secs(60), 10, 10);
+        let binding = binding("ftp-1", 1, "", 1);
+        let page = registry.open(binding.clone(), registry.generation("ftp-1"), entries(3)).await.unwrap();
+        let cursor = page.cursor.unwrap();
+
+        tokio::time::advance(Duration::from_secs(40)).await;
+        registry.validate(&cursor, &binding).unwrap();
+        tokio::time::advance(Duration::from_secs(21)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.session_count(), 1);
+
+        tokio::time::advance(Duration::from_secs(40)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(registry.session_count(), 0);
     }
 
     #[tokio::test]
