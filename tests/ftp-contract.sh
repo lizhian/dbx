@@ -39,6 +39,7 @@ trap cleanup EXIT
 
 start_ftp() {
   local suffix="$1"
+  local include_large_fixture="${2:-false}"
   stop_ftp
   container="dbx-ftp-contract-${suffix}-${RANDOM}"
   docker run -d \
@@ -93,7 +94,6 @@ start_ftp() {
 
   docker exec "${container}" sh -c "
     printf 'dbx ftp fixture\n' > /ftp/dbx/fixture.txt
-    dd if=/dev/zero of=/ftp/dbx/large.bin bs=1M count=256 status=none
     mkdir -p /ftp/dbx/nested
     mkdir -p /ftp/dbx/a
     printf 'literal-percent-space\n' > '/ftp/dbx/a%20b'
@@ -105,6 +105,12 @@ start_ftp() {
     done
     chown -R dbx:dbx /ftp/dbx
   "
+  if [[ "${include_large_fixture}" == "true" ]]; then
+    docker exec "${container}" sh -c "
+      dd if=/dev/zero of=/ftp/dbx/large.bin bs=1M count=256 status=none
+      chown dbx:dbx /ftp/dbx/large.bin
+    "
+  fi
 }
 
 run_contract() {
@@ -119,13 +125,13 @@ run_contract() {
 start_ftp "read"
 run_contract "fixed_ftp_service_contract"
 
-start_ftp "download"
+start_ftp "download" true
 run_contract "fixed_ftp_download_contract"
 
 # Each disconnect run starts from a fresh service. The Rust contract stops at
 # an explicit reader-open barrier, kills this container, and only then permits
 # the first read, so disconnect timing does not depend on polling file growth.
 for attempt in $(seq 1 3); do
-  start_ftp "disconnect-${attempt}"
+  start_ftp "disconnect-${attempt}" true
   run_contract "fixed_ftp_worker_success_cancel_and_disconnect_contract"
 done
