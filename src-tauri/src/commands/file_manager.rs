@@ -81,6 +81,12 @@ struct CachedOperator {
     operator: Operator,
 }
 
+struct CachedOperatorRetirement<'a> {
+    runtime: &'a FileManagerRuntime,
+    connection_id: &'a str,
+    revision: i64,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FileConnectionConfig {
@@ -415,27 +421,38 @@ pub async fn create_file_directory(
     let config = parse_storage_config(&record)?;
     let scope = password_scope(&config)?;
     let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
-    let operator = runtime.operator_for(&record, &config, password.as_deref())?;
     let directory_path = configured_operation_path(&config, &path, true);
     let cancellation = lease.cancellation();
+    let mutation_password = password.clone();
 
-    let result = run_mutation_operation(&runtime, &connection_id, revision, &cancellation, "Create directory", async {
-        let _mutation_guard = lease.entry.mutation_lock.lock().await;
-        cancellation.ensure_active()?;
-        operator
-            .create_dir(&directory_path)
-            .await
-            .map_err(|error| redact_error(error.to_string(), password.as_deref()))?;
-        let metadata = operator.stat(&directory_path).await.map_err(|error| {
-            format!(
-                "Directory creation could not be verified: {}",
-                redact_error(error.to_string(), password.as_deref())
-            )
-        })?;
-        if !metadata.mode().is_dir() {
-            return Err("Directory creation could not be verified because the target is not a directory".to_string());
-        }
-        Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+    let result = run_mutation_operation(&cancellation, "Create directory", async {
+        run_locked_mutation(
+            &runtime,
+            &lease.entry.mutation_lock,
+            &connection_id,
+            revision,
+            &cancellation,
+            || runtime.operator_for(&record, &config, password.as_deref()),
+            move |operator| async move {
+                operator
+                    .create_dir(&directory_path)
+                    .await
+                    .map_err(|error| redact_error(error.to_string(), mutation_password.as_deref()))?;
+                let metadata = operator.stat(&directory_path).await.map_err(|error| {
+                    format!(
+                        "Directory creation could not be verified: {}",
+                        redact_error(error.to_string(), mutation_password.as_deref())
+                    )
+                })?;
+                if !metadata.mode().is_dir() {
+                    return Err(
+                        "Directory creation could not be verified because the target is not a directory".to_string()
+                    );
+                }
+                Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+            },
+        )
+        .await
     })
     .await;
     result
@@ -461,13 +478,23 @@ pub async fn delete_file_entry(
     let config = parse_storage_config(&record)?;
     let scope = password_scope(&config)?;
     let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
-    let operator = runtime.operator_for(&record, &config, password.as_deref())?;
     let cancellation = lease.cancellation();
+    let mutation_config = config.clone();
+    let mutation_password = password.clone();
 
-    run_mutation_operation(&runtime, &connection_id, revision, &cancellation, "Delete", async {
-        let _mutation_guard = lease.entry.mutation_lock.lock().await;
-        cancellation.ensure_active()?;
-        delete_entry(&operator, &config, &path, password.as_deref()).await
+    run_mutation_operation(&cancellation, "Delete", async {
+        run_locked_mutation(
+            &runtime,
+            &lease.entry.mutation_lock,
+            &connection_id,
+            revision,
+            &cancellation,
+            || runtime.operator_for(&record, &config, password.as_deref()),
+            move |operator| async move {
+                delete_entry(&operator, &mutation_config, &path, mutation_password.as_deref()).await
+            },
+        )
+        .await
     })
     .await
 }
@@ -575,6 +602,12 @@ impl Default for ConnectionRuntime {
             list_lock: AsyncMutex::new(()),
             mutation_lock: AsyncMutex::new(()),
         }
+    }
+}
+
+impl Drop for CachedOperatorRetirement<'_> {
+    fn drop(&mut self) {
+        self.runtime.evict_revision(self.connection_id, self.revision);
     }
 }
 
@@ -725,9 +758,6 @@ where
 }
 
 async fn run_mutation_operation<T, F>(
-    runtime: &FileManagerRuntime,
-    connection_id: &str,
-    revision: i64,
     cancellation: &CancellationSignal,
     operation: &'static str,
     future: F,
@@ -735,18 +765,35 @@ async fn run_mutation_operation<T, F>(
 where
     F: Future<Output = Result<T, String>>,
 {
-    let result = tokio::select! {
+    tokio::select! {
         _ = cancellation.cancelled() => Err("File connection is being deleted".to_string()),
         result = tokio::time::timeout(MUTATION_TIMEOUT, future) => {
             result.map_err(|_| format!("{operation} timed out"))?
         }
-    };
-    // FTP mutations and their verification commonly finish on a 550/NotFound
-    // response. OpenDAL 0.57 can leave that pooled control connection
-    // unsuitable for the next command, so mutations always retire the cached
-    // operator before the UI refreshes.
-    runtime.evict_revision(connection_id, revision);
-    result
+    }
+}
+
+async fn run_locked_mutation<T, Acquire, Mutate, Mutation>(
+    runtime: &FileManagerRuntime,
+    mutation_lock: &AsyncMutex<()>,
+    connection_id: &str,
+    revision: i64,
+    cancellation: &CancellationSignal,
+    acquire_operator: Acquire,
+    mutate: Mutate,
+) -> Result<T, String>
+where
+    Acquire: FnOnce() -> Result<Operator, String>,
+    Mutate: FnOnce(Operator) -> Mutation,
+    Mutation: Future<Output = Result<T, String>>,
+{
+    let _mutation_guard = mutation_lock.lock().await;
+    cancellation.ensure_active()?;
+    // Declared after the lock guard so every return/cancellation path evicts
+    // the cached operator before the per-connection lock is released.
+    let _retirement = CachedOperatorRetirement { runtime, connection_id, revision };
+    let operator = acquire_operator()?;
+    mutate(operator).await
 }
 
 async fn delete_entry(
@@ -1382,19 +1429,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_mutation_retires_the_cached_operator() {
-        let runtime = FileManagerRuntime::default();
-        let config = input("ftp://example.test:21", "/");
-        let operator = build_operator(&config.config, None).unwrap();
-        runtime.operators.write().unwrap().insert("ftp-1".to_string(), CachedOperator { revision: 1, operator });
+    async fn queued_mutation_reacquires_operator_after_predecessor_retirement() {
+        let runtime = Arc::new(FileManagerRuntime::default());
+        let config = input("ftp://example.test:21", "/").config;
+        let record = FileConnectionStorageRecord {
+            id: "ftp-1".to_string(),
+            name: "FTP".to_string(),
+            kind: "ftp".to_string(),
+            config_json: serde_json::to_string(&config).unwrap(),
+            revision: 1,
+            created_at: String::new(),
+            updated_at: String::new(),
+            has_secret: false,
+        };
+        let first_started = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let second_acquired = Arc::new(AtomicBool::new(false));
+
+        let first_runtime = runtime.clone();
+        let first_lease = runtime.begin_operation("ftp-1").unwrap();
+        let first_cancellation = first_lease.cancellation();
+        let first_config = config.clone();
+        let first_record = record.clone();
+        let first_started_signal = first_started.clone();
+        let first_release_signal = release_first.clone();
+        let first = tokio::spawn(async move {
+            let acquire_runtime = first_runtime.clone();
+            let mutation_runtime = first_runtime.clone();
+            let result = run_mutation_operation(
+                &first_cancellation,
+                "Mutation",
+                run_locked_mutation(
+                    &first_runtime,
+                    &first_lease.entry.mutation_lock,
+                    "ftp-1",
+                    1,
+                    &first_cancellation,
+                    move || {
+                        assert_eq!(acquire_runtime.operator_count(), 0);
+                        acquire_runtime.operator_for(&first_record, &first_config, None)
+                    },
+                    move |_operator| async move {
+                        assert_eq!(mutation_runtime.operator_count(), 1);
+                        first_started_signal.notify_one();
+                        first_release_signal.notified().await;
+                        Ok::<_, String>(())
+                    },
+                ),
+            )
+            .await;
+            drop(first_lease);
+            result
+        });
+        first_started.notified().await;
         assert_eq!(runtime.operator_count(), 1);
 
-        run_mutation_operation(&runtime, "ftp-1", 1, &CancellationSignal::default(), "Mutation", async {
-            Ok::<_, String>(())
-        })
-        .await
-        .unwrap();
+        let second_runtime = runtime.clone();
+        let second_lease = runtime.begin_operation("ftp-1").unwrap();
+        let second_cancellation = second_lease.cancellation();
+        let second_config = config.clone();
+        let second_record = record.clone();
+        let second_acquired_flag = second_acquired.clone();
+        let second = tokio::spawn(async move {
+            let acquire_runtime = second_runtime.clone();
+            let mutation_runtime = second_runtime.clone();
+            let result = run_mutation_operation(
+                &second_cancellation,
+                "Mutation",
+                run_locked_mutation(
+                    &second_runtime,
+                    &second_lease.entry.mutation_lock,
+                    "ftp-1",
+                    1,
+                    &second_cancellation,
+                    move || {
+                        assert_eq!(acquire_runtime.operator_count(), 0);
+                        let operator = acquire_runtime.operator_for(&second_record, &second_config, None)?;
+                        assert_eq!(acquire_runtime.operator_count(), 1);
+                        second_acquired_flag.store(true, Ordering::Release);
+                        Ok(operator)
+                    },
+                    move |_operator| async move {
+                        assert_eq!(mutation_runtime.operator_count(), 1);
+                        Ok::<_, String>(())
+                    },
+                ),
+            )
+            .await;
+            drop(second_lease);
+            result
+        });
+        tokio::task::yield_now().await;
+        assert!(!second_acquired.load(Ordering::Acquire));
+        assert_eq!(runtime.operator_count(), 1);
+
+        release_first.notify_one();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert!(second_acquired.load(Ordering::Acquire));
         assert_eq!(runtime.operator_count(), 0);
+        assert_eq!(runtime.lifecycle_count(), 0);
     }
 
     #[tokio::test]
@@ -1402,12 +1536,11 @@ mod tests {
         let runtime = Arc::new(FileManagerRuntime::default());
         let acquired = Arc::new(Notify::new());
 
-        let first_runtime = runtime.clone();
         let first_acquired = acquired.clone();
         let first_lease = runtime.begin_operation("ftp-1").unwrap();
         let first_cancellation = first_lease.cancellation();
         let first = tokio::spawn(async move {
-            let result = run_mutation_operation(&first_runtime, "ftp-1", 1, &first_cancellation, "Mutation", async {
+            let result = run_mutation_operation(&first_cancellation, "Mutation", async {
                 let _guard = first_lease.entry.mutation_lock.lock().await;
                 first_acquired.notify_one();
                 std::future::pending::<Result<(), String>>().await
@@ -1418,11 +1551,10 @@ mod tests {
         });
         acquired.notified().await;
 
-        let second_runtime = runtime.clone();
         let second_lease = runtime.begin_operation("ftp-1").unwrap();
         let second_cancellation = second_lease.cancellation();
         let second = tokio::spawn(async move {
-            let result = run_mutation_operation(&second_runtime, "ftp-1", 1, &second_cancellation, "Mutation", async {
+            let result = run_mutation_operation(&second_cancellation, "Mutation", async {
                 let _guard = second_lease.entry.mutation_lock.lock().await;
                 second_cancellation.ensure_active()?;
                 std::future::pending::<Result<(), String>>().await
@@ -1653,8 +1785,8 @@ mod tests {
             delete_entry(&operator, &input.config, &removable_file, Some(&password)).await.unwrap().outcome,
             FileMutationOutcome::Completed
         ));
-        assert_eq!(operator.stat(&removable_file_path).await.unwrap_err().kind(), ErrorKind::NotFound);
         operator = build_operator(&input.config, Some(&password)).unwrap();
+        assert_eq!(operator.stat(&removable_file_path).await.unwrap_err().kind(), ErrorKind::NotFound);
 
         for (literal_name, decoded_name) in
             [("ticket-4%20literal-dir", "ticket-4 literal-dir"), ("ticket-4%2Fliteral-dir", "ticket-4/literal-dir")]
@@ -1667,12 +1799,13 @@ mod tests {
             direct.cwd(format!("/ftp/dbx/{literal_name}")).await.unwrap();
             direct.cwd("/ftp/dbx").await.unwrap();
             assert!(direct.cwd(format!("/ftp/dbx/{decoded_name}")).await.is_err());
+            direct = direct_ftp(&input, &password).await;
             assert!(matches!(
                 delete_entry(&operator, &input.config, &literal_directory, Some(&password)).await.unwrap().outcome,
                 FileMutationOutcome::Completed
             ));
             assert!(direct.cwd(format!("/ftp/dbx/{literal_name}")).await.is_err());
-            direct.cwd("/ftp/dbx").await.unwrap();
+            direct = direct_ftp(&input, &password).await;
             operator = build_operator(&input.config, Some(&password)).unwrap();
         }
 
@@ -1683,6 +1816,7 @@ mod tests {
         assert_eq!(operator.stat(&percent_space_file_path).await.unwrap().content_length(), 7);
         delete_entry(&operator, &input.config, &percent_space_file, Some(&password)).await.unwrap();
         assert!(direct.size("/ftp/dbx/ticket-4%20literal-file").await.is_err());
+        direct = direct_ftp(&input, &password).await;
         assert_eq!(direct.size("/ftp/dbx/ticket-4 literal-file").await.unwrap(), 14);
         direct.rm("/ftp/dbx/ticket-4 literal-file").await.unwrap();
         operator = build_operator(&input.config, Some(&password)).unwrap();
@@ -1695,6 +1829,7 @@ mod tests {
         assert_eq!(operator.stat(&percent_slash_file_path).await.unwrap().content_length(), 3);
         delete_entry(&operator, &input.config, &percent_slash_file, Some(&password)).await.unwrap();
         assert!(direct.size("/ftp/dbx/ticket-4-decoded%2Fliteral-file").await.is_err());
+        direct = direct_ftp(&input, &password).await;
         assert_eq!(direct.size("/ftp/dbx/ticket-4-decoded/literal-file").await.unwrap(), 14);
         direct.rm("/ftp/dbx/ticket-4-decoded/literal-file").await.unwrap();
         direct.rmdir("/ftp/dbx/ticket-4-decoded").await.unwrap();
