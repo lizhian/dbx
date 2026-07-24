@@ -2023,6 +2023,9 @@ mod tests {
     #[test]
     fn transfer_paths_cannot_escape_the_configured_root() {
         assert_eq!(validate_remote_relative_path("reports/2026.csv").unwrap(), "reports/2026.csv");
+        assert_eq!(validate_remote_relative_path("a%20b").unwrap(), "a%20b");
+        assert_eq!(validate_remote_relative_path("a%2Fb").unwrap(), "a%2Fb");
+        assert_eq!(validate_remote_relative_path("literal%FFname").unwrap(), "literal%FFname");
         assert!(validate_remote_relative_path(" reports/final.csv ").unwrap_err().contains("whitespace"));
         for path in ["/absolute", "../escape", "safe/../escape", "safe\\escape", "safe/%2e%2e/escape", "safe//file"] {
             assert!(validate_remote_relative_path(path).is_err(), "{path} should be rejected");

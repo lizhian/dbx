@@ -132,7 +132,11 @@ pub struct FileTransferStorageRecord {
     pub direction: String,
     pub remote_path: String,
     pub local_path: String,
+    #[serde(skip_serializing)]
+    pub local_directory_identity: String,
     pub temp_path: Option<String>,
+    #[serde(skip_serializing)]
+    pub temp_identity: Option<String>,
     pub status: String,
     pub bytes_transferred: i64,
     pub total_bytes: Option<i64>,
@@ -317,7 +321,9 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         direction TEXT NOT NULL,
         remote_path TEXT NOT NULL,
         local_path TEXT NOT NULL,
+        local_directory_identity TEXT NOT NULL DEFAULT '',
         temp_path TEXT,
+        temp_identity TEXT,
         status TEXT NOT NULL,
         bytes_transferred INTEGER NOT NULL DEFAULT 0,
         total_bytes INTEGER,
@@ -470,6 +476,7 @@ impl Storage {
             ensure_saved_sql_columns_sync(conn)?;
             ensure_tab_runtime_cache_columns_sync(conn)?;
             ensure_ai_configs_columns_sync(conn)?;
+            ensure_file_transfer_columns_sync(conn)?;
             Ok(())
         })
     }
@@ -699,15 +706,16 @@ impl Storage {
         direction: String,
         remote_path: String,
         local_path: String,
+        local_directory_identity: String,
     ) -> Result<FileTransferStorageRecord, String> {
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
                 "INSERT INTO file_transfers (
-                    id, connection_id, direction, remote_path, local_path, status,
-                    bytes_transferred, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 0, ?6, ?6)",
-                params![id, connection_id, direction, remote_path, local_path, now],
+                    id, connection_id, direction, remote_path, local_path,
+                    local_directory_identity, status, bytes_transferred, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', 0, ?7, ?7)",
+                params![id, connection_id, direction, remote_path, local_path, local_directory_identity, now],
             )
             .map_err(|error| error.to_string())?;
             query_file_transfer_record(conn, &id)
@@ -722,6 +730,7 @@ impl Storage {
         bytes_transferred: i64,
         total_bytes: Option<i64>,
         temp_path: Option<String>,
+        temp_identity: Option<String>,
         error: Option<String>,
         terminal: bool,
     ) -> Result<FileTransferStorageRecord, String> {
@@ -733,10 +742,22 @@ impl Storage {
                 .execute(
                     "UPDATE file_transfers
                      SET status = ?2, bytes_transferred = ?3, total_bytes = ?4,
-                         temp_path = ?5, error = ?6, updated_at = ?7, completed_at = ?8
+                         temp_path = ?5, temp_identity = ?6, error = ?7,
+                         updated_at = ?8, completed_at = ?9
                      WHERE id = ?1
-                       AND (?9 = 1 OR status IN ('queued', 'running'))",
-                    params![id, status, bytes_transferred, total_bytes, temp_path, error, now, completed_at, terminal],
+                       AND (?10 = 1 OR status IN ('queued', 'running'))",
+                    params![
+                        id,
+                        status,
+                        bytes_transferred,
+                        total_bytes,
+                        temp_path,
+                        temp_identity,
+                        error,
+                        now,
+                        completed_at,
+                        terminal
+                    ],
                 )
                 .map_err(|error| error.to_string())?;
             if changed == 0 {
@@ -803,7 +824,9 @@ impl Storage {
             let tx = conn.transaction().map_err(|error| error.to_string())?;
             let interrupted = {
                 let sql = format!(
-                    "{FILE_TRANSFER_SELECT} WHERE status IN ('queued', 'running', 'cancelling') ORDER BY created_at"
+                    "{FILE_TRANSFER_SELECT}
+                     WHERE status IN ('queued', 'running', 'cancelling', 'publishing')
+                     ORDER BY created_at"
                 );
                 let mut statement = tx.prepare(&sql).map_err(|error| error.to_string())?;
                 let rows = statement.query_map([], map_file_transfer_row).map_err(|error| error.to_string())?;
@@ -828,7 +851,8 @@ impl Storage {
 }
 
 const FILE_TRANSFER_SELECT: &str = "SELECT
-    id, connection_id, direction, remote_path, local_path, temp_path, status,
+    id, connection_id, direction, remote_path, local_path, local_directory_identity,
+    temp_path, temp_identity, status,
     bytes_transferred, total_bytes, error, created_at, updated_at, completed_at
     FROM file_transfers";
 
@@ -839,14 +863,16 @@ fn map_file_transfer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTransf
         direction: row.get(2)?,
         remote_path: row.get(3)?,
         local_path: row.get(4)?,
-        temp_path: row.get(5)?,
-        status: row.get(6)?,
-        bytes_transferred: row.get(7)?,
-        total_bytes: row.get(8)?,
-        error: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-        completed_at: row.get(12)?,
+        local_directory_identity: row.get(5)?,
+        temp_path: row.get(6)?,
+        temp_identity: row.get(7)?,
+        status: row.get(8)?,
+        bytes_transferred: row.get(9)?,
+        total_bytes: row.get(10)?,
+        error: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
+        completed_at: row.get(14)?,
     })
 }
 
@@ -964,6 +990,23 @@ fn ensure_history_columns_sync(conn: &Connection) -> Result<(), String> {
             continue;
         }
         conn.execute(&format!("ALTER TABLE history ADD COLUMN {name} {definition}"), []).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn ensure_file_transfer_columns_sync(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info('file_transfers')").map_err(|e| e.to_string())?;
+    let existing = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    drop(stmt);
+    for (name, definition) in [("local_directory_identity", "TEXT NOT NULL DEFAULT ''"), ("temp_identity", "TEXT")] {
+        if !existing.contains(name) {
+            conn.execute(&format!("ALTER TABLE file_transfers ADD COLUMN {name} {definition}"), [])
+                .map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -5842,6 +5885,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_transfer_schema_migrates_durable_identity_columns() {
+        let db = temp_db_path("file-transfer-identity-migration");
+        let legacy = Connection::open(&db).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE file_transfers (
+                    id TEXT PRIMARY KEY,
+                    connection_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    remote_path TEXT NOT NULL,
+                    local_path TEXT NOT NULL,
+                    temp_path TEXT,
+                    status TEXT NOT NULL,
+                    bytes_transferred INTEGER NOT NULL DEFAULT 0,
+                    total_bytes INTEGER,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let storage = Storage::open(&db).await.unwrap();
+        let created = storage
+            .create_file_transfer(
+                "migrated-transfer".into(),
+                "ftp-1".into(),
+                "download".into(),
+                "remote/file.bin".into(),
+                "/tmp/file.bin".into(),
+                "directory-identity".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.local_directory_identity, "directory-identity");
+        assert_eq!(created.temp_identity, None);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
     async fn file_transfer_terminal_state_is_queryable_and_cannot_be_regressed_by_late_progress() {
         let db = temp_db_path("file-transfer-terminal");
         let storage = Storage::open(&db).await.unwrap();
@@ -5852,6 +5937,7 @@ mod tests {
                 "download".into(),
                 "remote/file.bin".into(),
                 "/tmp/file.bin".into(),
+                "dir-identity".into(),
             )
             .await
             .unwrap();
@@ -5867,6 +5953,7 @@ mod tests {
                 Some(8),
                 Some("/tmp/.dbx-download-transfer-1-random.part".into()),
                 None,
+                None,
                 false,
             )
             .await
@@ -5875,8 +5962,10 @@ mod tests {
 
         let cancelling = storage.request_file_transfer_cancel("transfer-1").await.unwrap();
         assert_eq!(cancelling.status, "cancelling");
-        let late_progress =
-            storage.update_file_transfer("transfer-1", "running".into(), 8, Some(8), None, None, false).await.unwrap();
+        let late_progress = storage
+            .update_file_transfer("transfer-1", "running".into(), 8, Some(8), None, None, None, false)
+            .await
+            .unwrap();
         assert_eq!(late_progress.status, "cancelling");
 
         let terminal = storage
@@ -5885,6 +5974,7 @@ mod tests {
                 "cancelled".into(),
                 4,
                 Some(8),
+                None,
                 None,
                 Some("Download cancelled".into()),
                 true,
@@ -5909,6 +5999,7 @@ mod tests {
                 "download".into(),
                 "remote/file.bin".into(),
                 "/tmp/file.bin".into(),
+                "dir-identity".into(),
             )
             .await
             .unwrap();
@@ -5919,6 +6010,7 @@ mod tests {
                 10,
                 Some(20),
                 Some("/tmp/.dbx-download-transfer-1-random.part".into()),
+                None,
                 None,
                 false,
             )

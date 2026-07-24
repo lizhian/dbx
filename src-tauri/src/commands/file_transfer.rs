@@ -1,10 +1,14 @@
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use cap_fs_ext::{ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, OpenOptions};
 use dbx_core::connection::AppState;
 use dbx_core::storage::FileTransferStorageRecord;
 use futures::io::AsyncRead as FuturesAsyncRead;
@@ -12,7 +16,6 @@ use futures::io::AsyncReadExt as FuturesAsyncReadExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State, WebviewWindow};
 use tauri_plugin_fs::FsExt;
-use tempfile::{Builder as TempFileBuilder, TempPath};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -28,6 +31,17 @@ const GLOBAL_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const IO_PROGRESS_WATCHDOG: Duration = Duration::from_secs(30);
 const DOWNLOAD_OPERATION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const TRANSFER_EVENT: &str = "file-transfer-progress";
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestRemoteReaderBarrier {
+    opened: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static TEST_REMOTE_READER_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
 
 pub struct FileTransferRuntime {
     global_limit: Arc<Semaphore>,
@@ -50,7 +64,7 @@ pub struct StartDownloadInput {
     pub local_path: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartTransferResult {
     pub transfer_id: String,
@@ -66,6 +80,18 @@ struct TransferFailure {
 struct DownloadOutcome {
     bytes_transferred: i64,
     total_bytes: Option<i64>,
+}
+
+#[derive(Debug)]
+struct ValidatedLocalDestination {
+    path: PathBuf,
+    directory_identity: String,
+}
+
+struct AnchoredDestination {
+    directory: Arc<Dir>,
+    target_name: OsString,
+    temp_name: OsString,
 }
 
 struct TransferProgressSnapshot {
@@ -167,7 +193,7 @@ impl FileTransferRuntime {
             .get_or_try_init(|| async {
                 let interrupted = state.storage.recover_interrupted_file_transfers().await?;
                 for transfer in interrupted {
-                    recover_owned_temp_file(state, &transfer).await?;
+                    recover_interrupted_transfer(state, &transfer).await?;
                 }
                 Ok(())
             })
@@ -198,13 +224,23 @@ pub async fn start_download(
     runtime: State<'_, FileTransferRuntime>,
     input: StartDownloadInput,
 ) -> Result<StartTransferResult, String> {
+    start_download_inner(app, window, state.inner(), runtime.inner(), input).await
+}
+
+async fn start_download_inner<R: Runtime>(
+    app: AppHandle<R>,
+    window: WebviewWindow<R>,
+    state: &Arc<AppState>,
+    runtime: &FileTransferRuntime,
+    input: StartDownloadInput,
+) -> Result<StartTransferResult, String> {
     runtime.ensure_recovered(&state).await?;
     let remote_path = validate_remote_relative_path(&input.remote_path)?;
-    let local_path = validate_local_destination(Path::new(&input.local_path)).await?;
+    let local = validate_local_destination(Path::new(&input.local_path)).await?;
     let fs_scope = window
         .try_fs_scope()
         .ok_or_else(|| "File-system authorization is unavailable; choose the destination again".to_string())?;
-    validate_local_authorization(&fs_scope, &local_path)?;
+    validate_local_authorization(&fs_scope, &local.path)?;
     if state.storage.load_file_connection(&input.connection_id).await?.is_none() {
         return Err("File connection not found".to_string());
     }
@@ -217,7 +253,8 @@ pub async fn start_download(
             input.connection_id.clone(),
             "download".to_string(),
             remote_path,
-            local_path.to_string_lossy().into_owned(),
+            local.path.to_string_lossy().into_owned(),
+            local.directory_identity,
         )
         .await?;
     let cancellation = CancellationToken::new();
@@ -238,8 +275,16 @@ pub async fn get_file_transfer(
     runtime: State<'_, FileTransferRuntime>,
     transfer_id: String,
 ) -> Result<FileTransferStorageRecord, String> {
-    runtime.ensure_recovered(&state).await?;
-    state.storage.get_file_transfer(&transfer_id).await?.ok_or_else(|| "File transfer not found".to_string())
+    get_file_transfer_inner(state.inner(), runtime.inner(), &transfer_id).await
+}
+
+async fn get_file_transfer_inner(
+    state: &Arc<AppState>,
+    runtime: &FileTransferRuntime,
+    transfer_id: &str,
+) -> Result<FileTransferStorageRecord, String> {
+    runtime.ensure_recovered(state).await?;
+    state.storage.get_file_transfer(transfer_id).await?.ok_or_else(|| "File transfer not found".to_string())
 }
 
 #[tauri::command]
@@ -248,8 +293,16 @@ pub async fn list_file_transfers(
     runtime: State<'_, FileTransferRuntime>,
     connection_id: Option<String>,
 ) -> Result<Vec<FileTransferStorageRecord>, String> {
-    runtime.ensure_recovered(&state).await?;
-    state.storage.list_file_transfers(connection_id.as_deref(), 100).await
+    list_file_transfers_inner(state.inner(), runtime.inner(), connection_id.as_deref()).await
+}
+
+async fn list_file_transfers_inner(
+    state: &Arc<AppState>,
+    runtime: &FileTransferRuntime,
+    connection_id: Option<&str>,
+) -> Result<Vec<FileTransferStorageRecord>, String> {
+    runtime.ensure_recovered(state).await?;
+    state.storage.list_file_transfers(connection_id, 100).await
 }
 
 #[tauri::command]
@@ -259,11 +312,20 @@ pub async fn cancel_file_transfer(
     runtime: State<'_, FileTransferRuntime>,
     transfer_id: String,
 ) -> Result<FileTransferStorageRecord, String> {
-    runtime.ensure_recovered(&state).await?;
-    let record = state.storage.request_file_transfer_cancel(&transfer_id).await?;
+    cancel_file_transfer_inner(&app, state.inner(), runtime.inner(), &transfer_id).await
+}
+
+async fn cancel_file_transfer_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &Arc<AppState>,
+    runtime: &FileTransferRuntime,
+    transfer_id: &str,
+) -> Result<FileTransferStorageRecord, String> {
+    runtime.ensure_recovered(state).await?;
+    let record = state.storage.request_file_transfer_cancel(transfer_id).await?;
     if record.status == "cancelling" {
-        emit_transfer(&app, &record);
-        if let Some(cancellation) = runtime.cancellation(&transfer_id) {
+        emit_transfer(app, &record);
+        if let Some(cancellation) = runtime.cancellation(transfer_id) {
             cancellation.cancel();
         }
     }
@@ -346,24 +408,66 @@ async fn run_download_worker<R: Runtime>(
     .await;
 
     let latest = state.storage.get_file_transfer(&transfer_id).await.ok().flatten();
+    if result.is_err() && latest.as_ref().is_some_and(|record| record.status == "publishing") {
+        if let Some(record) = latest.as_ref() {
+            if let Err(error) = recover_interrupted_transfer(&state, record).await {
+                log::error!("Failed to reconcile publishing file transfer: {error}");
+            }
+        }
+        if let Ok(Some(record)) = state.storage.get_file_transfer(&transfer_id).await {
+            emit_transfer(&app, &record);
+        }
+        runtime.unregister(&transfer_id);
+        return;
+    }
+    let cleanup_error = if result.is_err() {
+        match latest.as_ref() {
+            Some(record) => cleanup_active_temp(record).await.err(),
+            None => None,
+        }
+    } else {
+        None
+    };
     let (status, bytes_transferred, total_bytes, error) = match result {
         Ok(outcome) => ("completed", outcome.bytes_transferred, outcome.total_bytes, None),
         Err(failure) => (
             failure.status,
             progress.bytes().max(latest.as_ref().map_or(0, |record| record.bytes_transferred)),
             progress.total().or_else(|| latest.as_ref().and_then(|record| record.total_bytes)),
-            Some(sanitize_error(&failure.message)),
+            Some(sanitize_error(&match cleanup_error {
+                Some(cleanup) => format!("{}; temporary-file cleanup failed safely: {cleanup}", failure.message),
+                None => failure.message,
+            })),
         ),
     };
     match state
         .storage
-        .update_file_transfer(&transfer_id, status.to_string(), bytes_transferred, total_bytes, None, error, true)
+        .update_file_transfer(&transfer_id, status.to_string(), bytes_transferred, total_bytes, None, None, error, true)
         .await
     {
         Ok(record) => emit_transfer(&app, &record),
         Err(error) => log::error!("Failed to persist terminal file transfer state: {error}"),
     }
     runtime.unregister(&transfer_id);
+}
+
+async fn cleanup_active_temp(record: &FileTransferStorageRecord) -> Result<(), String> {
+    let Some(temp_path) = record.temp_path.as_deref() else {
+        return Ok(());
+    };
+    if !is_owned_temp_path(record, Path::new(temp_path)) {
+        return Err("temporary-file identity is invalid".to_string());
+    }
+    let local_path = PathBuf::from(&record.local_path);
+    let temp_path = PathBuf::from(temp_path);
+    let directory_identity = record.local_directory_identity.clone();
+    let expected_temp_identity = record.temp_identity.clone();
+    tokio::task::spawn_blocking(move || {
+        let anchored = AnchoredDestination::reopen(&local_path, &temp_path, &directory_identity)?;
+        anchored.remove_owned_temp(expected_temp_identity.as_deref()).map(|_| ()).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 async fn transfer_record_for_worker(
@@ -417,7 +521,6 @@ async fn execute_download<R: Runtime>(
         .map_err(local_failure)?
         .ok_or_else(|| local_failure("File transfer not found"))?;
     let local_path = PathBuf::from(&record.local_path);
-    validate_local_destination(&local_path).await.map_err(local_failure)?;
 
     let metadata =
         watched_remote(prepared.operator.stat(&prepared.remote_path), "Remote file metadata timed out").await?;
@@ -427,17 +530,40 @@ async fn execute_download<R: Runtime>(
     let total_bytes = i64::try_from(metadata.content_length()).ok();
     progress_snapshot.record_total(total_bytes);
 
-    let parent =
-        local_path.parent().ok_or_else(|| local_failure("Local destination parent is required"))?.to_path_buf();
-    let temp_prefix = format!(".dbx-download-{transfer_id}-");
-    let (std_file, temp_path) = tokio::task::spawn_blocking(move || {
-        TempFileBuilder::new().prefix(&temp_prefix).suffix(".part").tempfile_in(parent).map(|file| file.into_parts())
+    let parent = local_path.parent().ok_or_else(|| local_failure("Local destination parent is required"))?;
+    let temp_name = format!(".dbx-download-{transfer_id}-{}.part", Uuid::new_v4());
+    let temp_path = parent.join(&temp_name);
+    let persisted_temp_path = temp_path.to_string_lossy().into_owned();
+    let preparing = state
+        .storage
+        .update_file_transfer(
+            transfer_id,
+            "running".to_string(),
+            0,
+            total_bytes,
+            Some(persisted_temp_path.clone()),
+            None,
+            None,
+            false,
+        )
+        .await
+        .map_err(local_failure)?;
+    emit_transfer(app, &preparing);
+
+    let expected_directory_identity = record.local_directory_identity.clone();
+    let anchored = tokio::task::spawn_blocking(move || {
+        AnchoredDestination::open(&local_path, &temp_path, &expected_directory_identity)
     })
     .await
     .map_err(|error| local_failure(error.to_string()))?
-    .map_err(|error| local_failure(format!("Failed to create download temporary file: {error}")))?;
-    let persisted_temp_path = temp_path.to_string_lossy().into_owned();
+    .map_err(local_failure)?;
+    let anchored = Arc::new(anchored);
 
+    let create_target = anchored.clone();
+    let (std_file, temp_identity) = tokio::task::spawn_blocking(move || create_target.create_temp())
+        .await
+        .map_err(|error| local_failure(error.to_string()))?
+        .map_err(|error| local_failure(format!("Failed to create download temporary file: {error}")))?;
     let running = state
         .storage
         .update_file_transfer(
@@ -446,6 +572,7 @@ async fn execute_download<R: Runtime>(
             0,
             total_bytes,
             Some(persisted_temp_path.clone()),
+            Some(temp_identity.clone()),
             None,
             false,
         )
@@ -458,17 +585,24 @@ async fn execute_download<R: Runtime>(
     let reader = watched_remote(async { reader_future.await }, "Opening the remote file timed out").await?;
     let mut reader =
         watched_remote(reader.into_futures_async_read(..), "Preparing the remote stream timed out").await?;
+    wait_at_test_remote_reader_barrier().await;
     let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_SIZE];
     let mut bytes_transferred = 0_i64;
     let mut last_progress = Instant::now();
 
     loop {
-        let count = transfer_one_chunk(&mut reader, &mut output, &mut buffer, IO_PROGRESS_WATCHDOG).await?;
+        let count = transfer_one_chunk(
+            &mut reader,
+            &mut output,
+            &mut buffer,
+            IO_PROGRESS_WATCHDOG,
+            &mut bytes_transferred,
+            &progress_snapshot,
+        )
+        .await?;
         if count == 0 {
             break;
         }
-        bytes_transferred = bytes_transferred.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
-        progress_snapshot.record_bytes(bytes_transferred);
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
             let progress = state
@@ -479,6 +613,7 @@ async fn execute_download<R: Runtime>(
                     bytes_transferred,
                     total_bytes,
                     Some(persisted_temp_path.clone()),
+                    Some(temp_identity.clone()),
                     None,
                     false,
                 )
@@ -501,19 +636,67 @@ async fn execute_download<R: Runtime>(
         .map_err(|error| local_failure(format!("Failed to synchronize the download: {error}")))?;
     drop(output);
 
-    // After this point cancellation must not report "cancelled": the
-    // no-clobber atomic publish may already have installed the destination.
+    let publishing = state
+        .storage
+        .update_file_transfer(
+            transfer_id,
+            "publishing".to_string(),
+            bytes_transferred,
+            total_bytes,
+            Some(persisted_temp_path),
+            Some(temp_identity.clone()),
+            None,
+            false,
+        )
+        .await
+        .map_err(local_failure)?;
+    emit_transfer(app, &publishing);
+
+    // Once publishing is durable, cancellation waits for reconciliation:
+    // the no-clobber link may already have installed the destination.
     commit_started.store(true, Ordering::Release);
-    publish_temp_file(temp_path, local_path.clone()).await?;
-    sync_parent_directory(local_path.parent().unwrap_or(Path::new("/"))).await?;
+    let publish_target = anchored.clone();
+    tokio::task::spawn_blocking(move || publish_target.publish(&temp_identity))
+        .await
+        .map_err(|error| local_failure(error.to_string()))?
+        .map_err(local_failure)?;
     Ok(DownloadOutcome { bytes_transferred, total_bytes })
 }
+
+#[cfg(test)]
+fn install_test_remote_reader_barrier() -> TestRemoteReaderBarrier {
+    let barrier = TestRemoteReaderBarrier {
+        opened: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    *TEST_REMOTE_READER_BARRIER.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner()) =
+        Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+async fn wait_at_test_remote_reader_barrier() {
+    let barrier = TEST_REMOTE_READER_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(barrier) = barrier {
+        barrier.opened.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(not(test))]
+async fn wait_at_test_remote_reader_barrier() {}
 
 async fn transfer_one_chunk<R, W>(
     reader: &mut R,
     output: &mut W,
     buffer: &mut [u8],
     watchdog: Duration,
+    bytes_transferred: &mut i64,
+    progress_snapshot: &TransferProgressSnapshot,
 ) -> Result<usize, TransferFailure>
 where
     R: FuturesAsyncRead + Unpin,
@@ -526,36 +709,187 @@ where
     if count == 0 {
         return Ok(0);
     }
-    tokio::time::timeout(watchdog, output.write_all(&buffer[..count]))
-        .await
-        .map_err(|_| local_failure("Local write made no progress before the I/O watchdog expired"))?
-        .map_err(|error| local_failure(format!("Failed to write the download: {error}")))?;
+    let mut offset = 0;
+    while offset < count {
+        let written = tokio::time::timeout(watchdog, output.write(&buffer[offset..count]))
+            .await
+            .map_err(|_| local_failure("Local write made no progress before the I/O watchdog expired"))?
+            .map_err(|error| local_failure(format!("Failed to write the download: {error}")))?;
+        if written == 0 {
+            return Err(local_failure("Failed to write the download: write returned zero bytes"));
+        }
+        offset += written;
+        *bytes_transferred = (*bytes_transferred).saturating_add(i64::try_from(written).unwrap_or(i64::MAX));
+        progress_snapshot.record_bytes(*bytes_transferred);
+    }
     Ok(count)
 }
 
-async fn publish_temp_file(temp_path: TempPath, local_path: PathBuf) -> Result<(), TransferFailure> {
-    tokio::task::spawn_blocking(move || temp_path.persist_noclobber(local_path))
-        .await
-        .map_err(|error| local_failure(error.to_string()))?
-        .map_err(|error| {
-            local_failure(format!(
-                "Failed to atomically publish the download without replacing the destination: {error}"
-            ))
-        })
+impl AnchoredDestination {
+    fn open(local_path: &Path, temp_path: &Path, expected_directory_identity: &str) -> Result<Self, String> {
+        Self::open_internal(local_path, temp_path, expected_directory_identity, true)
+    }
+
+    fn reopen(local_path: &Path, temp_path: &Path, expected_directory_identity: &str) -> Result<Self, String> {
+        Self::open_internal(local_path, temp_path, expected_directory_identity, false)
+    }
+
+    fn open_internal(
+        local_path: &Path,
+        temp_path: &Path,
+        expected_directory_identity: &str,
+        require_target_absent: bool,
+    ) -> Result<Self, String> {
+        let parent = local_path.parent().ok_or_else(|| "Local destination parent is required".to_string())?;
+        if temp_path.parent() != Some(parent) {
+            return Err("Download temporary file is not a sibling of the destination".to_string());
+        }
+        let target_name = single_file_name(local_path, "Local destination")?;
+        let temp_name = single_file_name(temp_path, "Download temporary file")?;
+        let directory = open_absolute_directory_nofollow(parent)
+            .map_err(|error| format!("Failed to open the destination directory safely: {error}"))?;
+        let actual_identity = directory_identity(&directory)
+            .map_err(|error| format!("Failed to identify destination directory: {error}"))?;
+        if actual_identity != expected_directory_identity {
+            return Err("Local destination directory changed after it was authorized".to_string());
+        }
+        if require_target_absent {
+            match directory.symlink_metadata(&target_name) {
+                Ok(_) => return Err("Local download destination already exists".to_string()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("Failed to inspect local download destination: {error}")),
+            }
+        }
+        Ok(Self { directory: Arc::new(directory), target_name, temp_name })
+    }
+
+    fn create_temp(&self) -> io::Result<(std::fs::File, String)> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true).follow(FollowSymlinks::No);
+        let file = self.directory.open_with(&self.temp_name, &options)?.into_std();
+        let identity = metadata_identity(&file.metadata()?)?;
+        Ok((file, identity))
+    }
+
+    fn entry_identity(&self, name: &OsStr) -> io::Result<Option<String>> {
+        match self.directory.symlink_metadata(name) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Err(io::Error::other("operation-owned path was replaced by a symbolic link"))
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                Err(io::Error::other("operation-owned path was replaced by a non-file entry"))
+            }
+            Ok(_) => {
+                let mut options = OpenOptions::new();
+                options.read(true).follow(FollowSymlinks::No);
+                let file = self.directory.open_with(name, &options)?.into_std();
+                Ok(Some(metadata_identity(&file.metadata()?)?))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn remove_owned_temp(&self, expected_identity: Option<&str>) -> io::Result<bool> {
+        let Some(actual_identity) = self.entry_identity(&self.temp_name)? else {
+            return Ok(false);
+        };
+        if expected_identity.is_some_and(|expected| expected != actual_identity) {
+            return Err(io::Error::other("operation-owned temporary file identity changed"));
+        }
+        self.directory.remove_file(&self.temp_name)?;
+        self.sync_directory()?;
+        Ok(true)
+    }
+
+    fn link_temp(&self, expected_identity: &str) -> io::Result<()> {
+        let actual_identity = self
+            .entry_identity(&self.temp_name)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "download temporary file is missing"))?;
+        if actual_identity != expected_identity {
+            return Err(io::Error::other("download temporary file identity changed"));
+        }
+        self.directory.hard_link(&self.temp_name, &self.directory, &self.target_name)?;
+        let target_identity = self
+            .entry_identity(&self.target_name)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "published destination is missing"))?;
+        if target_identity != expected_identity {
+            return Err(io::Error::other("published destination identity does not match the download"));
+        }
+        self.sync_directory()
+    }
+
+    fn publish(&self, expected_identity: &str) -> Result<(), String> {
+        self.link_temp(expected_identity).map_err(|error| {
+            format!("Failed to atomically publish the download without replacing the destination: {error}")
+        })?;
+        self.remove_owned_temp(Some(expected_identity))
+            .map_err(|error| format!("Download was published but temporary-file cleanup failed: {error}"))?;
+        Ok(())
+    }
+
+    fn sync_directory(&self) -> io::Result<()> {
+        self.directory.try_clone()?.into_std_file().sync_all()
+    }
+}
+
+fn single_file_name(path: &Path, label: &str) -> Result<OsString, String> {
+    let name = path.file_name().ok_or_else(|| format!("{label} must name a file"))?;
+    if matches!(name.to_str(), Some("" | "." | "..")) {
+        return Err(format!("{label} has an invalid file name"));
+    }
+    Ok(name.to_os_string())
+}
+
+fn open_absolute_directory_nofollow(path: &Path) -> io::Result<Dir> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "directory path must be absolute"));
+    }
+    let mut root = PathBuf::new();
+    let mut segments = Vec::<OsString>::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+            Component::RootDir => root.push(component.as_os_str()),
+            Component::Normal(segment) => segments.push(segment.to_os_string()),
+            Component::CurDir | Component::ParentDir => {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe directory path component"));
+            }
+        }
+    }
+    if root.as_os_str().is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "directory root is missing"));
+    }
+    let mut directory = Dir::open_ambient_dir(root, ambient_authority())?;
+    for segment in segments {
+        directory = directory.open_dir_nofollow(segment)?;
+    }
+    Ok(directory)
+}
+
+fn directory_identity(directory: &Dir) -> io::Result<String> {
+    let file = directory.try_clone()?.into_std_file();
+    metadata_identity(&file.metadata()?)
 }
 
 #[cfg(unix)]
-async fn sync_parent_directory(parent: &Path) -> Result<(), TransferFailure> {
-    let parent = parent.to_path_buf();
-    tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
-        .await
-        .map_err(|error| local_failure(error.to_string()))?
-        .map_err(|error| local_failure(format!("Failed to synchronize the destination directory: {error}")))
+fn metadata_identity(metadata: &std::fs::Metadata) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
 }
 
-#[cfg(not(unix))]
-async fn sync_parent_directory(_parent: &Path) -> Result<(), TransferFailure> {
-    Ok(())
+#[cfg(windows)]
+fn metadata_identity(metadata: &std::fs::Metadata) -> io::Result<String> {
+    use std::os::windows::fs::MetadataExt;
+    let volume =
+        metadata.volume_serial_number().ok_or_else(|| io::Error::other("volume serial number is unavailable"))?;
+    let index = metadata.file_index().ok_or_else(|| io::Error::other("file index is unavailable"))?;
+    Ok(format!("windows:{volume}:{index}"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_identity(_metadata: &std::fs::Metadata) -> io::Result<String> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "stable file identity is unavailable on this platform"))
 }
 
 async fn watched_remote<T>(
@@ -568,7 +902,14 @@ async fn watched_remote<T>(
         .map_err(|error| remote_failure(error.to_string()))
 }
 
-async fn validate_local_destination(path: &Path) -> Result<PathBuf, String> {
+async fn validate_local_destination(path: &Path) -> Result<ValidatedLocalDestination, String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || validate_local_destination_sync(&path))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn validate_local_destination_sync(path: &Path) -> Result<ValidatedLocalDestination, String> {
     if !path.is_absolute() {
         return Err("Local download destination must be an absolute path".to_string());
     }
@@ -582,19 +923,17 @@ async fn validate_local_destination(path: &Path) -> Result<PathBuf, String> {
         return Err("Local download destination must name a file".to_string());
     }
     let parent = path.parent().ok_or_else(|| "Local download destination parent is required".to_string())?;
-    let parent_metadata = tokio::fs::metadata(parent)
-        .await
-        .map_err(|error| format!("Local download destination parent is unavailable: {error}"))?;
-    if !parent_metadata.is_dir() {
-        return Err("Local download destination parent is not a directory".to_string());
-    }
-    reject_symlink_ancestors(parent).await?;
-    match tokio::fs::symlink_metadata(path).await {
+    let directory = open_absolute_directory_nofollow(parent)
+        .map_err(|error| format!("Local download destination parent is unavailable or unsafe: {error}"))?;
+    let target_name = single_file_name(path, "Local download destination")?;
+    match directory.symlink_metadata(target_name) {
         Ok(_) => return Err("Local download destination already exists".to_string()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("Failed to inspect local download destination: {error}")),
     }
-    Ok(path.to_path_buf())
+    let directory_identity =
+        directory_identity(&directory).map_err(|error| format!("Failed to identify local destination: {error}"))?;
+    Ok(ValidatedLocalDestination { path: path.to_path_buf(), directory_identity })
 }
 
 fn validate_local_authorization(scope: &tauri::fs::Scope, path: &Path) -> Result<(), String> {
@@ -605,20 +944,23 @@ fn validate_local_authorization(scope: &tauri::fs::Scope, path: &Path) -> Result
     }
 }
 
-async fn reject_symlink_ancestors(path: &Path) -> Result<(), String> {
-    for ancestor in path.ancestors() {
-        let metadata = tokio::fs::symlink_metadata(ancestor)
-            .await
-            .map_err(|error| format!("Failed to inspect local path: {error}"))?;
-        if metadata.file_type().is_symlink() {
-            return Err("Local download destination cannot traverse a symbolic link".to_string());
-        }
-    }
-    Ok(())
-}
-
-async fn recover_owned_temp_file(state: &AppState, transfer: &FileTransferStorageRecord) -> Result<(), String> {
+async fn recover_interrupted_transfer(state: &AppState, transfer: &FileTransferStorageRecord) -> Result<(), String> {
     let Some(temp_path) = transfer.temp_path.as_deref() else {
+        if transfer.status == "publishing" {
+            state
+                .storage
+                .update_file_transfer(
+                    &transfer.id,
+                    "failed".to_string(),
+                    transfer.bytes_transferred,
+                    transfer.total_bytes,
+                    None,
+                    None,
+                    Some("Publishing transfer has no durable temporary-file identity".to_string()),
+                    true,
+                )
+                .await?;
+        }
         return Ok(());
     };
     if !is_owned_temp_path(transfer, Path::new(temp_path)) {
@@ -630,15 +972,81 @@ async fn recover_owned_temp_file(state: &AppState, transfer: &FileTransferStorag
                 transfer.bytes_transferred,
                 transfer.total_bytes,
                 Some(temp_path.to_string()),
+                transfer.temp_identity.clone(),
                 Some("Interrupted transfer has an invalid temporary-file path; no file was removed".to_string()),
                 true,
             )
             .await?;
         return Ok(());
     }
-    match tokio::fs::remove_file(temp_path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+    let local_path = PathBuf::from(&transfer.local_path);
+    let temp_path = PathBuf::from(temp_path);
+    let persisted_temp_path = temp_path.to_string_lossy().into_owned();
+    let directory_identity = transfer.local_directory_identity.clone();
+    let expected_temp_identity = transfer.temp_identity.clone();
+    let publishing = transfer.status == "publishing";
+    let reconciliation = tokio::task::spawn_blocking(move || {
+        let anchored = AnchoredDestination::reopen(&local_path, &temp_path, &directory_identity)?;
+        if publishing {
+            let expected = expected_temp_identity
+                .as_deref()
+                .ok_or_else(|| "Publishing transfer has no durable file identity".to_string())?;
+            let target_identity = anchored.entry_identity(&anchored.target_name).map_err(|error| error.to_string())?;
+            let temp_identity = anchored.entry_identity(&anchored.temp_name).map_err(|error| error.to_string())?;
+            if target_identity.as_deref() == Some(expected) {
+                if temp_identity.as_deref() == Some(expected) {
+                    anchored.remove_owned_temp(Some(expected)).map_err(|error| error.to_string())?;
+                }
+                Ok(true)
+            } else {
+                if temp_identity.as_deref() == Some(expected) {
+                    anchored.remove_owned_temp(Some(expected)).map_err(|error| error.to_string())?;
+                }
+                Ok(false)
+            }
+        } else {
+            anchored
+                .remove_owned_temp(expected_temp_identity.as_deref())
+                .map(|_| false)
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+
+    match reconciliation {
+        Ok(true) => {
+            state
+                .storage
+                .update_file_transfer(
+                    &transfer.id,
+                    "completed".to_string(),
+                    transfer.bytes_transferred,
+                    transfer.total_bytes,
+                    None,
+                    None,
+                    None,
+                    true,
+                )
+                .await?;
+        }
+        Ok(false) if publishing => {
+            state
+                .storage
+                .update_file_transfer(
+                    &transfer.id,
+                    "failed".to_string(),
+                    transfer.bytes_transferred,
+                    transfer.total_bytes,
+                    None,
+                    None,
+                    Some("The application exited before publishing the download".to_string()),
+                    true,
+                )
+                .await?;
+        }
+        Ok(false) => {}
         Err(error) => {
             state
                 .storage
@@ -647,14 +1055,15 @@ async fn recover_owned_temp_file(state: &AppState, transfer: &FileTransferStorag
                     "failed".to_string(),
                     transfer.bytes_transferred,
                     transfer.total_bytes,
-                    Some(temp_path.to_string()),
-                    Some(format!("Interrupted transfer temporary-file cleanup failed: {error}")),
+                    Some(persisted_temp_path),
+                    transfer.temp_identity.clone(),
+                    Some(format!("Interrupted transfer reconciliation failed safely: {error}")),
                     true,
                 )
                 .await?;
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn is_owned_temp_path(transfer: &FileTransferStorageRecord, temp_path: &Path) -> bool {
@@ -762,12 +1171,67 @@ mod tests {
         }
     }
 
+    struct PartialThenDiskFull {
+        first_write: usize,
+        wrote: bool,
+    }
+
+    impl AsyncWrite for PartialThenDiskFull {
+        fn poll_write(mut self: Pin<&mut Self>, _context: &mut Context<'_>, buffer: &[u8]) -> Poll<io::Result<usize>> {
+            if self.wrote {
+                Poll::Ready(Err(io::Error::from_raw_os_error(28)))
+            } else {
+                self.wrote = true;
+                Poll::Ready(Ok(self.first_write.min(buffer.len())))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PartialThenStall {
+        first_write: usize,
+        wrote: bool,
+    }
+
+    impl AsyncWrite for PartialThenStall {
+        fn poll_write(mut self: Pin<&mut Self>, _context: &mut Context<'_>, buffer: &[u8]) -> Poll<io::Result<usize>> {
+            if self.wrote {
+                Poll::Pending
+            } else {
+                self.wrote = true;
+                Poll::Ready(Ok(self.first_write.min(buffer.len())))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn canonical_directory_identity(path: &Path) -> String {
+        let directory = open_absolute_directory_nofollow(path).unwrap();
+        directory_identity(&directory).unwrap()
+    }
+
     #[tokio::test]
     async fn local_destination_must_be_absolute_new_and_not_symlinked() {
         assert!(validate_local_destination(Path::new("relative/file.bin")).await.is_err());
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().canonicalize().unwrap().join("download.bin");
-        assert_eq!(validate_local_destination(&target).await.unwrap(), target);
+        let validated = validate_local_destination(&target).await.unwrap();
+        assert_eq!(validated.path, target);
+        assert_eq!(validated.directory_identity, canonical_directory_identity(target.parent().unwrap()));
         let ambiguous = target.parent().unwrap().join("nested").join("..").join("escape.bin");
         assert!(validate_local_destination(&ambiguous).await.unwrap_err().contains("path segments"));
         tokio::fs::write(&target, b"existing").await.unwrap();
@@ -791,24 +1255,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_contract_authorizes_starts_cancels_and_queries_without_streaming_bytes_over_ipc() {
+        use super::super::file_manager::{FileConnectionConfig, FtpConnectionConfig};
+
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let config = FileConnectionConfig::Ftp(FtpConnectionConfig {
+            endpoint: "ftp://127.0.0.1:9".to_string(),
+            root: "/".to_string(),
+            username: "dbx".to_string(),
+        });
+        storage
+            .save_file_connection(
+                "ftp-command".into(),
+                "FTP command".into(),
+                "ftp".into(),
+                serde_json::to_string(&config).unwrap(),
+                Some("password".into()),
+                "ftp\n127.0.0.1\n9\ndbx".into(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+        let runtime = app.state::<FileTransferRuntime>();
+        let _global_barrier = runtime.global_limit.clone().acquire_many_owned(8).await.unwrap();
+        let target = parent.join("raw-path.bin");
+        let input = || StartDownloadInput {
+            connection_id: "ftp-command".to_string(),
+            remote_path: "a%2Fb".to_string(),
+            local_path: target.to_string_lossy().into_owned(),
+        };
+
+        let unauthorized =
+            start_download_inner(app.handle().clone(), window.clone(), &state, runtime.inner(), input()).await;
+        assert!(unauthorized.unwrap_err().contains("not authorized"));
+
+        window.fs_scope().allow_file(&target).unwrap();
+        let started =
+            start_download_inner(app.handle().clone(), window.clone(), &state, runtime.inner(), input()).await.unwrap();
+        let serialized = serde_json::to_value(&started).unwrap();
+        assert_eq!(serialized.as_object().unwrap().len(), 1);
+        assert_eq!(serialized["transferId"], started.transfer_id);
+        assert!(serialized.get("bytes").is_none());
+        assert!(serialized.get("bytesTransferred").is_none());
+
+        let persisted = get_file_transfer_inner(&state, runtime.inner(), &started.transfer_id).await.unwrap();
+        assert_eq!(persisted.remote_path, "a%2Fb");
+        assert_eq!(persisted.status, "queued");
+
+        let cancelling =
+            cancel_file_transfer_inner(app.handle(), &state, runtime.inner(), &started.transfer_id).await.unwrap();
+        assert_eq!(cancelling.status, "cancelling");
+        let terminal = wait_for_transfer_status(&state.storage, &started.transfer_id, &["cancelled"]).await;
+        assert_eq!(terminal.bytes_transferred, 0);
+        let queried = get_file_transfer_inner(&state, runtime.inner(), &started.transfer_id).await.unwrap();
+        assert_eq!(queried.status, "cancelled");
+        assert!(list_file_transfers_inner(&state, runtime.inner(), Some("ftp-command"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.id == started.transfer_id && record.status == "cancelled"));
+
+        let existing = parent.join("existing.bin");
+        std::fs::write(&existing, b"existing").unwrap();
+        window.fs_scope().allow_file(&existing).unwrap();
+        let existing_error = start_download_inner(
+            app.handle().clone(),
+            window,
+            &state,
+            runtime.inner(),
+            StartDownloadInput {
+                connection_id: "ftp-command".to_string(),
+                remote_path: "fixture.bin".to_string(),
+                local_path: existing.to_string_lossy().into_owned(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(existing_error.contains("already exists"));
+    }
+
+    #[tokio::test]
     async fn publish_is_no_clobber_and_removes_the_operation_temp() {
         let directory = tempfile::tempdir().unwrap();
-        let target = directory.path().join("download.bin");
-        let temp =
-            TempFileBuilder::new().prefix(".dbx-download-test-").suffix(".part").tempfile_in(directory.path()).unwrap();
-        std::fs::write(temp.path(), b"payload").unwrap();
-        let (_, temp_path) = temp.into_parts();
-        let original_temp = temp_path.to_path_buf();
-        publish_temp_file(temp_path, target.clone()).await.unwrap();
-        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"payload");
-        assert!(!original_temp.exists());
+        let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("download.bin");
+        let temp_path = parent.join(".dbx-download-test-first.part");
+        let identity = canonical_directory_identity(&parent);
+        let anchored = AnchoredDestination::open(&target, &temp_path, &identity).unwrap();
+        let (mut temp, temp_identity) = anchored.create_temp().unwrap();
+        use std::io::Write;
+        temp.write_all(b"payload").unwrap();
+        temp.sync_all().unwrap();
+        drop(temp);
+        anchored.publish(&temp_identity).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload");
+        assert!(!temp_path.exists());
 
-        let second =
-            TempFileBuilder::new().prefix(".dbx-download-test-").suffix(".part").tempfile_in(directory.path()).unwrap();
-        std::fs::write(second.path(), b"replacement").unwrap();
-        let (_, second_path) = second.into_parts();
-        assert!(publish_temp_file(second_path, target.clone()).await.is_err());
+        let second_path = parent.join(".dbx-download-test-second.part");
+        let second = AnchoredDestination::reopen(&target, &second_path, &identity).unwrap();
+        let (mut second_temp, second_identity) = second.create_temp().unwrap();
+        second_temp.write_all(b"replacement").unwrap();
+        second_temp.sync_all().unwrap();
+        drop(second_temp);
+        assert!(second.publish(&second_identity).is_err());
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"payload");
+        second.remove_owned_temp(Some(&second_identity)).unwrap();
     }
 
     #[test]
@@ -820,7 +1383,9 @@ mod tests {
             direction: "download".to_string(),
             remote_path: "report.csv".to_string(),
             local_path: target.to_string_lossy().into_owned(),
+            local_directory_identity: "identity".to_string(),
             temp_path: None,
+            temp_identity: None,
             status: "running".to_string(),
             bytes_transferred: 10,
             total_bytes: Some(20),
@@ -836,13 +1401,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_recovery_removes_only_the_owned_residual_file() {
+    async fn crash_before_temp_create_does_not_remove_an_unrelated_file() {
         let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
         let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
         let state = AppState::new(storage);
-        let target = directory.path().join("report.csv");
-        let owned = directory.path().join(".dbx-download-transfer-1-random.part");
-        tokio::fs::write(&owned, b"partial").await.unwrap();
+        let target = parent.join("report.csv");
+        let owned = parent.join(".dbx-download-transfer-1-random.part");
+        let unrelated = parent.join("unrelated.part");
+        tokio::fs::write(&unrelated, b"unrelated").await.unwrap();
         state
             .storage
             .create_file_transfer(
@@ -851,6 +1418,7 @@ mod tests {
                 "download".into(),
                 "report.csv".into(),
                 target.to_string_lossy().into_owned(),
+                canonical_directory_identity(&parent),
             )
             .await
             .unwrap();
@@ -863,6 +1431,7 @@ mod tests {
                 Some(20),
                 Some(owned.to_string_lossy().into_owned()),
                 None,
+                None,
                 false,
             )
             .await
@@ -870,16 +1439,170 @@ mod tests {
 
         let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
         assert_eq!(interrupted.len(), 1);
-        recover_owned_temp_file(&state, &interrupted[0]).await.unwrap();
+        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
         assert!(!owned.exists());
+        assert_eq!(tokio::fs::read(&unrelated).await.unwrap(), b"unrelated");
         let recovered = state.storage.get_file_transfer("transfer-1").await.unwrap().unwrap();
         assert_eq!(recovered.status, "failed");
         assert!(recovered.completed_at.is_some());
     }
 
     #[tokio::test]
+    async fn crash_after_temp_create_before_identity_persist_removes_only_random_owned_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let state = AppState::new(storage);
+        let target = parent.join("report.csv");
+        let owned = parent.join(".dbx-download-transfer-create-window-random.part");
+        tokio::fs::write(&owned, b"partial").await.unwrap();
+        state
+            .storage
+            .create_file_transfer(
+                "transfer-create-window".into(),
+                "connection-1".into(),
+                "download".into(),
+                "report.csv".into(),
+                target.to_string_lossy().into_owned(),
+                canonical_directory_identity(&parent),
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_transfer(
+                "transfer-create-window",
+                "running".into(),
+                0,
+                Some(20),
+                Some(owned.to_string_lossy().into_owned()),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+        assert!(!owned.exists());
+        assert_eq!(state.storage.get_file_transfer("transfer-create-window").await.unwrap().unwrap().status, "failed");
+    }
+
+    #[tokio::test]
+    async fn publishing_crash_after_link_is_reconciled_to_completed() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("report.csv");
+        let temp_path = parent.join(".dbx-download-transfer-publishing-random.part");
+        let identity = canonical_directory_identity(&parent);
+        let anchored = AnchoredDestination::open(&target, &temp_path, &identity).unwrap();
+        let (mut temp, temp_identity) = anchored.create_temp().unwrap();
+        use std::io::Write;
+        temp.write_all(b"complete payload").unwrap();
+        temp.sync_all().unwrap();
+        drop(temp);
+
+        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let state = AppState::new(storage);
+        state
+            .storage
+            .create_file_transfer(
+                "transfer-publishing".into(),
+                "connection-1".into(),
+                "download".into(),
+                "report.csv".into(),
+                target.to_string_lossy().into_owned(),
+                identity,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_transfer(
+                "transfer-publishing",
+                "publishing".into(),
+                16,
+                Some(16),
+                Some(temp_path.to_string_lossy().into_owned()),
+                Some(temp_identity.clone()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        anchored.link_temp(&temp_identity).unwrap();
+
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        assert_eq!(interrupted[0].status, "publishing");
+        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+        let recovered = state.storage.get_file_transfer("transfer-publishing").await.unwrap().unwrap();
+        assert_eq!(recovered.status, "completed");
+        assert_eq!(std::fs::read(target).unwrap(), b"complete payload");
+        assert!(!temp_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_destination_directory_is_rejected_without_touching_attacker_entries() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let authorized = root.path().join("authorized");
+        let moved = root.path().join("authorized-moved");
+        let attacker = root.path().join("attacker");
+        std::fs::create_dir(&authorized).unwrap();
+        std::fs::create_dir(&attacker).unwrap();
+        let authorized = authorized.canonicalize().unwrap();
+        let target = authorized.join("report.csv");
+        let temp_path = authorized.join(".dbx-download-transfer-swap-random.part");
+        let expected_identity = canonical_directory_identity(&authorized);
+        std::fs::rename(&authorized, &moved).unwrap();
+        symlink(&attacker, &authorized).unwrap();
+        let attacker_temp = attacker.join(".dbx-download-transfer-swap-random.part");
+        std::fs::write(&attacker_temp, b"do not delete").unwrap();
+
+        let error = AnchoredDestination::open(&target, &temp_path, &expected_identity).err().unwrap();
+        assert!(error.contains("safely") || error.contains("changed"), "{error}");
+
+        let storage = Storage::open(&root.path().join("dbx.sqlite")).await.unwrap();
+        let state = AppState::new(storage);
+        state
+            .storage
+            .create_file_transfer(
+                "transfer-swap".into(),
+                "connection-1".into(),
+                "download".into(),
+                "report.csv".into(),
+                target.to_string_lossy().into_owned(),
+                expected_identity,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_transfer(
+                "transfer-swap",
+                "running".into(),
+                0,
+                None,
+                Some(temp_path.to_string_lossy().into_owned()),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+        assert_eq!(std::fs::read(attacker_temp).unwrap(), b"do not delete");
+        assert_eq!(state.storage.get_file_transfer("transfer-swap").await.unwrap().unwrap().status, "failed");
+    }
+
+    #[tokio::test]
     async fn persisted_queued_cancel_intent_wins_before_worker_start() {
         let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
         let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
         storage
             .create_file_transfer(
@@ -887,7 +1610,8 @@ mod tests {
                 "connection-1".into(),
                 "download".into(),
                 "report.csv".into(),
-                directory.path().join("report.csv").to_string_lossy().into_owned(),
+                parent.join("report.csv").to_string_lossy().into_owned(),
+                canonical_directory_identity(&parent),
             )
             .await
             .unwrap();
@@ -928,22 +1652,46 @@ mod tests {
         assert_eq!(DOWNLOAD_BUFFER_SIZE, 4 * 1024 * 1024);
         let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_SIZE];
         let mut sink = tokio::io::sink();
+        let progress = TransferProgressSnapshot::new();
+        let mut bytes = 0;
 
-        let disconnected =
-            transfer_one_chunk(&mut FailedReader, &mut sink, &mut buffer, Duration::from_millis(50)).await.unwrap_err();
+        let disconnected = transfer_one_chunk(
+            &mut FailedReader,
+            &mut sink,
+            &mut buffer,
+            Duration::from_millis(50),
+            &mut bytes,
+            &progress,
+        )
+        .await
+        .unwrap_err();
         assert!(disconnected.invalidate_operator);
         assert!(disconnected.message.contains("injected disconnect"));
 
-        let stalled = transfer_one_chunk(&mut StalledReader, &mut sink, &mut buffer, Duration::from_millis(10))
-            .await
-            .unwrap_err();
+        let stalled = transfer_one_chunk(
+            &mut StalledReader,
+            &mut sink,
+            &mut buffer,
+            Duration::from_millis(10),
+            &mut bytes,
+            &progress,
+        )
+        .await
+        .unwrap_err();
         assert!(stalled.invalidate_operator);
         assert!(stalled.message.contains("watchdog"));
 
         let mut input = futures::io::Cursor::new(vec![7_u8; 1024]);
-        let disk_full = transfer_one_chunk(&mut input, &mut DiskFullWriter, &mut buffer, Duration::from_millis(50))
-            .await
-            .unwrap_err();
+        let disk_full = transfer_one_chunk(
+            &mut input,
+            &mut DiskFullWriter,
+            &mut buffer,
+            Duration::from_millis(50),
+            &mut bytes,
+            &progress,
+        )
+        .await
+        .unwrap_err();
         assert!(!disk_full.invalidate_operator);
         assert!(
             disk_full.message.contains("No space left") || disk_full.message.contains("space"),
@@ -953,8 +1701,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_write_failure_and_cancel_account_exact_successful_bytes() {
+        let mut buffer = vec![0_u8; 1_024];
+        let mut input = futures::io::Cursor::new(vec![1_u8; 1_024]);
+        let mut disk_full = PartialThenDiskFull { first_write: 137, wrote: false };
+        let progress = TransferProgressSnapshot::new();
+        let mut bytes = 0;
+        let failure = transfer_one_chunk(
+            &mut input,
+            &mut disk_full,
+            &mut buffer,
+            Duration::from_millis(50),
+            &mut bytes,
+            &progress,
+        )
+        .await
+        .unwrap_err();
+        assert!(failure.message.contains("space") || failure.message.contains("No space left"));
+        assert_eq!(bytes, 137);
+        assert_eq!(progress.bytes(), 137);
+
+        let mut input = futures::io::Cursor::new(vec![2_u8; 1_024]);
+        let mut stalled = PartialThenStall { first_write: 211, wrote: false };
+        let progress = TransferProgressSnapshot::new();
+        let mut bytes = 0;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            transfer_one_chunk(&mut input, &mut stalled, &mut buffer, Duration::from_secs(30), &mut bytes, &progress),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        assert_eq!(bytes, 211);
+        assert_eq!(progress.bytes(), 211);
+    }
+
+    #[tokio::test]
     async fn disk_full_terminal_snapshot_keeps_all_prior_successful_bytes() {
         let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
         let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
         storage
             .create_file_transfer(
@@ -962,7 +1746,8 @@ mod tests {
                 "connection-1".into(),
                 "download".into(),
                 "remote.bin".into(),
-                directory.path().join("local.bin").to_string_lossy().into_owned(),
+                parent.join("local.bin").to_string_lossy().into_owned(),
+                canonical_directory_identity(&parent),
             )
             .await
             .unwrap();
@@ -972,12 +1757,15 @@ mod tests {
         let mut buffer = vec![0_u8; 1_024];
 
         let mut first = futures::io::Cursor::new(vec![1_u8; 1_024]);
-        let first_count =
-            transfer_one_chunk(&mut first, &mut writer, &mut buffer, Duration::from_millis(50)).await.unwrap();
-        progress.record_bytes(i64::try_from(first_count).unwrap());
+        let mut bytes = 0;
+        transfer_one_chunk(&mut first, &mut writer, &mut buffer, Duration::from_millis(50), &mut bytes, &progress)
+            .await
+            .unwrap();
         let mut second = futures::io::Cursor::new(vec![2_u8; 1_024]);
         let failure =
-            transfer_one_chunk(&mut second, &mut writer, &mut buffer, Duration::from_millis(50)).await.unwrap_err();
+            transfer_one_chunk(&mut second, &mut writer, &mut buffer, Duration::from_millis(50), &mut bytes, &progress)
+                .await
+                .unwrap_err();
         assert!(failure.message.contains("space") || failure.message.contains("No space left"));
 
         storage
@@ -986,6 +1774,7 @@ mod tests {
                 "failed".into(),
                 progress.bytes(),
                 progress.total(),
+                None,
                 None,
                 Some(failure.message),
                 true,
@@ -1013,29 +1802,30 @@ mod tests {
         let mut reader = reader_future.await.unwrap().into_futures_async_read(..).await.unwrap();
 
         let directory = tempfile::tempdir().unwrap();
-        let target = directory.path().join("fixture.txt");
-        let temp = TempFileBuilder::new()
-            .prefix(".dbx-download-contract-")
-            .suffix(".part")
-            .tempfile_in(directory.path())
-            .unwrap();
-        let (std_file, temp_path) = temp.into_parts();
+        let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("fixture.txt");
+        let temp_path = parent.join(".dbx-download-contract-random.part");
+        let anchored = AnchoredDestination::open(&target, &temp_path, &canonical_directory_identity(&parent)).unwrap();
+        let (std_file, temp_identity) = anchored.create_temp().unwrap();
         let mut output = tokio::fs::File::from_std(std_file);
         let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_SIZE];
-        let mut bytes = 0;
+        let progress = TransferProgressSnapshot::new();
+        let mut bytes = 0_i64;
         loop {
-            let count = transfer_one_chunk(&mut reader, &mut output, &mut buffer, IO_PROGRESS_WATCHDOG).await.unwrap();
+            let count =
+                transfer_one_chunk(&mut reader, &mut output, &mut buffer, IO_PROGRESS_WATCHDOG, &mut bytes, &progress)
+                    .await
+                    .unwrap();
             if count == 0 {
                 break;
             }
-            bytes += count;
         }
         output.flush().await.unwrap();
         output.sync_all().await.unwrap();
         drop(output);
-        publish_temp_file(temp_path, target.clone()).await.unwrap();
+        anchored.publish(&temp_identity).unwrap();
 
-        assert_eq!(bytes, b"dbx ftp fixture\n".len());
+        assert_eq!(bytes, i64::try_from(b"dbx ftp fixture\n".len()).unwrap());
         assert_eq!(tokio::fs::read(target).await.unwrap(), b"dbx ftp fixture\n");
     }
 
@@ -1093,6 +1883,7 @@ mod tests {
         R: Runtime,
     {
         let state = app.state::<Arc<AppState>>();
+        let parent = local_path.parent().unwrap();
         state
             .storage
             .create_file_transfer(
@@ -1101,6 +1892,7 @@ mod tests {
                 "download".into(),
                 remote_path.to_string(),
                 local_path.to_string_lossy().into_owned(),
+                canonical_directory_identity(parent),
             )
             .await
             .unwrap();
@@ -1189,23 +1981,28 @@ mod tests {
         assert_no_owned_temp(&download_directory, "ftp-cancel");
 
         let disconnect_target = download_directory.join("disconnect.bin");
+        let disconnect_barrier = install_test_remote_reader_barrier();
         let (_, disconnect_worker) =
             create_worker_transfer(&app, "ftp-disconnect", "large.bin", &disconnect_target).await;
-        wait_for_transfer_status(&state.storage, "ftp-disconnect", &["running"]).await;
-        let disconnect_written = wait_for_owned_temp_bytes(&download_directory, "ftp-disconnect").await;
+        tokio::time::timeout(Duration::from_secs(10), disconnect_barrier.opened.notified())
+            .await
+            .expect("FTP reader must reach the explicit disconnect barrier");
+        let at_barrier = state.storage.get_file_transfer("ftp-disconnect").await.unwrap().unwrap();
+        assert_eq!(at_barrier.status, "running");
+        assert_eq!(at_barrier.bytes_transferred, 0);
         let kill = tokio::task::spawn_blocking(move || Command::new("docker").args(["kill", &container]).status())
             .await
             .unwrap()
             .unwrap();
         assert!(kill.success());
+        disconnect_barrier.release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), disconnect_worker)
             .await
             .expect("disconnect must terminate active FTP I/O")
             .unwrap();
         let disconnected = state.storage.get_file_transfer("ftp-disconnect").await.unwrap().unwrap();
         assert_eq!(disconnected.status, "failed");
-        assert!(disconnected.bytes_transferred >= i64::try_from(disconnect_written).unwrap());
-        assert!(disconnected.bytes_transferred > 0);
+        assert_eq!(disconnected.bytes_transferred, 0);
         assert!(disconnected.error.as_deref().is_some_and(|error| !error.is_empty()));
         assert!(!disconnect_target.exists());
         assert_no_owned_temp(&download_directory, "ftp-disconnect");

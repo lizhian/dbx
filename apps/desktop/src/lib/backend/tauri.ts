@@ -245,7 +245,7 @@ export interface FileMutationResult {
   outcome: "completed" | "no_op";
 }
 
-export type FileTransferStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
+export type FileTransferStatus = "queued" | "running" | "cancelling" | "publishing" | "completed" | "failed" | "cancelled";
 
 export interface FileTransfer {
   id: string;

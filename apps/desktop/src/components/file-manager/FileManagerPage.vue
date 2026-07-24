@@ -75,6 +75,7 @@ const text = computed(() => ({
     queued: t("fileManager.transferQueued"),
     running: t("fileManager.transferRunning"),
     cancelling: t("fileManager.transferCancelling"),
+    publishing: t("fileManager.transferPublishing"),
     completed: t("fileManager.transferCompleted"),
     failed: t("fileManager.transferFailed"),
     cancelled: t("fileManager.transferCancelled"),
@@ -476,7 +477,7 @@ onMounted(async () => {
   }
   await Promise.all([loadConnections(), refreshTransfers()]);
   transferPoll = setInterval(() => {
-    if (transfers.value.some((transfer) => ["queued", "running", "cancelling"].includes(transfer.status))) {
+    if (transfers.value.some((transfer) => ["queued", "running", "cancelling", "publishing"].includes(transfer.status))) {
       void refreshTransfers();
     }
   }, 2_000);

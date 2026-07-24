@@ -5608,6 +5608,7 @@ export default {
     transferQueued: "Queued",
     transferRunning: "Downloading",
     transferCancelling: "Cancelling",
+    transferPublishing: "Finalizing",
     transferCompleted: "Completed",
     transferFailed: "Failed",
     transferCancelled: "Cancelled",

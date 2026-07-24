@@ -5594,6 +5594,7 @@ export default withEnglishFallback({
     transferQueued: "等待中",
     transferRunning: "下载中",
     transferCancelling: "正在取消",
+    transferPublishing: "正在完成",
     transferCompleted: "已完成",
     transferFailed: "失败",
     transferCancelled: "已取消",
