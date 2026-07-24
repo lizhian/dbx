@@ -1166,26 +1166,65 @@ fn atomic_rename_noreplace(
 
 #[cfg(windows)]
 fn atomic_rename_noreplace(
-    _source_directory: &Dir,
-    source_path: &Path,
+    source_directory: &Dir,
+    _source_path: &Path,
     source_name: &OsStr,
-    _destination_directory: &Dir,
-    destination_path: &Path,
+    destination_directory: &Dir,
+    _destination_path: &Path,
     destination_name: &OsStr,
 ) -> io::Result<()> {
+    use cap_std::fs::OpenOptionsExt;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfoEx, SetFileInformationByHandle, DELETE, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
     if let Some(error) = test_atomic_rename_error(source_name) {
         return Err(error);
     }
-    let source = source_path.join(source_name).as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
-    let destination =
-        destination_path.join(destination_name).as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
-    let moved = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) };
-    if moved == 0 {
+
+    let destination = destination_name.encode_wide().collect::<Vec<_>>();
+    if destination.is_empty() || destination.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "destination file name is invalid"));
+    }
+    let file_name_bytes = destination
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination file name is too long"))?;
+    let buffer_size = std::mem::size_of::<FILE_RENAME_INFO>()
+        .checked_add((destination.len() - 1) * std::mem::size_of::<u16>())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination file name is too long"))?;
+    let buffer_size_u32 = u32::try_from(buffer_size)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination file name is too long"))?;
+    let mut buffer = vec![0usize; buffer_size.div_ceil(std::mem::size_of::<usize>())];
+    let rename_info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+
+    let mut source_options = OpenOptions::new();
+    source_options
+        .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .follow(FollowSymlinks::No);
+    let source = source_directory.open_with(source_name, &source_options)?;
+
+    unsafe {
+        (*rename_info).Anonymous.Flags = 0;
+        (*rename_info).RootDirectory = destination_directory.as_raw_handle();
+        (*rename_info).FileNameLength = file_name_bytes;
+        std::ptr::copy_nonoverlapping(
+            destination.as_ptr(),
+            std::ptr::addr_of_mut!((*rename_info).FileName).cast::<u16>(),
+            destination.len(),
+        );
+    }
+    let renamed = unsafe {
+        SetFileInformationByHandle(source.as_raw_handle(), FileRenameInfoEx, rename_info.cast(), buffer_size_u32)
+    };
+    if renamed == 0 {
         let error = io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(1 | 17 | 50)) {
+        if matches!(error.raw_os_error(), Some(1 | 17 | 50 | 87 | 120)) {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("filesystem does not support same-volume atomic no-replace rename: {error}"),
@@ -1327,14 +1366,8 @@ async fn recover_interrupted_transfer(state: &AppState, transfer: &FileTransferS
                 anchored.remove_owned_temp(expected).map_err(|error| error.to_string())?;
                 Ok(false)
             } else if target_identity.is_some() && temp_identity.is_none() {
-                let (_, _, quarantine_path) = anchored
-                    .quarantine_entry(&anchored.target_name, ".dbx-rejected-publish-")
-                    .map_err(|error| error.to_string())?;
-                anchored.sync_directory().map_err(|error| error.to_string())?;
-                Err(format!(
-                    "Published destination identity was invalid; replacement preserved in {}",
-                    quarantine_path.display()
-                ))
+                Err("Published destination identity does not match the download; existing file was left in place"
+                    .to_string())
             } else {
                 Ok(false)
             }
@@ -2004,6 +2037,65 @@ mod tests {
         assert!(!temp_path.exists());
     }
 
+    #[tokio::test]
+    async fn publishing_recovery_leaves_an_unproven_target_in_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("report.csv");
+        let temp_path = parent.join(".dbx-download-transfer-publishing-mismatch-random.part");
+        let directory_identity = canonical_directory_identity(&parent);
+        let anchored = AnchoredDestination::open(&target, &temp_path, &directory_identity).unwrap();
+        let (mut temp, temp_identity) = anchored.create_temp().unwrap();
+        use std::io::Write;
+        temp.write_all(b"download payload").unwrap();
+        temp.sync_all().unwrap();
+        drop(temp);
+
+        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let state = AppState::new(storage);
+        state
+            .storage
+            .create_file_transfer(
+                "transfer-publishing-mismatch".into(),
+                "connection-1".into(),
+                "download".into(),
+                "report.csv".into(),
+                target.to_string_lossy().into_owned(),
+                directory_identity,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_transfer(
+                "transfer-publishing-mismatch",
+                "publishing".into(),
+                16,
+                Some(16),
+                Some(temp_path.to_string_lossy().into_owned()),
+                Some(temp_identity),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        std::fs::remove_file(&temp_path).unwrap();
+        std::fs::write(&target, b"user replacement").unwrap();
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
+
+        let recovered = state.storage.get_file_transfer("transfer-publishing-mismatch").await.unwrap().unwrap();
+        assert_eq!(recovered.status, "failed");
+        assert!(recovered.error.unwrap().contains("existing file was left in place"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"user replacement");
+        assert!(!parent
+            .read_dir()
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(".dbx-rejected-publish-")));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn replaced_destination_directory_is_rejected_without_touching_attacker_entries() {
@@ -2360,7 +2452,7 @@ mod tests {
         .unwrap_or_else(|_| panic!("transfer {transfer_id} did not write its temporary file"))
     }
 
-    async fn create_worker_transfer<R: Runtime>(
+    async fn create_worker_transfer<R>(
         app: &tauri::App<R>,
         transfer_id: &str,
         remote_path: &str,
