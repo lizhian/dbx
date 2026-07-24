@@ -134,6 +134,7 @@ pub struct FileTransferStorageRecord {
     pub local_path: String,
     #[serde(skip_serializing)]
     pub local_directory_identity: String,
+    #[serde(skip_serializing)]
     pub temp_path: Option<String>,
     #[serde(skip_serializing)]
     pub temp_identity: Option<String>,
@@ -741,11 +742,15 @@ impl Storage {
             let changed = conn
                 .execute(
                     "UPDATE file_transfers
-                     SET status = ?2, bytes_transferred = ?3, total_bytes = ?4,
+                     SET status = CASE
+                             WHEN status = 'cancelling' AND ?10 = 0 THEN status
+                             ELSE ?2
+                         END,
+                         bytes_transferred = ?3, total_bytes = ?4,
                          temp_path = ?5, temp_identity = ?6, error = ?7,
                          updated_at = ?8, completed_at = ?9
                      WHERE id = ?1
-                       AND (?10 = 1 OR status IN ('queued', 'running'))",
+                       AND (?10 = 1 OR status IN ('queued', 'running', 'cancelling'))",
                     params![
                         id,
                         status,
@@ -5963,10 +5968,21 @@ mod tests {
         let cancelling = storage.request_file_transfer_cancel("transfer-1").await.unwrap();
         assert_eq!(cancelling.status, "cancelling");
         let late_progress = storage
-            .update_file_transfer("transfer-1", "running".into(), 8, Some(8), None, None, None, false)
+            .update_file_transfer(
+                "transfer-1",
+                "running".into(),
+                8,
+                Some(8),
+                Some("/tmp/.dbx-download-transfer-1-random.part".into()),
+                Some("temp-identity".into()),
+                None,
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(late_progress.status, "cancelling");
+        assert_eq!(late_progress.bytes_transferred, 8);
+        assert_eq!(late_progress.temp_identity.as_deref(), Some("temp-identity"));
 
         let terminal = storage
             .update_file_transfer(

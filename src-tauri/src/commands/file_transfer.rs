@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cap_fs_ext::{ambient_authority, DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{
+    ambient_authority, DirExt, FollowSymlinks, MetadataExt as CapabilityMetadataExt, OpenOptionsFollowExt,
+};
 use cap_std::fs::{Dir, OpenOptions};
 use dbx_core::connection::AppState;
 use dbx_core::storage::FileTransferStorageRecord;
@@ -21,7 +23,9 @@ use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::file_manager::{validate_remote_relative_path, FileManagerRuntime, PreparedFileOperation};
+use super::file_manager::{
+    validate_remote_relative_path, CancellationSignal, FileManagerRuntime, PreparedFileOperation,
+};
 
 const DOWNLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const GLOBAL_TRANSFER_LIMIT: usize = 8;
@@ -29,6 +33,7 @@ const CONNECTION_TRANSFER_LIMIT: usize = 4;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 const GLOBAL_PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
 const IO_PROGRESS_WATCHDOG: Duration = Duration::from_secs(30);
+const CREATE_TEMP_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_OPERATION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const TRANSFER_EVENT: &str = "file-transfer-progress";
 
@@ -42,6 +47,23 @@ struct TestRemoteReaderBarrier {
 #[cfg(test)]
 static TEST_REMOTE_READER_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
     std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestBlockingBarrier {
+    entry_name: OsString,
+    opened: Arc<tokio::sync::Notify>,
+    release: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+static TEST_CREATE_TEMP_BARRIER: std::sync::OnceLock<Mutex<Option<TestBlockingBarrier>>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_LEAF_MUTATION_BARRIER: std::sync::OnceLock<Mutex<Option<TestBlockingBarrier>>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_UNSUPPORTED_ATOMIC_RENAME: std::sync::OnceLock<Mutex<Option<OsString>>> = std::sync::OnceLock::new();
 
 pub struct FileTransferRuntime {
     global_limit: Arc<Semaphore>,
@@ -82,6 +104,12 @@ struct DownloadOutcome {
     total_bytes: Option<i64>,
 }
 
+struct CreateTempCompletion {
+    file: std::fs::File,
+    identity: String,
+    timed_out: bool,
+}
+
 #[derive(Debug)]
 struct ValidatedLocalDestination {
     path: PathBuf,
@@ -90,6 +118,7 @@ struct ValidatedLocalDestination {
 
 struct AnchoredDestination {
     directory: Arc<Dir>,
+    parent_path: PathBuf,
     target_name: OsString,
     temp_name: OsString,
 }
@@ -234,7 +263,7 @@ async fn start_download_inner<R: Runtime>(
     runtime: &FileTransferRuntime,
     input: StartDownloadInput,
 ) -> Result<StartTransferResult, String> {
-    runtime.ensure_recovered(&state).await?;
+    runtime.ensure_recovered(state).await?;
     let remote_path = validate_remote_relative_path(&input.remote_path)?;
     let local = validate_local_destination(Path::new(&input.local_path)).await?;
     let fs_scope = window
@@ -360,16 +389,25 @@ async fn run_download_worker<R: Runtime>(
             }
         };
         let connection_cancellation = prepared.cancellation.clone();
-        let commit_started = Arc::new(AtomicBool::new(false));
-        let operation =
-            execute_download(&app, &state, &runtime, &transfer_id, &prepared, commit_started.clone(), progress.clone());
+        let mutation_in_flight = Arc::new(AtomicBool::new(false));
+        let operation = execute_download(
+            &app,
+            &state,
+            &runtime,
+            &transfer_id,
+            &prepared,
+            &cancellation,
+            &connection_cancellation,
+            mutation_in_flight.clone(),
+            progress.clone(),
+        );
         tokio::pin!(operation);
         let operation_deadline = tokio::time::sleep(DOWNLOAD_OPERATION_TIMEOUT);
         tokio::pin!(operation_deadline);
         let operation_result = tokio::select! {
             result = &mut operation => result,
             _ = &mut operation_deadline => {
-                if commit_started.load(Ordering::Acquire) {
+                if mutation_in_flight.load(Ordering::Acquire) {
                     operation.await
                 } else {
                     Err(TransferFailure {
@@ -380,14 +418,14 @@ async fn run_download_worker<R: Runtime>(
                 }
             },
             _ = cancellation.cancelled() => {
-                if commit_started.load(Ordering::Acquire) {
+                if mutation_in_flight.load(Ordering::Acquire) {
                     operation.await
                 } else {
                     Err(cancelled_active_failure())
                 }
             },
             _ = connection_cancellation.cancelled() => {
-                if commit_started.load(Ordering::Acquire) {
+                if mutation_in_flight.load(Ordering::Acquire) {
                     operation.await
                 } else {
                     Err(TransferFailure {
@@ -398,26 +436,35 @@ async fn run_download_worker<R: Runtime>(
                 }
             }
         };
-        operation_result.map_err(|failure| {
+        operation_result.inspect_err(|failure| {
             if failure.invalidate_operator {
                 file_manager.evict_revision(&connection_id, prepared.revision);
             }
-            failure
         })
     }
     .await;
 
-    let latest = state.storage.get_file_transfer(&transfer_id).await.ok().flatten();
+    finalize_download_result(&app, &state, &transfer_id, result, &progress).await;
+    runtime.unregister(&transfer_id);
+}
+
+async fn finalize_download_result<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    transfer_id: &str,
+    result: Result<DownloadOutcome, TransferFailure>,
+    progress: &TransferProgressSnapshot,
+) {
+    let latest = state.storage.get_file_transfer(transfer_id).await.ok().flatten();
     if result.is_err() && latest.as_ref().is_some_and(|record| record.status == "publishing") {
         if let Some(record) = latest.as_ref() {
-            if let Err(error) = recover_interrupted_transfer(&state, record).await {
+            if let Err(error) = recover_interrupted_transfer(state, record).await {
                 log::error!("Failed to reconcile publishing file transfer: {error}");
             }
         }
-        if let Ok(Some(record)) = state.storage.get_file_transfer(&transfer_id).await {
-            emit_transfer(&app, &record);
+        if let Ok(Some(record)) = state.storage.get_file_transfer(transfer_id).await {
+            emit_transfer(app, &record);
         }
-        runtime.unregister(&transfer_id);
         return;
     }
     let cleanup_error = if result.is_err() {
@@ -442,13 +489,12 @@ async fn run_download_worker<R: Runtime>(
     };
     match state
         .storage
-        .update_file_transfer(&transfer_id, status.to_string(), bytes_transferred, total_bytes, None, None, error, true)
+        .update_file_transfer(transfer_id, status.to_string(), bytes_transferred, total_bytes, None, None, error, true)
         .await
     {
-        Ok(record) => emit_transfer(&app, &record),
+        Ok(record) => emit_transfer(app, &record),
         Err(error) => log::error!("Failed to persist terminal file transfer state: {error}"),
     }
-    runtime.unregister(&transfer_id);
 }
 
 async fn cleanup_active_temp(record: &FileTransferStorageRecord) -> Result<(), String> {
@@ -461,10 +507,13 @@ async fn cleanup_active_temp(record: &FileTransferStorageRecord) -> Result<(), S
     let local_path = PathBuf::from(&record.local_path);
     let temp_path = PathBuf::from(temp_path);
     let directory_identity = record.local_directory_identity.clone();
-    let expected_temp_identity = record.temp_identity.clone();
+    let expected_temp_identity = record
+        .temp_identity
+        .clone()
+        .ok_or_else(|| "temporary-file identity is unavailable; no file was removed".to_string())?;
     tokio::task::spawn_blocking(move || {
         let anchored = AnchoredDestination::reopen(&local_path, &temp_path, &directory_identity)?;
-        anchored.remove_owned_temp(expected_temp_identity.as_deref()).map(|_| ()).map_err(|error| error.to_string())
+        anchored.remove_owned_temp(&expected_temp_identity).map(|_| ()).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
@@ -511,7 +560,9 @@ async fn execute_download<R: Runtime>(
     runtime: &FileTransferRuntime,
     transfer_id: &str,
     prepared: &PreparedFileOperation,
-    commit_started: Arc<AtomicBool>,
+    cancellation: &CancellationToken,
+    connection_cancellation: &CancellationSignal,
+    mutation_in_flight: Arc<AtomicBool>,
     progress_snapshot: Arc<TransferProgressSnapshot>,
 ) -> Result<DownloadOutcome, TransferFailure> {
     let record = state
@@ -559,12 +610,16 @@ async fn execute_download<R: Runtime>(
     .map_err(local_failure)?;
     let anchored = Arc::new(anchored);
 
-    let create_target = anchored.clone();
-    let (std_file, temp_identity) = tokio::task::spawn_blocking(move || create_target.create_temp())
-        .await
-        .map_err(|error| local_failure(error.to_string()))?
-        .map_err(|error| local_failure(format!("Failed to create download temporary file: {error}")))?;
-    let running = state
+    mutation_in_flight.store(true, Ordering::Release);
+    let creation = await_create_temp(anchored.clone(), CREATE_TEMP_TIMEOUT).await;
+    let (std_file, temp_identity, create_timed_out) = match creation {
+        Ok(creation) => (creation.file, creation.identity, creation.timed_out),
+        Err(error) => {
+            mutation_in_flight.store(false, Ordering::Release);
+            return Err(error);
+        }
+    };
+    let running_result = state
         .storage
         .update_file_transfer(
             transfer_id,
@@ -576,9 +631,44 @@ async fn execute_download<R: Runtime>(
             None,
             false,
         )
-        .await
-        .map_err(local_failure)?;
+        .await;
+    let running = match running_result {
+        Ok(running) => running,
+        Err(error) => {
+            drop(std_file);
+            let cleanup_target = anchored.clone();
+            let cleanup_identity = temp_identity.clone();
+            let cleanup = tokio::task::spawn_blocking(move || cleanup_target.remove_owned_temp(&cleanup_identity))
+                .await
+                .map_err(|cleanup| cleanup.to_string())
+                .and_then(|cleanup| cleanup.map_err(|cleanup| cleanup.to_string()));
+            mutation_in_flight.store(false, Ordering::Release);
+            return Err(local_failure(match cleanup {
+                Ok(_) => error,
+                Err(cleanup) => format!(
+                    "{error}; temporary-file cleanup after identity persistence failure failed safely: {cleanup}"
+                ),
+            }));
+        }
+    };
+    mutation_in_flight.store(false, Ordering::Release);
     emit_transfer(app, &running);
+    if create_timed_out {
+        drop(std_file);
+        return Err(local_failure("Creating the download temporary file timed out"));
+    }
+    if cancellation.is_cancelled() {
+        drop(std_file);
+        return Err(cancelled_active_failure());
+    }
+    if connection_cancellation.is_cancelled() {
+        drop(std_file);
+        return Err(TransferFailure {
+            status: "cancelled",
+            message: "The file connection was removed while the download was running".to_string(),
+            invalidate_operator: true,
+        });
+    }
 
     let mut output = tokio::fs::File::from_std(std_file);
     let reader_future = prepared.operator.reader_with(&prepared.remote_path).concurrent(1).chunk(DOWNLOAD_BUFFER_SIZE);
@@ -653,14 +743,29 @@ async fn execute_download<R: Runtime>(
     emit_transfer(app, &publishing);
 
     // Once publishing is durable, cancellation waits for reconciliation:
-    // the no-clobber link may already have installed the destination.
-    commit_started.store(true, Ordering::Release);
+    // the no-clobber rename may already have installed the destination.
+    mutation_in_flight.store(true, Ordering::Release);
     let publish_target = anchored.clone();
     tokio::task::spawn_blocking(move || publish_target.publish(&temp_identity))
         .await
         .map_err(|error| local_failure(error.to_string()))?
         .map_err(local_failure)?;
     Ok(DownloadOutcome { bytes_transferred, total_bytes })
+}
+
+async fn await_create_temp(
+    anchored: Arc<AnchoredDestination>,
+    timeout: Duration,
+) -> Result<CreateTempCompletion, TransferFailure> {
+    let mut task = tokio::task::spawn_blocking(move || anchored.create_temp());
+    let (result, timed_out) = match tokio::time::timeout(timeout, &mut task).await {
+        Ok(result) => (result, false),
+        Err(_) => (task.await, true),
+    };
+    let (file, identity) = result
+        .map_err(|error| local_failure(error.to_string()))?
+        .map_err(|error| local_failure(format!("Failed to create download temporary file: {error}")))?;
+    Ok(CreateTempCompletion { file, identity, timed_out })
 }
 
 #[cfg(test)]
@@ -689,6 +794,66 @@ async fn wait_at_test_remote_reader_barrier() {
 
 #[cfg(not(test))]
 async fn wait_at_test_remote_reader_barrier() {}
+
+#[cfg(test)]
+fn install_test_blocking_barrier(
+    slot: &std::sync::OnceLock<Mutex<Option<TestBlockingBarrier>>>,
+    entry_name: &OsStr,
+) -> TestBlockingBarrier {
+    let barrier = TestBlockingBarrier {
+        entry_name: entry_name.to_os_string(),
+        opened: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+    };
+    *slot.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner()) = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+fn wait_at_test_blocking_barrier(slot: &std::sync::OnceLock<Mutex<Option<TestBlockingBarrier>>>, entry_name: &OsStr) {
+    let barrier = {
+        let mut guard = slot.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner());
+        if guard
+            .as_ref()
+            .is_some_and(|barrier| barrier.entry_name == OsStr::new("*") || barrier.entry_name == entry_name)
+        {
+            guard.take()
+        } else {
+            None
+        }
+    };
+    if let Some(barrier) = barrier {
+        barrier.opened.notify_one();
+        let (released, condition) = &*barrier.release;
+        let mut released = released.lock().unwrap_or_else(|error| error.into_inner());
+        while !*released {
+            released = condition.wait(released).unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+#[cfg(test)]
+fn wait_at_test_create_temp_barrier(entry_name: &OsStr) {
+    wait_at_test_blocking_barrier(&TEST_CREATE_TEMP_BARRIER, entry_name);
+}
+
+#[cfg(not(test))]
+fn wait_at_test_create_temp_barrier(_entry_name: &OsStr) {}
+
+#[cfg(test)]
+fn wait_at_test_leaf_mutation_barrier(entry_name: &OsStr) {
+    wait_at_test_blocking_barrier(&TEST_LEAF_MUTATION_BARRIER, entry_name);
+}
+
+#[cfg(not(test))]
+fn wait_at_test_leaf_mutation_barrier(_entry_name: &OsStr) {}
+
+#[cfg(test)]
+fn release_test_blocking_barrier(barrier: &TestBlockingBarrier) {
+    let (released, condition) = &*barrier.release;
+    *released.lock().unwrap_or_else(|error| error.into_inner()) = true;
+    condition.notify_all();
+}
 
 async fn transfer_one_chunk<R, W>(
     reader: &mut R,
@@ -760,15 +925,16 @@ impl AnchoredDestination {
                 Err(error) => return Err(format!("Failed to inspect local download destination: {error}")),
             }
         }
-        Ok(Self { directory: Arc::new(directory), target_name, temp_name })
+        Ok(Self { directory: Arc::new(directory), parent_path: parent.to_path_buf(), target_name, temp_name })
     }
 
     fn create_temp(&self) -> io::Result<(std::fs::File, String)> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true).follow(FollowSymlinks::No);
-        let file = self.directory.open_with(&self.temp_name, &options)?.into_std();
-        let identity = metadata_identity(&file.metadata()?)?;
-        Ok((file, identity))
+        wait_at_test_create_temp_barrier(&self.temp_name);
+        let file = self.directory.open_with(&self.temp_name, &options)?;
+        let identity = metadata_identity(&file.metadata()?);
+        Ok((file.into_std(), identity))
     }
 
     fn entry_identity(&self, name: &OsStr) -> io::Result<Option<String>> {
@@ -782,49 +948,103 @@ impl AnchoredDestination {
             Ok(_) => {
                 let mut options = OpenOptions::new();
                 options.read(true).follow(FollowSymlinks::No);
-                let file = self.directory.open_with(name, &options)?.into_std();
-                Ok(Some(metadata_identity(&file.metadata()?)?))
+                let file = self.directory.open_with(name, &options)?;
+                Ok(Some(metadata_identity(&file.metadata()?)))
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }
 
-    fn remove_owned_temp(&self, expected_identity: Option<&str>) -> io::Result<bool> {
+    fn remove_owned_temp(&self, expected_identity: &str) -> io::Result<bool> {
         let Some(actual_identity) = self.entry_identity(&self.temp_name)? else {
             return Ok(false);
         };
-        if expected_identity.is_some_and(|expected| expected != actual_identity) {
+        if expected_identity != actual_identity {
             return Err(io::Error::other("operation-owned temporary file identity changed"));
         }
-        self.directory.remove_file(&self.temp_name)?;
+
+        wait_at_test_leaf_mutation_barrier(&self.temp_name);
+        let (quarantine, quarantine_name, quarantine_path) = self.quarantine_entry(&self.temp_name, ".dbx-cleanup-")?;
+        let payload_name = OsStr::new("payload.part");
+        let moved_identity = entry_identity_in(&quarantine, payload_name)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "quarantined temporary file is missing"))?;
+        if moved_identity != expected_identity {
+            return Err(io::Error::other(format!(
+                "operation-owned temporary file was replaced; replacement preserved in {}",
+                quarantine_path.display()
+            )));
+        }
+        quarantine.remove_file(payload_name)?;
+        quarantine.try_clone()?.into_std_file().sync_all()?;
+        self.directory.remove_dir(&quarantine_name)?;
         self.sync_directory()?;
         Ok(true)
     }
 
-    fn link_temp(&self, expected_identity: &str) -> io::Result<()> {
+    fn quarantine_entry(&self, source_name: &OsStr, directory_prefix: &str) -> io::Result<(Dir, OsString, PathBuf)> {
+        let quarantine_name = OsString::from(format!("{directory_prefix}{}", Uuid::new_v4()));
+        #[cfg(unix)]
+        let builder = {
+            use cap_std::fs::DirBuilderExt;
+            let mut builder = cap_std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = cap_std::fs::DirBuilder::new();
+        self.directory.create_dir_with(&quarantine_name, &builder)?;
+        let quarantine = self.directory.open_dir_nofollow(&quarantine_name)?;
+        let quarantine_path = self.parent_path.join(&quarantine_name);
+        let payload_name = OsStr::new("payload.part");
+        if let Err(error) = atomic_rename_noreplace(
+            &self.directory,
+            &self.parent_path,
+            source_name,
+            &quarantine,
+            &quarantine_path,
+            payload_name,
+        ) {
+            let _ = self.directory.remove_dir(&quarantine_name);
+            return Err(error);
+        }
+        Ok((quarantine, quarantine_name, quarantine_path))
+    }
+
+    fn rename_temp_to_target(&self, expected_identity: &str) -> io::Result<()> {
         let actual_identity = self
             .entry_identity(&self.temp_name)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "download temporary file is missing"))?;
         if actual_identity != expected_identity {
             return Err(io::Error::other("download temporary file identity changed"));
         }
-        self.directory.hard_link(&self.temp_name, &self.directory, &self.target_name)?;
+        wait_at_test_leaf_mutation_barrier(&self.temp_name);
+        atomic_rename_noreplace(
+            &self.directory,
+            &self.parent_path,
+            &self.temp_name,
+            &self.directory,
+            &self.parent_path,
+            &self.target_name,
+        )?;
         let target_identity = self
             .entry_identity(&self.target_name)?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "published destination is missing"))?;
         if target_identity != expected_identity {
-            return Err(io::Error::other("published destination identity does not match the download"));
+            let (_, _, quarantine_path) = self.quarantine_entry(&self.target_name, ".dbx-rejected-publish-")?;
+            self.sync_directory()?;
+            return Err(io::Error::other(format!(
+                "published destination identity does not match the download; replacement preserved in {}",
+                quarantine_path.display()
+            )));
         }
         self.sync_directory()
     }
 
     fn publish(&self, expected_identity: &str) -> Result<(), String> {
-        self.link_temp(expected_identity).map_err(|error| {
+        self.rename_temp_to_target(expected_identity).map_err(|error| {
             format!("Failed to atomically publish the download without replacing the destination: {error}")
         })?;
-        self.remove_owned_temp(Some(expected_identity))
-            .map_err(|error| format!("Download was published but temporary-file cleanup failed: {error}"))?;
         Ok(())
     }
 
@@ -868,28 +1088,129 @@ fn open_absolute_directory_nofollow(path: &Path) -> io::Result<Dir> {
 }
 
 fn directory_identity(directory: &Dir) -> io::Result<String> {
-    let file = directory.try_clone()?.into_std_file();
-    metadata_identity(&file.metadata()?)
+    Ok(metadata_identity(&directory.dir_metadata()?))
 }
 
-#[cfg(unix)]
-fn metadata_identity(metadata: &std::fs::Metadata) -> io::Result<String> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+fn metadata_identity(metadata: &cap_std::fs::Metadata) -> String {
+    format!("cap:{}:{}", CapabilityMetadataExt::dev(metadata), CapabilityMetadataExt::ino(metadata))
+}
+
+fn entry_identity_in(directory: &Dir, name: &OsStr) -> io::Result<Option<String>> {
+    match directory.symlink_metadata(name) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(io::Error::other("operation-owned path was replaced by a symbolic link"))
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            Err(io::Error::other("operation-owned path was replaced by a non-file entry"))
+        }
+        Ok(_) => {
+            let mut options = OpenOptions::new();
+            options.read(true).follow(FollowSymlinks::No);
+            let file = directory.open_with(name, &options)?;
+            Ok(Some(metadata_identity(&file.metadata()?)))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+fn test_atomic_rename_error(source_name: &OsStr) -> Option<io::Error> {
+    let mut guard = TEST_UNSUPPORTED_ATOMIC_RENAME
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if guard.as_deref() == Some(source_name) {
+        guard.take();
+        Some(io::Error::new(io::ErrorKind::Unsupported, "injected filesystem without atomic no-replace rename"))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(test))]
+fn test_atomic_rename_error(_source_name: &OsStr) -> Option<io::Error> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_rename_noreplace(
+    source_directory: &Dir,
+    _source_path: &Path,
+    source_name: &OsStr,
+    destination_directory: &Dir,
+    _destination_path: &Path,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    if let Some(error) = test_atomic_rename_error(source_name) {
+        return Err(error);
+    }
+    rustix::fs::renameat_with(
+        source_directory,
+        source_name,
+        destination_directory,
+        destination_name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        if matches!(error, rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::INVAL) {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("filesystem does not support atomic no-replace rename: {error}"),
+            )
+        } else {
+            io::Error::from(error)
+        }
+    })
 }
 
 #[cfg(windows)]
-fn metadata_identity(metadata: &std::fs::Metadata) -> io::Result<String> {
-    use std::os::windows::fs::MetadataExt;
-    let volume =
-        metadata.volume_serial_number().ok_or_else(|| io::Error::other("volume serial number is unavailable"))?;
-    let index = metadata.file_index().ok_or_else(|| io::Error::other("file index is unavailable"))?;
-    Ok(format!("windows:{volume}:{index}"))
+fn atomic_rename_noreplace(
+    _source_directory: &Dir,
+    source_path: &Path,
+    source_name: &OsStr,
+    _destination_directory: &Dir,
+    destination_path: &Path,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    if let Some(error) = test_atomic_rename_error(source_name) {
+        return Err(error);
+    }
+    let source = source_path.join(source_name).as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let destination =
+        destination_path.join(destination_name).as_os_str().encode_wide().chain(Some(0)).collect::<Vec<_>>();
+    let moved = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if moved == 0 {
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(1 | 17 | 50)) {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("filesystem does not support same-volume atomic no-replace rename: {error}"),
+            ))
+        } else {
+            Err(error)
+        }
+    } else {
+        Ok(())
+    }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn metadata_identity(_metadata: &std::fs::Metadata) -> io::Result<String> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "stable file identity is unavailable on this platform"))
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn atomic_rename_noreplace(
+    _source_directory: &Dir,
+    _source_path: &Path,
+    source_name: &OsStr,
+    _destination_directory: &Dir,
+    _destination_path: &Path,
+    _destination_name: &OsStr,
+) -> io::Result<()> {
+    if let Some(error) = test_atomic_rename_error(source_name) {
+        return Err(error);
+    }
+    Err(io::Error::new(io::ErrorKind::Unsupported, "atomic no-replace rename is unavailable on this platform"))
 }
 
 async fn watched_remote<T>(
@@ -996,20 +1317,32 @@ async fn recover_interrupted_transfer(state: &AppState, transfer: &FileTransferS
             let temp_identity = anchored.entry_identity(&anchored.temp_name).map_err(|error| error.to_string())?;
             if target_identity.as_deref() == Some(expected) {
                 if temp_identity.as_deref() == Some(expected) {
-                    anchored.remove_owned_temp(Some(expected)).map_err(|error| error.to_string())?;
+                    anchored.remove_owned_temp(expected).map_err(|error| error.to_string())?;
                 }
                 Ok(true)
+            } else if target_identity.is_none() && temp_identity.as_deref() == Some(expected) {
+                anchored.publish(expected)?;
+                Ok(true)
+            } else if target_identity.is_some() && temp_identity.as_deref() == Some(expected) {
+                anchored.remove_owned_temp(expected).map_err(|error| error.to_string())?;
+                Ok(false)
+            } else if target_identity.is_some() && temp_identity.is_none() {
+                let (_, _, quarantine_path) = anchored
+                    .quarantine_entry(&anchored.target_name, ".dbx-rejected-publish-")
+                    .map_err(|error| error.to_string())?;
+                anchored.sync_directory().map_err(|error| error.to_string())?;
+                Err(format!(
+                    "Published destination identity was invalid; replacement preserved in {}",
+                    quarantine_path.display()
+                ))
             } else {
-                if temp_identity.as_deref() == Some(expected) {
-                    anchored.remove_owned_temp(Some(expected)).map_err(|error| error.to_string())?;
-                }
                 Ok(false)
             }
         } else {
-            anchored
-                .remove_owned_temp(expected_temp_identity.as_deref())
-                .map(|_| false)
-                .map_err(|error| error.to_string())
+            let expected = expected_temp_identity.as_deref().ok_or_else(|| {
+                "Interrupted transfer has no durable temporary-file identity; no file was removed".to_string()
+            })?;
+            anchored.remove_owned_temp(expected).map(|_| false).map_err(|error| error.to_string())
         }
     })
     .await
@@ -1313,6 +1646,10 @@ mod tests {
         let persisted = get_file_transfer_inner(&state, runtime.inner(), &started.transfer_id).await.unwrap();
         assert_eq!(persisted.remote_path, "a%2Fb");
         assert_eq!(persisted.status, "queued");
+        let serialized = serde_json::to_value(&persisted).unwrap();
+        assert!(serialized.get("localDirectoryIdentity").is_none());
+        assert!(serialized.get("tempPath").is_none());
+        assert!(serialized.get("tempIdentity").is_none());
 
         let cancelling =
             cancel_file_transfer_inner(app.handle(), &state, runtime.inner(), &started.transfer_id).await.unwrap();
@@ -1371,7 +1708,130 @@ mod tests {
         drop(second_temp);
         assert!(second.publish(&second_identity).is_err());
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"payload");
-        second.remove_owned_temp(Some(&second_identity)).unwrap();
+        second.remove_owned_temp(&second_identity).unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_timeout_awaits_blocking_task_before_cleanup_can_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("download.bin");
+        let temp_path = parent.join(".dbx-download-create-timeout-random.part");
+        let anchored =
+            Arc::new(AnchoredDestination::open(&target, &temp_path, &canonical_directory_identity(&parent)).unwrap());
+        let barrier = install_test_blocking_barrier(&TEST_CREATE_TEMP_BARRIER, temp_path.file_name().unwrap());
+        let create_target = anchored.clone();
+        let creation = tokio::spawn(async move { await_create_temp(create_target, Duration::from_millis(10)).await });
+
+        tokio::time::timeout(Duration::from_secs(2), barrier.opened.notified()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!creation.is_finished(), "timed-out create must still be structurally awaited");
+        assert!(!temp_path.exists());
+
+        release_test_blocking_barrier(&barrier);
+        let completion = creation.await.unwrap().unwrap();
+        assert!(completion.timed_out);
+        drop(completion.file);
+        assert!(temp_path.exists());
+        anchored.remove_owned_temp(&completion.identity).unwrap();
+        assert!(!temp_path.exists());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!temp_path.exists(), "no detached create may recreate the file after cleanup");
+    }
+
+    #[tokio::test]
+    async fn unsupported_atomic_rename_is_rejected_without_a_hard_link_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("download.bin");
+        let temp_path = parent.join(".dbx-download-unsupported-rename-random.part");
+        let anchored = AnchoredDestination::open(&target, &temp_path, &canonical_directory_identity(&parent)).unwrap();
+        let (mut temp, identity) = anchored.create_temp().unwrap();
+        use std::io::Write;
+        temp.write_all(b"payload").unwrap();
+        temp.sync_all().unwrap();
+        drop(temp);
+        *TEST_UNSUPPORTED_ATOMIC_RENAME
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(temp_path.file_name().unwrap().to_os_string());
+
+        let error = anchored.publish(&identity).unwrap_err();
+        assert!(error.contains("without atomic no-replace rename"), "{error}");
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&temp_path).unwrap(), b"payload");
+        anchored.remove_owned_temp(&identity).unwrap();
+    }
+
+    #[tokio::test]
+    async fn publish_leaf_swap_is_detected_without_deleting_the_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("download.bin");
+        let temp_path = parent.join(".dbx-download-publish-swap-random.part");
+        let displaced = parent.join("displaced-original.part");
+        let anchored =
+            Arc::new(AnchoredDestination::open(&target, &temp_path, &canonical_directory_identity(&parent)).unwrap());
+        let (mut temp, identity) = anchored.create_temp().unwrap();
+        use std::io::Write;
+        temp.write_all(b"owned payload").unwrap();
+        temp.sync_all().unwrap();
+        drop(temp);
+
+        let barrier = install_test_blocking_barrier(&TEST_LEAF_MUTATION_BARRIER, temp_path.file_name().unwrap());
+        let publish_target = anchored.clone();
+        let publish_identity = identity.clone();
+        let publishing = tokio::task::spawn_blocking(move || publish_target.publish(&publish_identity));
+        tokio::time::timeout(Duration::from_secs(2), barrier.opened.notified()).await.unwrap();
+        std::fs::rename(&temp_path, &displaced).unwrap();
+        std::fs::write(&temp_path, b"replacement payload").unwrap();
+        release_test_blocking_barrier(&barrier);
+
+        let error = publishing.await.unwrap().unwrap_err();
+        assert!(error.contains("identity does not match"), "{error}");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"owned payload");
+        assert!(!target.exists());
+        let quarantined = std::fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(".dbx-rejected-publish-"))
+            .expect("rejected replacement must remain quarantined");
+        assert_eq!(std::fs::read(quarantined.path().join("payload.part")).unwrap(), b"replacement payload");
+    }
+
+    #[tokio::test]
+    async fn cleanup_leaf_swap_quarantines_and_preserves_the_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("download.bin");
+        let temp_path = parent.join(".dbx-download-cleanup-swap-random.part");
+        let displaced = parent.join("displaced-original.part");
+        let anchored =
+            Arc::new(AnchoredDestination::open(&target, &temp_path, &canonical_directory_identity(&parent)).unwrap());
+        let (mut temp, identity) = anchored.create_temp().unwrap();
+        use std::io::Write;
+        temp.write_all(b"owned payload").unwrap();
+        temp.sync_all().unwrap();
+        drop(temp);
+
+        let barrier = install_test_blocking_barrier(&TEST_LEAF_MUTATION_BARRIER, temp_path.file_name().unwrap());
+        let cleanup_target = anchored.clone();
+        let cleanup_identity = identity.clone();
+        let cleanup = tokio::task::spawn_blocking(move || cleanup_target.remove_owned_temp(&cleanup_identity));
+        tokio::time::timeout(Duration::from_secs(2), barrier.opened.notified()).await.unwrap();
+        std::fs::rename(&temp_path, &displaced).unwrap();
+        std::fs::write(&temp_path, b"replacement payload").unwrap();
+        release_test_blocking_barrier(&barrier);
+
+        let error = cleanup.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("replacement preserved"));
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"owned payload");
+        let quarantined = std::fs::read_dir(&parent)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(".dbx-cleanup-"))
+            .expect("replacement quarantine must remain");
+        assert_eq!(std::fs::read(quarantined.path().join("payload.part")).unwrap(), b"replacement payload");
     }
 
     #[test]
@@ -1448,7 +1908,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crash_after_temp_create_before_identity_persist_removes_only_random_owned_name() {
+    async fn crash_after_temp_create_before_identity_persist_preserves_unproven_file() {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
         let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
@@ -1485,12 +1945,14 @@ mod tests {
 
         let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
         recover_interrupted_transfer(&state, &interrupted[0]).await.unwrap();
-        assert!(!owned.exists());
-        assert_eq!(state.storage.get_file_transfer("transfer-create-window").await.unwrap().unwrap().status, "failed");
+        assert_eq!(tokio::fs::read(&owned).await.unwrap(), b"partial");
+        let recovered = state.storage.get_file_transfer("transfer-create-window").await.unwrap().unwrap();
+        assert_eq!(recovered.status, "failed");
+        assert!(recovered.error.unwrap().contains("no durable temporary-file identity"));
     }
 
     #[tokio::test]
-    async fn publishing_crash_after_link_is_reconciled_to_completed() {
+    async fn publishing_crash_after_rename_is_reconciled_to_completed() {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
         let target = parent.join("report.csv");
@@ -1531,7 +1993,7 @@ mod tests {
             )
             .await
             .unwrap();
-        anchored.link_temp(&temp_identity).unwrap();
+        anchored.rename_temp_to_target(&temp_identity).unwrap();
 
         let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
         assert_eq!(interrupted[0].status, "publishing");
@@ -1739,6 +2201,15 @@ mod tests {
     async fn disk_full_terminal_snapshot_keeps_all_prior_successful_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
+        let target = parent.join("local.bin");
+        let temp_path = parent.join(".dbx-download-disk-full-random.part");
+        let directory_identity = canonical_directory_identity(&parent);
+        let anchored = AnchoredDestination::open(&target, &temp_path, &directory_identity).unwrap();
+        let (mut temp, temp_identity) = anchored.create_temp().unwrap();
+        use std::io::Write;
+        temp.write_all(&vec![1_u8; 1_024]).unwrap();
+        temp.sync_all().unwrap();
+        drop(temp);
         let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
         storage
             .create_file_transfer(
@@ -1746,8 +2217,21 @@ mod tests {
                 "connection-1".into(),
                 "download".into(),
                 "remote.bin".into(),
-                parent.join("local.bin").to_string_lossy().into_owned(),
-                canonical_directory_identity(&parent),
+                target.to_string_lossy().into_owned(),
+                directory_identity,
+            )
+            .await
+            .unwrap();
+        storage
+            .update_file_transfer(
+                "disk-full",
+                "running".into(),
+                0,
+                Some(2_048),
+                Some(temp_path.to_string_lossy().into_owned()),
+                Some(temp_identity),
+                None,
+                false,
             )
             .await
             .unwrap();
@@ -1768,23 +2252,26 @@ mod tests {
                 .unwrap_err();
         assert!(failure.message.contains("space") || failure.message.contains("No space left"));
 
-        storage
-            .update_file_transfer(
-                "disk-full",
-                "failed".into(),
-                progress.bytes(),
-                progress.total(),
-                None,
-                None,
-                Some(failure.message),
-                true,
-            )
-            .await
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
-        let terminal = storage.get_file_transfer("disk-full").await.unwrap().unwrap();
+        finalize_download_result(app.handle(), &state, "disk-full", Err(failure), &progress).await;
+
+        let runtime = app.state::<FileTransferRuntime>();
+        let terminal = get_file_transfer_inner(&state, runtime.inner(), "disk-full").await.unwrap();
         assert_eq!(terminal.bytes_transferred, 1_024);
         assert_eq!(terminal.total_bytes, Some(2_048));
         assert_eq!(terminal.status, "failed");
+        assert!(!temp_path.exists());
+        assert!(!target.exists());
+        assert!(list_file_transfers_inner(&state, runtime.inner(), Some("connection-1"))
+            .await
+            .unwrap()
+            .iter()
+            .any(|record| record.id == "disk-full" && record.status == "failed" && record.bytes_transferred == 1_024));
     }
 
     #[tokio::test]
@@ -1956,6 +2443,25 @@ mod tests {
             .manage(FileTransferRuntime::default())
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
+
+        let create_cancel_target = download_directory.join("create-cancel.bin");
+        let create_barrier = install_test_blocking_barrier(&TEST_CREATE_TEMP_BARRIER, OsStr::new("*"));
+        let (create_cancel_token, create_cancel_worker) =
+            create_worker_transfer(&app, "ftp-create-cancel", "fixture.txt", &create_cancel_target).await;
+        tokio::time::timeout(Duration::from_secs(10), create_barrier.opened.notified())
+            .await
+            .expect("temporary-file create must reach its explicit barrier");
+        state.storage.request_file_transfer_cancel("ftp-create-cancel").await.unwrap();
+        create_cancel_token.cancel();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!create_cancel_worker.is_finished(), "worker cleanup must wait for the blocking create task");
+        release_test_blocking_barrier(&create_barrier);
+        create_cancel_worker.await.unwrap();
+        let create_cancelled = state.storage.get_file_transfer("ftp-create-cancel").await.unwrap().unwrap();
+        assert_eq!(create_cancelled.status, "cancelled");
+        assert_eq!(create_cancelled.bytes_transferred, 0);
+        assert!(!create_cancel_target.exists());
+        assert_no_owned_temp(&download_directory, "ftp-create-cancel");
 
         let success_target = download_directory.join("success.txt");
         let (_, success_worker) = create_worker_transfer(&app, "ftp-success", "fixture.txt", &success_target).await;

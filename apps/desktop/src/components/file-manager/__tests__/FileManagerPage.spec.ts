@@ -107,7 +107,6 @@ function transfer(id: string, status: FileTransfer["status"], overrides: Partial
     direction: "download",
     remotePath: `${id}.bin`,
     localPath: `/tmp/${id}.bin`,
-    tempPath: null,
     status,
     bytesTransferred: 0,
     totalBytes: 100,

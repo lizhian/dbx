@@ -635,6 +635,10 @@ impl CancellationSignal {
             Ok(())
         }
     }
+
+    pub(super) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 impl OperationLease {

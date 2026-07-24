@@ -253,7 +253,6 @@ export interface FileTransfer {
   direction: "download";
   remotePath: string;
   localPath: string;
-  tempPath?: string | null;
   status: FileTransferStatus;
   bytesTransferred: number;
   totalBytes?: number | null;
