@@ -1167,6 +1167,7 @@ pub fn run() {
     builder
         .manage(CloseBehaviorState::new())
         .manage(AppLocaleState::new())
+        .manage(commands::file_manager::FileManagerRuntime::default())
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
                 if let Some(state) = webview.app_handle().try_state::<CloseBehaviorState>() {
@@ -1372,6 +1373,11 @@ pub fn run() {
             commands::connection::load_connections,
             commands::connection::save_sidebar_layout,
             commands::connection::load_sidebar_layout,
+            commands::file_manager::list_file_connections,
+            commands::file_manager::save_file_connection,
+            commands::file_manager::delete_file_connection,
+            commands::file_manager::test_file_connection,
+            commands::file_manager::list_file_root,
             commands::plugins::list_plugins,
             commands::plugins::list_jdbc_drivers,
             commands::plugins::list_jdbc_maven_bundles,

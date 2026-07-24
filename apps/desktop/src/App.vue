@@ -11,6 +11,7 @@ import EditorToolbar from "@/components/layout/EditorToolbar.vue";
 import ContentArea from "@/components/layout/ContentArea.vue";
 import AppDialogs from "@/components/layout/AppDialogs.vue";
 import WelcomeScreen from "@/components/layout/WelcomeScreen.vue";
+const FileManagerPage = defineAsyncComponent(() => import("@/components/file-manager/FileManagerPage.vue"));
 import type { ConfigTab } from "@/components/connection/ConnectionDialog.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
@@ -172,9 +173,12 @@ const showQueryEditorDdlDialog = ref(false);
 const showQueryEditorObjectSourceDialog = ref(false);
 const driverStoreTabOpen = ref(false);
 const driverStoreActive = ref(false);
+const fileManagerTabOpen = ref(false);
+const fileManagerActive = ref(false);
 const driverStoreActiveTab = ref<"agent" | "jdbc" | "storage" | "runtime">("agent");
-const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome");
+const settingsReturnSurface = ref<"query" | "driverStore" | "fileManager" | "welcome">("welcome");
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
+const showFileManager = computed(() => fileManagerTabOpen.value && fileManagerActive.value);
 const showSettingsPage = computed(() => settingsPageTabOpen.value && settingsStore.settingsPageActive);
 const showQuickOpen = ref(false);
 const agentDriverUpdateCount = ref(0);
@@ -349,7 +353,7 @@ function openSettings(initialTab = "appearance", initialSection?: string) {
   settingsInitialTab.value = initialTab;
   settingsInitialSection.value = initialSection;
   if (!settingsStore.settingsPageActive) {
-    settingsReturnSurface.value = showDriverStore.value ? "driverStore" : activeTab.value ? "query" : "welcome";
+    settingsReturnSurface.value = showDriverStore.value ? "driverStore" : showFileManager.value ? "fileManager" : activeTab.value ? "query" : "welcome";
   }
   activateSettingsPage();
 }
@@ -367,6 +371,7 @@ function activateSettingsPage() {
   settingsPageTabOpen.value = true;
   settingsStore.settingsPageActive = true;
   driverStoreActive.value = false;
+  fileManagerActive.value = false;
 }
 
 function closeSettingsPage() {
@@ -376,7 +381,12 @@ function closeSettingsPage() {
     driverStoreActive.value = true;
     return;
   }
+  if (settingsReturnSurface.value === "fileManager" && fileManagerTabOpen.value) {
+    fileManagerActive.value = true;
+    return;
+  }
   driverStoreActive.value = false;
+  fileManagerActive.value = false;
 }
 
 const driverStoreFocus = ref<DriverStoreFocus | null>(null);
@@ -394,6 +404,7 @@ function openDriverStorePage(target?: "agent" | "jdbc" | "storage" | "runtime" |
   driverStoreTabOpen.value = true;
   driverStoreActive.value = true;
   settingsStore.settingsPageActive = false;
+  fileManagerActive.value = false;
 }
 
 function closeDriverStorePage() {
@@ -401,6 +412,19 @@ function closeDriverStorePage() {
   driverStoreActive.value = false;
   driverStoreActiveTab.value = "agent";
   driverStoreFocus.value = null;
+}
+
+function openFileManagerPage() {
+  if (!isDesktop) return;
+  fileManagerTabOpen.value = true;
+  fileManagerActive.value = true;
+  driverStoreActive.value = false;
+  settingsStore.settingsPageActive = false;
+}
+
+function closeFileManagerPage() {
+  fileManagerTabOpen.value = false;
+  fileManagerActive.value = false;
 }
 const toolbarAgentDriverUpdateCount = computed(() => (updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0));
 const toolbarHasUpdateAvailable = computed(() => updateNotificationsEnabled.value && hasUpdateAvailable.value);
@@ -541,6 +565,7 @@ watch(
     if (id) newQueryContextSource.value = "tab";
     if (id && driverStoreActive.value) driverStoreActive.value = false;
     if (id && settingsStore.settingsPageActive) settingsStore.settingsPageActive = false;
+    if (id && fileManagerActive.value) fileManagerActive.value = false;
     selectedSql.value = "";
     activeOutputView.value = "result";
     if (id) queryStore.reloadEvictedTab(id);
@@ -1797,6 +1822,7 @@ function activateQueryTab(tabId: string): boolean {
   queryStore.activeTabId = tabId;
   driverStoreActive.value = false;
   settingsStore.settingsPageActive = false;
+  fileManagerActive.value = false;
   return true;
 }
 
@@ -1890,6 +1916,8 @@ function handleKeydown(e: KeyboardEvent) {
       closeSettingsPage();
     } else if (showDriverStore.value) {
       closeDriverStorePage();
+    } else if (showFileManager.value) {
+      closeFileManagerPage();
     } else if (queryStore.activeTabId) {
       queryStore.closeTab(queryStore.activeTabId);
     }
@@ -2143,6 +2171,7 @@ onUnmounted(() => {
           :show-sql-library="showSqlLibraryPanel"
           :show-sql-file-panel="showSqlFilePanel"
           :show-driver-store="showDriverStore"
+          :show-file-manager="showFileManager"
           :show-settings-page="showSettingsPage"
           :checking-updates="checkingUpdates"
           :has-update-available="toolbarHasUpdateAvailable"
@@ -2159,6 +2188,7 @@ onUnmounted(() => {
           @open-github="openGitHub"
           @open-settings="openSettings()"
           @open-driver-store="openDriverStorePage"
+          @open-file-manager="openFileManagerPage"
           @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
           @open-sql-file="dialogs.showSqlFileDialog.value = true"
@@ -2180,16 +2210,21 @@ onUnmounted(() => {
                 ref="appTabBarRef"
                 :driver-store-open="driverStoreTabOpen"
                 :driver-store-active="driverStoreActive"
+                :file-manager-open="fileManagerTabOpen"
+                :file-manager-active="fileManagerActive"
                 :settings-page-open="settingsPageTabOpen"
                 :settings-page-active="settingsStore.settingsPageActive"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
                 @activate-driver-store="openDriverStorePage"
+                @activate-file-manager="openFileManagerPage"
                 @activate-settings-page="activateSettingsPage"
                 @activate-tab="
                   driverStoreActive = false;
                   settingsStore.settingsPageActive = false;
+                  fileManagerActive = false;
                 "
                 @close-driver-store="closeDriverStorePage"
+                @close-file-manager="closeFileManagerPage"
                 @close-settings-page="closeSettingsPage"
                 @save-tab="handleSaveTab"
                 @discard-tab-close="handleDiscardPendingTabClose"
@@ -2198,6 +2233,7 @@ onUnmounted(() => {
                 @cancel-tab-close="cancelPendingAppClose"
               />
               <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
+              <FileManagerPage v-if="isDesktop && fileManagerTabOpen" v-show="fileManagerActive" class="flex-1 min-h-0" />
               <EditorSettingsPage
                 v-if="settingsPageTabOpen"
                 v-show="settingsStore.settingsPageActive"
@@ -2209,7 +2245,7 @@ onUnmounted(() => {
                 class="flex-1 min-h-0"
                 @update:open="(open: boolean) => (open ? activateSettingsPage() : closeSettingsPage())"
               />
-              <div v-if="activeTab" v-show="!driverStoreActive && !settingsStore.settingsPageActive" class="flex flex-col flex-1 min-h-0">
+              <div v-if="activeTab" v-show="!driverStoreActive && !settingsStore.settingsPageActive && !fileManagerActive" class="flex flex-col flex-1 min-h-0">
                 <EditorToolbar
                   v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
                   :active-tab="activeTab"
@@ -2319,7 +2355,7 @@ onUnmounted(() => {
                 </KeepAlive>
               </div>
               <WelcomeScreen
-                v-else-if="!driverStoreActive && !settingsStore.settingsPageActive"
+                v-else-if="!driverStoreActive && !settingsStore.settingsPageActive && !fileManagerActive"
                 :connection-stats="connectionStats"
                 :recent-connections="recentConnections"
                 :saved-sql-history-items="savedSqlHistoryItems"

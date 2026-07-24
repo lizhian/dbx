@@ -1,0 +1,1027 @@
+use std::collections::HashMap;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+
+use dbx_core::connection::AppState;
+use dbx_core::storage::FileConnectionStorageRecord;
+use opendal::services::Ftp;
+use opendal::Operator;
+use serde::{Deserialize, Serialize};
+use suppaftp::tokio::AsyncFtpStream;
+use tauri::State;
+use tokio::net::{lookup_host, TcpStream};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
+use url::Url;
+use uuid::Uuid;
+
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
+const LIST_TIMEOUT: Duration = Duration::from_secs(30);
+const DELETE_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+pub struct FileManagerRuntime {
+    operators: RwLock<HashMap<String, CachedOperator>>,
+    lifecycles: Arc<Mutex<HashMap<String, Arc<ConnectionRuntime>>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionLifecycle {
+    Active,
+    Deleting,
+}
+
+struct ConnectionRuntime {
+    state: Mutex<ConnectionRuntimeState>,
+    idle: Notify,
+    list_lock: AsyncMutex<()>,
+}
+
+struct ConnectionRuntimeState {
+    lifecycle: ConnectionLifecycle,
+    in_flight: usize,
+    cancellation: Arc<CancellationSignal>,
+}
+
+#[derive(Default)]
+struct CancellationSignal {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+struct OperationLease {
+    connection_id: String,
+    entry: Arc<ConnectionRuntime>,
+    lifecycles: Arc<Mutex<HashMap<String, Arc<ConnectionRuntime>>>>,
+    cancellation: Arc<CancellationSignal>,
+}
+
+struct DeleteLease {
+    connection_id: String,
+    entry: Arc<ConnectionRuntime>,
+    lifecycles: Arc<Mutex<HashMap<String, Arc<ConnectionRuntime>>>>,
+}
+
+struct CachedOperator {
+    revision: i64,
+    operator: Operator,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileConnectionConfig {
+    Ftp(FtpConnectionConfig),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FtpConnectionConfig {
+    pub endpoint: String,
+    pub root: String,
+    #[serde(default)]
+    pub username: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileConnectionSecrets {
+    pub password: Option<String>,
+    #[serde(default)]
+    pub clear_password: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileConnectionInput {
+    pub id: Option<String>,
+    pub expected_revision: Option<i64>,
+    pub name: String,
+    pub config: FileConnectionConfig,
+    pub secrets: Option<FileConnectionSecrets>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileConnection {
+    pub id: String,
+    pub name: String,
+    pub config: FileConnectionConfig,
+    pub revision: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub has_password: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionTestStage {
+    pub stage: &'static str,
+    pub status: &'static str,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileConnectionTestResult {
+    pub success: bool,
+    pub stages: Vec<ConnectionTestStage>,
+}
+
+#[tauri::command]
+pub async fn list_file_connections(state: State<'_, std::sync::Arc<AppState>>) -> Result<Vec<FileConnection>, String> {
+    state.storage.list_file_connections().await?.into_iter().map(file_connection_from_storage).collect()
+}
+
+#[tauri::command]
+pub async fn save_file_connection(
+    state: State<'_, std::sync::Arc<AppState>>,
+    runtime: State<'_, FileManagerRuntime>,
+    mut input: FileConnectionInput,
+) -> Result<FileConnection, String> {
+    validate_input(&input)?;
+    normalize_input(&mut input)?;
+    let id = input.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+    let _lease = runtime.begin_operation(&id)?;
+
+    let config_json = serde_json::to_string(&input.config).map_err(|error| error.to_string())?;
+    let password = input.secrets.as_ref().and_then(|secrets| secrets.password.clone());
+    let replace_secret = password.is_some() || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_password);
+    let password_scope = password_scope(&input.config)?;
+    let record = state
+        .storage
+        .save_file_connection(
+            id.clone(),
+            input.name.trim().to_string(),
+            config_kind(&input.config).to_string(),
+            config_json,
+            password,
+            password_scope,
+            replace_secret,
+            input.expected_revision,
+        )
+        .await?;
+    runtime.evict(&id);
+    file_connection_from_storage(record)
+}
+
+#[tauri::command]
+pub async fn delete_file_connection(
+    state: State<'_, std::sync::Arc<AppState>>,
+    runtime: State<'_, FileManagerRuntime>,
+    connection_id: String,
+) -> Result<(), String> {
+    let deleting = runtime.start_delete(&connection_id)?;
+    if let Err(error) = deleting.wait_for_idle().await {
+        deleting.restore_active();
+        return Err(error);
+    }
+    let result = state.storage.delete_file_connection(&connection_id).await;
+    match result {
+        Ok(true) => {
+            runtime.evict(&connection_id);
+            deleting.finish();
+            Ok(())
+        }
+        Ok(false) => {
+            deleting.restore_active();
+            Err("File connection not found".to_string())
+        }
+        Err(error) => {
+            deleting.restore_active();
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn test_file_connection(
+    state: State<'_, std::sync::Arc<AppState>>,
+    runtime: State<'_, FileManagerRuntime>,
+    mut input: FileConnectionInput,
+) -> Result<FileConnectionTestResult, String> {
+    let lease = match input.id.as_deref() {
+        Some(id) => Some(runtime.begin_operation(id)?),
+        None => None,
+    };
+    if validate_input(&input).is_err() {
+        return Ok(test_ftp_connection(&input, None).await);
+    }
+    normalize_input(&mut input)?;
+    let password = resolve_input_password(&state, &input).await?;
+    match lease {
+        Some(lease) => {
+            let cancellation = lease.cancellation();
+            tokio::select! {
+                result = test_ftp_connection(&input, password.as_deref()) => Ok(result),
+                _ = cancellation.cancelled() => Err("File connection is being deleted".to_string()),
+            }
+        }
+        None => Ok(test_ftp_connection(&input, password.as_deref()).await),
+    }
+}
+
+#[tauri::command]
+pub async fn list_file_root(
+    state: State<'_, std::sync::Arc<AppState>>,
+    runtime: State<'_, FileManagerRuntime>,
+    connection_id: String,
+) -> Result<Vec<FileEntry>, String> {
+    let lease = runtime.begin_operation(&connection_id)?;
+    let record = state
+        .storage
+        .load_file_connection(&connection_id)
+        .await?
+        .ok_or_else(|| "File connection not found".to_string())?;
+    let revision = record.revision;
+    let config = match parse_storage_config(&record) {
+        Ok(config) => config,
+        Err(error) => {
+            runtime.evict_revision(&connection_id, revision);
+            return Err(error);
+        }
+    };
+    let cancellation = lease.cancellation();
+    run_list_operation(&runtime, &connection_id, revision, &cancellation, LIST_TIMEOUT, async {
+        // The tracer intentionally permits one root browse per connection at a
+        // time so concurrent refreshes cannot create duplicate FTP sessions.
+        let _list_guard = lease.entry.list_lock.lock().await;
+        let scope = password_scope(&config)?;
+        let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
+        let operator = runtime.operator_for(&record, &config, password.as_deref())?;
+        verify_ftp_root_read_only(&config, password.as_deref()).await?;
+        let list_path = configured_root_list_path(&config);
+        let entries =
+            operator.list(&list_path).await.map_err(|error| redact_error(error.to_string(), password.as_deref()))?;
+        entries
+            .into_iter()
+            .map(|entry| {
+                let metadata = entry.metadata();
+                Ok(FileEntry {
+                    path: root_relative_entry_path(&list_path, entry.path())?,
+                    name: entry.name().trim_end_matches('/').to_string(),
+                    kind: if metadata.mode().is_dir() { "directory" } else { "file" }.to_string(),
+                    size: metadata.content_length(),
+                    last_modified: metadata.last_modified().map(|value| value.to_string()),
+                })
+            })
+            .collect()
+    })
+    .await
+}
+
+impl FileManagerRuntime {
+    fn begin_operation(&self, connection_id: &str) -> Result<OperationLease, String> {
+        let mut lifecycles = self.lifecycles.lock().unwrap_or_else(|error| error.into_inner());
+        let entry = lifecycles
+            .entry(connection_id.to_string())
+            .or_insert_with(|| Arc::new(ConnectionRuntime::default()))
+            .clone();
+        let mut state = entry.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle == ConnectionLifecycle::Deleting {
+            return Err("File connection is being deleted".to_string());
+        }
+        state.in_flight += 1;
+        let cancellation = state.cancellation.clone();
+        drop(state);
+        drop(lifecycles);
+        Ok(OperationLease {
+            connection_id: connection_id.to_string(),
+            entry,
+            lifecycles: self.lifecycles.clone(),
+            cancellation,
+        })
+    }
+
+    fn start_delete(&self, connection_id: &str) -> Result<DeleteLease, String> {
+        let mut lifecycles = self.lifecycles.lock().unwrap_or_else(|error| error.into_inner());
+        let entry = lifecycles
+            .entry(connection_id.to_string())
+            .or_insert_with(|| Arc::new(ConnectionRuntime::default()))
+            .clone();
+        let mut state = entry.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.lifecycle == ConnectionLifecycle::Deleting {
+            return Err("File connection is being deleted".to_string());
+        }
+        state.lifecycle = ConnectionLifecycle::Deleting;
+        state.cancellation.cancel();
+        drop(state);
+        drop(lifecycles);
+        Ok(DeleteLease { connection_id: connection_id.to_string(), entry, lifecycles: self.lifecycles.clone() })
+    }
+
+    fn evict(&self, connection_id: &str) {
+        self.operators.write().unwrap_or_else(|error| error.into_inner()).remove(connection_id);
+    }
+
+    fn evict_revision(&self, connection_id: &str, revision: i64) {
+        let mut operators = self.operators.write().unwrap_or_else(|error| error.into_inner());
+        if operators.get(connection_id).is_some_and(|cached| cached.revision == revision) {
+            operators.remove(connection_id);
+        }
+    }
+
+    fn operator_for(
+        &self,
+        record: &FileConnectionStorageRecord,
+        config: &FileConnectionConfig,
+        password: Option<&str>,
+    ) -> Result<Operator, String> {
+        if let Some(cached) = self
+            .operators
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&record.id)
+            .filter(|cached| cached.revision == record.revision)
+        {
+            return Ok(cached.operator.clone());
+        }
+
+        let operator = build_operator(config, password)?;
+        self.operators
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(record.id.clone(), CachedOperator { revision: record.revision, operator: operator.clone() });
+        Ok(operator)
+    }
+
+    #[cfg(test)]
+    fn lifecycle_count(&self) -> usize {
+        self.lifecycles.lock().unwrap_or_else(|error| error.into_inner()).len()
+    }
+
+    #[cfg(test)]
+    fn operator_count(&self) -> usize {
+        self.operators.read().unwrap_or_else(|error| error.into_inner()).len()
+    }
+}
+
+impl Default for ConnectionRuntime {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ConnectionRuntimeState {
+                lifecycle: ConnectionLifecycle::Active,
+                in_flight: 0,
+                cancellation: Arc::new(CancellationSignal::default()),
+            }),
+            idle: Notify::new(),
+            list_lock: AsyncMutex::new(()),
+        }
+    }
+}
+
+impl CancellationSignal {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl OperationLease {
+    fn cancellation(&self) -> Arc<CancellationSignal> {
+        self.cancellation.clone()
+    }
+}
+
+impl Drop for OperationLease {
+    fn drop(&mut self) {
+        let mut lifecycles = self.lifecycles.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.entry.state.lock().unwrap_or_else(|error| error.into_inner());
+        debug_assert!(state.in_flight > 0);
+        state.in_flight = state.in_flight.saturating_sub(1);
+        let became_idle = state.in_flight == 0;
+        let remove = became_idle
+            && state.lifecycle == ConnectionLifecycle::Active
+            && lifecycles.get(&self.connection_id).is_some_and(|entry| Arc::ptr_eq(entry, &self.entry));
+        drop(state);
+        if became_idle {
+            self.entry.idle.notify_waiters();
+        }
+        if remove {
+            lifecycles.remove(&self.connection_id);
+        }
+    }
+}
+
+impl DeleteLease {
+    async fn wait_for_idle(&self) -> Result<(), String> {
+        tokio::time::timeout(DELETE_WAIT_TIMEOUT, async {
+            loop {
+                let notified = self.entry.idle.notified();
+                if self.entry.state.lock().unwrap_or_else(|error| error.into_inner()).in_flight == 0 {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| "Timed out waiting for file operations to stop; connection was not deleted".to_string())
+    }
+
+    fn restore_active(&self) {
+        let mut lifecycles = self.lifecycles.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.entry.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.lifecycle = ConnectionLifecycle::Active;
+        state.cancellation = Arc::new(CancellationSignal::default());
+        let remove = state.in_flight == 0
+            && lifecycles.get(&self.connection_id).is_some_and(|entry| Arc::ptr_eq(entry, &self.entry));
+        drop(state);
+        if remove {
+            lifecycles.remove(&self.connection_id);
+        }
+    }
+
+    fn finish(&self) {
+        let mut lifecycles = self.lifecycles.lock().unwrap_or_else(|error| error.into_inner());
+        if lifecycles.get(&self.connection_id).is_some_and(|entry| Arc::ptr_eq(entry, &self.entry)) {
+            lifecycles.remove(&self.connection_id);
+        }
+    }
+}
+
+async fn resolve_input_password(state: &AppState, input: &FileConnectionInput) -> Result<Option<String>, String> {
+    if input.secrets.as_ref().is_some_and(|secrets| secrets.clear_password) {
+        return Ok(None);
+    }
+    if let Some(password) = input.secrets.as_ref().and_then(|secrets| secrets.password.clone()) {
+        return Ok(Some(password));
+    }
+    match input.id.as_deref() {
+        Some(id) => {
+            let record =
+                state.storage.load_file_connection(id).await?.ok_or_else(|| "File connection not found".to_string())?;
+            if input.expected_revision != Some(record.revision) {
+                return Err("Saved password cannot be reused after the connection revision changed".to_string());
+            }
+            let stored_config = parse_storage_config(&record)?;
+            let input_scope = password_scope(&input.config)?;
+            if input_scope != password_scope(&stored_config)? {
+                return Err("Re-enter or clear the password after changing the FTP endpoint or username".to_string());
+            }
+            state.storage.load_file_connection_password(id, &input_scope).await
+        }
+        None => Ok(None),
+    }
+}
+
+async fn run_with_deadline_and_cancellation<T, F>(
+    cancellation: &CancellationSignal,
+    deadline: Duration,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::select! {
+        _ = cancellation.cancelled() => Err("File connection is being deleted".to_string()),
+        result = tokio::time::timeout(deadline, future) => {
+            result.map_err(|_| "FTP root listing timed out".to_string())?
+        }
+    }
+}
+
+async fn run_list_operation<T, F>(
+    runtime: &FileManagerRuntime,
+    connection_id: &str,
+    revision: i64,
+    cancellation: &CancellationSignal,
+    deadline: Duration,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    let result = run_with_deadline_and_cancellation(cancellation, deadline, future).await;
+    if result.is_err() {
+        runtime.evict_revision(connection_id, revision);
+    }
+    result
+}
+
+async fn test_ftp_connection(input: &FileConnectionInput, password: Option<&str>) -> FileConnectionTestResult {
+    let mut stages = Vec::with_capacity(5);
+    if let Err(error) = validate_input(input) {
+        stages.push(failed_stage("configuration", error));
+        append_skipped_stages(&mut stages, &["dns", "tcp", "authentication", "root"]);
+        return FileConnectionTestResult { success: false, stages };
+    }
+    stages.push(passed_stage("configuration"));
+
+    let FileConnectionConfig::Ftp(config) = &input.config;
+    let (host, port) = endpoint_host_port(&config.endpoint).expect("validated endpoint");
+    let addresses = match resolve_addresses(&host, port).await {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            stages.push(failed_stage("dns", error));
+            append_skipped_stages(&mut stages, &["tcp", "authentication", "root"]);
+            return FileConnectionTestResult { success: false, stages };
+        }
+    };
+    if addresses.is_empty() {
+        stages.push(failed_stage("dns", "No addresses returned".to_string()));
+        append_skipped_stages(&mut stages, &["tcp", "authentication", "root"]);
+        return FileConnectionTestResult { success: false, stages };
+    }
+    stages.push(passed_stage("dns"));
+
+    let address = match connect_first(&addresses).await {
+        Ok(address) => address,
+        Err(error) => {
+            stages.push(failed_stage("tcp", error));
+            append_skipped_stages(&mut stages, &["authentication", "root"]);
+            return FileConnectionTestResult { success: false, stages };
+        }
+    };
+    stages.push(passed_stage("tcp"));
+
+    let mut ftp = match tokio::time::timeout(CONNECTION_TIMEOUT, AsyncFtpStream::connect(address)).await {
+        Ok(Ok(ftp)) => ftp,
+        Ok(Err(error)) => {
+            stages.push(failed_stage("authentication", redact_error(error.to_string(), password)));
+            stages.push(skipped_stage("root"));
+            return FileConnectionTestResult { success: false, stages };
+        }
+        Err(_) => {
+            stages.push(failed_stage("authentication", "FTP greeting timed out".to_string()));
+            stages.push(skipped_stage("root"));
+            return FileConnectionTestResult { success: false, stages };
+        }
+    };
+    let (username, resolved_password) = ftp_credentials(config, password);
+    match tokio::time::timeout(CONNECTION_TIMEOUT, ftp.login(&username, &resolved_password)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            stages.push(failed_stage("authentication", redact_error(error.to_string(), password)));
+            stages.push(skipped_stage("root"));
+            return FileConnectionTestResult { success: false, stages };
+        }
+        Err(_) => {
+            stages.push(failed_stage("authentication", "FTP login timed out".to_string()));
+            stages.push(skipped_stage("root"));
+            return FileConnectionTestResult { success: false, stages };
+        }
+    }
+    stages.push(passed_stage("authentication"));
+
+    match tokio::time::timeout(CONNECTION_TIMEOUT, ftp.cwd(&config.root)).await {
+        Ok(Ok(())) => {
+            stages.push(passed_stage("root"));
+            let _ = ftp.quit().await;
+            FileConnectionTestResult { success: true, stages }
+        }
+        Ok(Err(error)) => {
+            stages.push(failed_stage("root", redact_error(error.to_string(), password)));
+            FileConnectionTestResult { success: false, stages }
+        }
+        Err(_) => {
+            stages.push(failed_stage("root", "FTP root check timed out".to_string()));
+            FileConnectionTestResult { success: false, stages }
+        }
+    }
+}
+
+async fn connect_first(addresses: &[SocketAddr]) -> Result<SocketAddr, String> {
+    let mut last_error = "No address available".to_string();
+    for address in addresses {
+        match tokio::time::timeout(CONNECTION_TIMEOUT, TcpStream::connect(address)).await {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                return Ok(*address);
+            }
+            Ok(Err(error)) => last_error = error.to_string(),
+            Err(_) => last_error = "TCP connection timed out".to_string(),
+        }
+    }
+    Err(last_error)
+}
+
+async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    tokio::time::timeout(CONNECTION_TIMEOUT, lookup_host((host, port)))
+        .await
+        .map_err(|_| "DNS lookup timed out".to_string())?
+        .map(|addresses| addresses.collect())
+        .map_err(|error| error.to_string())
+}
+
+async fn verify_ftp_root_read_only(config: &FileConnectionConfig, password: Option<&str>) -> Result<(), String> {
+    let FileConnectionConfig::Ftp(config) = config;
+    let (host, port) = endpoint_host_port(&config.endpoint)?;
+    let addresses = resolve_addresses(&host, port).await.map_err(|error| format!("DNS stage failed: {error}"))?;
+    let address = connect_first(&addresses).await.map_err(|error| format!("TCP stage failed: {error}"))?;
+    let mut ftp = tokio::time::timeout(CONNECTION_TIMEOUT, AsyncFtpStream::connect(address))
+        .await
+        .map_err(|_| "Authentication stage failed: FTP greeting timed out".to_string())?
+        .map_err(|error| format!("Authentication stage failed: {}", redact_error(error.to_string(), password)))?;
+    let (username, resolved_password) = ftp_credentials(config, password);
+    tokio::time::timeout(CONNECTION_TIMEOUT, ftp.login(&username, &resolved_password))
+        .await
+        .map_err(|_| "Authentication stage failed: FTP login timed out".to_string())?
+        .map_err(|error| format!("Authentication stage failed: {}", redact_error(error.to_string(), password)))?;
+    tokio::time::timeout(CONNECTION_TIMEOUT, ftp.cwd(&config.root))
+        .await
+        .map_err(|_| "Root stage failed: FTP root check timed out".to_string())?
+        .map_err(|error| format!("Root stage failed: {}", redact_error(error.to_string(), password)))?;
+    let _ = ftp.quit().await;
+    Ok(())
+}
+
+fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
+    if input.name.trim().is_empty() {
+        return Err("Connection name is required".to_string());
+    }
+    match &input.config {
+        FileConnectionConfig::Ftp(config) => {
+            endpoint_host_port(&config.endpoint)?;
+            normalize_ftp_root(&config.root)?;
+            Ok(())
+        }
+    }
+}
+
+fn endpoint_host_port(endpoint: &str) -> Result<(String, u16), String> {
+    let url = Url::parse(endpoint).map_err(|_| "FTP endpoint must be a valid ftp:// URL".to_string())?;
+    if url.scheme() != "ftp" {
+        return Err("Only unencrypted ftp:// endpoints are supported".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Credentials must not be embedded in the FTP endpoint".to_string());
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err("FTP endpoint must not contain a path, query, or fragment; use the root field".to_string());
+    }
+    let host = url.host_str().ok_or_else(|| "FTP endpoint host is required".to_string())?;
+    Ok((host.to_string(), url.port().unwrap_or(21)))
+}
+
+fn build_operator(config: &FileConnectionConfig, password: Option<&str>) -> Result<Operator, String> {
+    match config {
+        FileConnectionConfig::Ftp(config) => {
+            let (username, resolved_password) = ftp_credentials(config, password);
+            let builder =
+                Ftp::default().endpoint(&config.endpoint).root("/").user(&username).password(&resolved_password);
+            Operator::new(builder)
+                .map(|builder| builder.finish())
+                .map_err(|error| redact_error(error.to_string(), password))
+        }
+    }
+}
+
+fn normalize_input(input: &mut FileConnectionInput) -> Result<(), String> {
+    match &mut input.config {
+        FileConnectionConfig::Ftp(config) => {
+            config.endpoint = config.endpoint.trim().trim_end_matches('/').to_string();
+            config.root = normalize_ftp_root(&config.root)?;
+            config.username = config.username.trim().to_string();
+        }
+    }
+    Ok(())
+}
+
+fn normalize_ftp_root(root: &str) -> Result<String, String> {
+    let decoded = percent_encoding::percent_decode_str(root.trim())
+        .decode_utf8()
+        .map_err(|_| "FTP root contains invalid percent-encoded UTF-8".to_string())?;
+    if !decoded.starts_with('/') {
+        return Err("FTP root must be an absolute path beginning with '/'".to_string());
+    }
+    if decoded.contains('\0') || decoded.contains('\\') {
+        return Err("FTP root contains an invalid character".to_string());
+    }
+    let mut normalized = Vec::new();
+    for segment in decoded.split('/').filter(|segment| !segment.is_empty()) {
+        if matches!(segment, "." | "..") {
+            return Err("FTP root cannot contain '.' or '..' path segments".to_string());
+        }
+        normalized.push(segment);
+    }
+    Ok(if normalized.is_empty() { "/".to_string() } else { format!("/{}", normalized.join("/")) })
+}
+
+fn configured_root_list_path(config: &FileConnectionConfig) -> String {
+    match config {
+        FileConnectionConfig::Ftp(config) => {
+            let relative = config.root.trim_matches('/');
+            if relative.is_empty() {
+                "/".to_string()
+            } else {
+                format!("{relative}/")
+            }
+        }
+    }
+}
+
+fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
+    match config {
+        FileConnectionConfig::Ftp(config) => {
+            let (host, port) = endpoint_host_port(&config.endpoint)?;
+            Ok(format!("ftp\n{}\n{port}\n{}", host.to_ascii_lowercase(), config.username))
+        }
+    }
+}
+
+fn root_relative_entry_path(list_path: &str, entry_path: &str) -> Result<String, String> {
+    let root = list_path.trim_matches('/');
+    let candidate = entry_path.trim_start_matches('/');
+    let relative = if root.is_empty() {
+        candidate
+    } else {
+        candidate
+            .strip_prefix(root)
+            .and_then(|path| path.strip_prefix('/'))
+            .ok_or_else(|| "FTP server returned an entry outside the configured root".to_string())?
+    };
+    if relative.is_empty() || relative.starts_with('/') || relative.contains('\0') || relative.contains('\\') {
+        return Err("FTP server returned an invalid entry path".to_string());
+    }
+    let decoded = percent_encoding::percent_decode_str(relative)
+        .decode_utf8()
+        .map_err(|_| "FTP server returned an invalid percent-encoded entry path".to_string())?;
+    if decoded.starts_with('/') || decoded.contains('\0') || decoded.contains('\\') {
+        return Err("FTP server returned an invalid encoded entry path".to_string());
+    }
+    if decoded.split('/').any(|segment| matches!(segment, "." | "..")) {
+        return Err("FTP server returned an unsafe entry path".to_string());
+    }
+    Ok(relative.to_string())
+}
+
+fn ftp_credentials(config: &FtpConnectionConfig, password: Option<&str>) -> (String, String) {
+    if config.username.is_empty() {
+        ("anonymous".to_string(), "anonymous@".to_string())
+    } else {
+        (config.username.clone(), password.unwrap_or_default().to_string())
+    }
+}
+
+fn parse_storage_config(record: &FileConnectionStorageRecord) -> Result<FileConnectionConfig, String> {
+    serde_json::from_str(&record.config_json).map_err(|_| "Stored file connection configuration is invalid".to_string())
+}
+
+fn file_connection_from_storage(record: FileConnectionStorageRecord) -> Result<FileConnection, String> {
+    let config = parse_storage_config(&record)?;
+    Ok(FileConnection {
+        id: record.id,
+        name: record.name,
+        config,
+        revision: record.revision,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+        has_password: record.has_secret,
+    })
+}
+
+fn config_kind(config: &FileConnectionConfig) -> &'static str {
+    match config {
+        FileConnectionConfig::Ftp(_) => "ftp",
+    }
+}
+
+fn redact_error(mut message: String, password: Option<&str>) -> String {
+    if let Some(password) = password.filter(|password| !password.is_empty()) {
+        message = message.replace(password, "[REDACTED]");
+    }
+    message
+}
+
+fn passed_stage(stage: &'static str) -> ConnectionTestStage {
+    ConnectionTestStage { stage, status: "passed", message: None }
+}
+
+fn failed_stage(stage: &'static str, message: String) -> ConnectionTestStage {
+    ConnectionTestStage { stage, status: "failed", message: Some(message) }
+}
+
+fn skipped_stage(stage: &'static str) -> ConnectionTestStage {
+    ConnectionTestStage { stage, status: "skipped", message: None }
+}
+
+fn append_skipped_stages(stages: &mut Vec<ConnectionTestStage>, remaining: &[&'static str]) {
+    stages.extend(remaining.iter().map(|stage| skipped_stage(stage)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(endpoint: &str, root: &str) -> FileConnectionInput {
+        FileConnectionInput {
+            id: None,
+            expected_revision: None,
+            name: "FTP".to_string(),
+            config: FileConnectionConfig::Ftp(FtpConnectionConfig {
+                endpoint: endpoint.to_string(),
+                root: root.to_string(),
+                username: "demo".to_string(),
+            }),
+            secrets: None,
+        }
+    }
+
+    #[test]
+    fn ftp_validation_rejects_embedded_credentials_and_non_ftp_transport() {
+        assert!(validate_input(&input("ftp://demo:secret@example.test:21", "/")).unwrap_err().contains("embedded"));
+        assert!(validate_input(&input("ftps://example.test:21", "/")).unwrap_err().contains("unencrypted"));
+    }
+
+    #[test]
+    fn ftp_validation_keeps_endpoint_and_root_separate() {
+        assert!(validate_input(&input("ftp://example.test:21/files", "/")).unwrap_err().contains("root field"));
+        assert!(validate_input(&input("ftp://example.test:21", "relative")).unwrap_err().contains("absolute"));
+        assert!(validate_input(&input("ftp://example.test:21", "/")).is_ok());
+        assert!(validate_input(&input("ftp://example.test:21", "/safe/%2e%2e/escape"))
+            .unwrap_err()
+            .contains("path segments"));
+        assert_eq!(normalize_ftp_root("//safe///folder/").unwrap(), "/safe/folder");
+    }
+
+    #[tokio::test]
+    async fn runtime_blocks_new_work_while_deleting() {
+        let runtime = FileManagerRuntime::default();
+        let deleting = runtime.start_delete("ftp-1").unwrap();
+        assert!(runtime.begin_operation("ftp-1").err().unwrap().contains("being deleted"));
+        deleting.restore_active();
+        assert_eq!(runtime.lifecycle_count(), 0);
+        drop(runtime.begin_operation("ftp-1").unwrap());
+        assert_eq!(runtime.lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn tracer_serializes_root_lists_per_connection() {
+        let runtime = FileManagerRuntime::default();
+        let first = runtime.begin_operation("ftp-1").unwrap();
+        let second = runtime.begin_operation("ftp-1").unwrap();
+        let guard = first.entry.list_lock.try_lock().unwrap();
+        assert!(second.entry.list_lock.try_lock().is_err());
+        drop(guard);
+        drop(first);
+        drop(second);
+        assert_eq!(runtime.lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deletion_cancels_a_hanging_list_and_cleans_lifecycle_state() {
+        let runtime = FileManagerRuntime::default();
+        let lease = runtime.begin_operation("ftp-1").unwrap();
+        let cancellation = lease.cancellation();
+        let hanging = tokio::spawn(async move {
+            let result = run_with_deadline_and_cancellation(
+                &cancellation,
+                Duration::from_secs(60),
+                std::future::pending::<Result<(), String>>(),
+            )
+            .await;
+            drop(lease);
+            result
+        });
+        let deleting = runtime.start_delete("ftp-1").unwrap();
+        deleting.wait_for_idle().await.unwrap();
+        assert!(hanging.await.unwrap().unwrap_err().contains("being deleted"));
+        deleting.finish();
+        assert_eq!(runtime.lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_deadline_is_bounded_and_invalid_ids_do_not_accumulate() {
+        let runtime = FileManagerRuntime::default();
+        let lease = runtime.begin_operation("missing").unwrap();
+        let config = input("ftp://127.0.0.1:21", "/").config;
+        let record = FileConnectionStorageRecord {
+            id: "missing".to_string(),
+            name: "Missing".to_string(),
+            kind: "ftp".to_string(),
+            config_json: serde_json::to_string(&config).unwrap(),
+            revision: 7,
+            created_at: String::new(),
+            updated_at: String::new(),
+            has_secret: false,
+        };
+        runtime.operator_for(&record, &config, None).unwrap();
+        assert_eq!(runtime.operator_count(), 1);
+        let cancellation = lease.cancellation();
+        let error = run_list_operation(
+            &runtime,
+            "missing",
+            7,
+            &cancellation,
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("timed out"));
+        assert_eq!(runtime.operator_count(), 0);
+        drop(lease);
+        assert_eq!(runtime.lifecycle_count(), 0);
+    }
+
+    #[test]
+    fn ftp_entry_paths_are_relative_to_the_configured_root() {
+        assert_eq!(root_relative_entry_path("ftp/dbx/", "ftp/dbx/fixture.txt").unwrap(), "fixture.txt");
+        assert_eq!(root_relative_entry_path("/", "fixture.txt").unwrap(), "fixture.txt");
+        assert!(root_relative_entry_path("ftp/dbx/", "ftp/other/fixture.txt").is_err());
+        assert!(root_relative_entry_path("ftp/dbx/", "ftp/dbx/%2e%2e/escape").is_err());
+        assert!(root_relative_entry_path("ftp/dbx/", "ftp/dbx/safe%5cescape").is_err());
+        assert!(root_relative_entry_path("ftp/dbx/", "ftp/dbx/safe%00escape").is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/ftp-contract.sh with a pinned FTP image"]
+    async fn fixed_ftp_service_contract() {
+        let endpoint = std::env::var("DBX_TEST_FTP_ENDPOINT").expect("DBX_TEST_FTP_ENDPOINT is required");
+        let username = std::env::var("DBX_TEST_FTP_USERNAME").unwrap_or_else(|_| "dbx".to_string());
+        let password = std::env::var("DBX_TEST_FTP_PASSWORD").unwrap_or_else(|_| "dbx-password".to_string());
+        let input = FileConnectionInput {
+            id: None,
+            expected_revision: None,
+            name: "FTP contract".to_string(),
+            config: FileConnectionConfig::Ftp(FtpConnectionConfig { endpoint, root: "/ftp/dbx".to_string(), username }),
+            secrets: Some(FileConnectionSecrets { password: Some(password.clone()), clear_password: false }),
+        };
+
+        let result = test_ftp_connection(&input, Some(&password)).await;
+        assert!(result.success, "stages: {}", serde_json::to_string(&result.stages).unwrap());
+
+        let db_path = std::env::temp_dir().join(format!("dbx-ftp-contract-{}.db", Uuid::new_v4()));
+        let storage = dbx_core::storage::Storage::open(&db_path).await.unwrap();
+        let config_json = serde_json::to_string(&input.config).unwrap();
+        let created = storage
+            .save_file_connection(
+                "ftp-contract".to_string(),
+                input.name.clone(),
+                "ftp".to_string(),
+                config_json.clone(),
+                Some(password.clone()),
+                password_scope(&input.config).unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.revision, 1);
+        assert_eq!(storage.list_file_connections().await.unwrap().len(), 1);
+        let updated = storage
+            .save_file_connection(
+                created.id.clone(),
+                "FTP contract edited".to_string(),
+                "ftp".to_string(),
+                config_json,
+                None,
+                password_scope(&input.config).unwrap(),
+                false,
+                Some(created.revision),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+
+        let operator = build_operator(&input.config, Some(&password)).unwrap();
+        let list_path = configured_root_list_path(&input.config);
+        let entries = operator.list(&list_path).await.unwrap();
+        let paths =
+            entries.iter().map(|entry| root_relative_entry_path(&list_path, entry.path()).unwrap()).collect::<Vec<_>>();
+        assert!(paths.iter().any(|path| path == "fixture.txt"), "entries: {paths:?}");
+
+        let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
+            endpoint: match &input.config {
+                FileConnectionConfig::Ftp(config) => config.endpoint.clone(),
+            },
+            root: "/ftp/dbx/must-not-be-created".to_string(),
+            username: match &input.config {
+                FileConnectionConfig::Ftp(config) => config.username.clone(),
+            },
+        });
+        let before =
+            operator.list(&list_path).await.unwrap().iter().map(|entry| entry.path().to_string()).collect::<Vec<_>>();
+        assert!(verify_ftp_root_read_only(&missing_config, Some(&password)).await.is_err());
+        let after =
+            operator.list(&list_path).await.unwrap().iter().map(|entry| entry.path().to_string()).collect::<Vec<_>>();
+        assert_eq!(after, before);
+        assert!(!after.iter().any(|path| path.contains("must-not-be-created")));
+
+        assert!(storage.delete_file_connection(&created.id).await.unwrap());
+        assert!(storage.list_file_connections().await.unwrap().is_empty());
+        drop(storage);
+        std::fs::remove_file(db_path).ok();
+    }
+}

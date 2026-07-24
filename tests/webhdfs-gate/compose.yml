@@ -1,0 +1,31 @@
+services:
+  namenode:
+    image: apache/hadoop:3.4.1
+    platform: linux/amd64
+    hostname: namenode
+    command:
+      - bash
+      - -lc
+      - |
+        if [ ! -d /tmp/hadoop/name/current ]; then
+          hdfs namenode -format -force -nonInteractive
+        fi
+        exec hdfs namenode
+    ports:
+      - "9870:9870"
+    volumes:
+      - ./core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+
+  datanode:
+    image: apache/hadoop:3.4.1
+    platform: linux/amd64
+    hostname: datanode
+    command: ["hdfs", "datanode"]
+    depends_on:
+      - namenode
+    ports:
+      - "9864:9864"
+    volumes:
+      - ./core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro

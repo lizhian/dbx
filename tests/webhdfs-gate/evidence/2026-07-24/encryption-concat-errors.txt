@@ -1,0 +1,5 @@
+same-zone:
+HadoopIllegalArgumentException: concat can not be called for files in an encryption zone.
+
+cross-zone:
+HadoopIllegalArgumentException: concat can not be called for files in an encryption zone.

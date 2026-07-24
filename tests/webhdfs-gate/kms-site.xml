@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<configuration>
+  <property>
+    <name>hadoop.kms.key.provider.uri</name>
+    <value>jceks://file@/tmp/kms/kms.jceks</value>
+  </property>
+  <property>
+    <name>hadoop.kms.authentication.type</name>
+    <value>simple</value>
+  </property>
+</configuration>

@@ -7,6 +7,7 @@ license = "Apache-2.0"
 repository = ""
 edition = "2021"
 rust-version = "1.88.0"
+default-run = "dbx"
 
 [lib]
 name = "dbx_lib"
@@ -17,6 +18,12 @@ default = ["duckdb-bundled", "mq-admin", "sqlite-sqlcipher"]
 duckdb-bundled = ["duckdb", "duckdb/parquet", "dbx-core/duckdb-bundled"]
 mq-admin = ["dbx-core/mq-admin"]
 sqlite-sqlcipher = ["dbx-core/sqlite-sqlcipher"]
+webhdfs-gate = []
+
+[[bin]]
+name = "webhdfs_gate"
+path = "src/bin/webhdfs_gate.rs"
+required-features = ["webhdfs-gate"]
 
 [build-dependencies]
 tauri-build = { version = "2.5.6", features = [] }
@@ -51,6 +58,8 @@ tiberius = { version = "0.12.3", default-features = false, features = ["tds73", 
 tokio-util = { version = "0.7", features = ["compat"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
+bytes = "1"
+opendal = { version = "=0.57.0", default-features = false, features = ["executors-tokio", "reqwest-rustls-tls", "services-ftp", "services-webhdfs"] }
 mongodb = "3.2.5"
 percent-encoding = "2"
 minisign-verify = "0.2.5"
@@ -65,6 +74,8 @@ axum = { version = "0.8", features = ["ws"] }
 font-kit = "0.14.3"
 tauri-plugin-clipboard-manager = "2.3.2"
 sys-locale = "0.3"
+suppaftp = { version = "8.0.3", default-features = false, features = ["tokio"] }
+url = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }

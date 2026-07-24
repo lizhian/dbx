@@ -115,6 +115,10 @@ import type {
   MongoGridFsFileInfo,
   AppSupportInfo,
   PromptTemplate,
+  FileConnection,
+  FileConnectionInput,
+  FileConnectionTestResult,
+  FileManagerEntry,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -289,6 +293,30 @@ export async function saveConnections(configs: ConnectionConfig[]): Promise<void
 
 export async function loadConnections(): Promise<ConnectionConfig[]> {
   return get("/api/connection/list");
+}
+
+function desktopFileManagerUnavailable(): never {
+  throw new Error("File Manager is available in the desktop app only");
+}
+
+export async function listFileConnections(): Promise<FileConnection[]> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function saveFileConnection(_input: FileConnectionInput): Promise<FileConnection> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function deleteFileConnection(_connectionId: string): Promise<void> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function testFileConnection(_input: FileConnectionInput): Promise<FileConnectionTestResult> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function listFileRoot(_connectionId: string): Promise<FileManagerEntry[]> {
+  return desktopFileManagerUnavailable();
 }
 
 export async function loadTunnelProfiles(): Promise<TunnelProfile[]> {

@@ -33,6 +33,8 @@ const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instruction
 const USER_DATA_TABLES: &[&str] = &[
     "connections",
     "connection_secrets",
+    "file_connections",
+    "file_connection_secrets",
     "history",
     "ai_conversations",
     "mq_token_records",
@@ -106,6 +108,19 @@ pub fn maybe_import_user_data_db(
 
 pub struct Storage {
     db: SqliteHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileConnectionStorageRecord {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub config_json: String,
+    pub revision: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub has_secret: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +276,22 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         secret TEXT NOT NULL,
         PRIMARY KEY (connection_id, key)
     )",
+    "CREATE TABLE IF NOT EXISTS file_connections (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        config_json TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS file_connection_secrets (
+        connection_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        secret TEXT NOT NULL,
+        PRIMARY KEY (connection_id, key),
+        FOREIGN KEY (connection_id) REFERENCES file_connections(id) ON DELETE CASCADE
+    )",
     "CREATE TABLE IF NOT EXISTS history (
         id TEXT PRIMARY KEY,
         connection_id TEXT NOT NULL DEFAULT '',
@@ -413,6 +444,243 @@ impl Storage {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || db.with_connection(f)).await.map_err(|e| e.to_string())?
     }
+}
+
+impl Storage {
+    pub async fn save_file_connection(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        config_json: String,
+        secret: Option<String>,
+        secret_scope: String,
+        replace_secret: bool,
+        expected_revision: Option<i64>,
+    ) -> Result<FileConnectionStorageRecord, String> {
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let current_revision = tx
+                .query_row("SELECT revision FROM file_connections WHERE id = ?1", [&id], |row| row.get::<_, i64>(0))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            match (current_revision, expected_revision) {
+                (Some(current), Some(expected)) if current == expected => {
+                    tx.execute(
+                        "UPDATE file_connections
+                         SET name = ?2, kind = ?3, config_json = ?4, revision = revision + 1, updated_at = ?5
+                         WHERE id = ?1",
+                        params![id, name, kind, config_json, now],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                (Some(current), Some(expected)) => {
+                    return Err(format!("File connection revision conflict: expected {expected}, current {current}"));
+                }
+                (Some(_), None) => return Err("File connection revision is required for updates".to_string()),
+                (None, Some(_)) => return Err("File connection not found".to_string()),
+                (None, None) => {
+                    tx.execute(
+                        "INSERT INTO file_connections
+                         (id, name, kind, config_json, revision, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
+                        params![id, name, kind, config_json, now],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+
+            if current_revision.is_some() && !replace_secret {
+                let has_password = tx
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM file_connection_secrets
+                            WHERE connection_id = ?1 AND key = 'password'
+                        )",
+                        [&id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if has_password {
+                    let stored_scope = tx
+                        .query_row(
+                            "SELECT secret FROM file_connection_secrets
+                             WHERE connection_id = ?1 AND key = 'password_scope'",
+                            [&id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?;
+                    if stored_scope.as_deref() != Some(secret_scope.as_str()) {
+                        return Err(
+                            "Re-enter or clear the password after changing the FTP endpoint or username".to_string()
+                        );
+                    }
+                }
+            }
+
+            if replace_secret {
+                tx.execute(
+                    "DELETE FROM file_connection_secrets
+                     WHERE connection_id = ?1 AND key IN ('password', 'password_scope')",
+                    [&id],
+                )
+                .map_err(|error| error.to_string())?;
+                if let Some(secret) = secret.filter(|value| !value.is_empty()) {
+                    tx.execute(
+                        "INSERT INTO file_connection_secrets (connection_id, key, secret)
+                         VALUES (?1, 'password', ?2)",
+                        params![&id, secret],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    tx.execute(
+                        "INSERT INTO file_connection_secrets (connection_id, key, secret)
+                         VALUES (?1, 'password_scope', ?2)",
+                        params![&id, secret_scope],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+
+            let record = query_file_connection_record(&tx, &id)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(record)
+        })
+        .await
+    }
+
+    pub async fn list_file_connections(&self) -> Result<Vec<FileConnectionStorageRecord>, String> {
+        self.with_conn(|conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT f.id, f.name, f.kind, f.config_json, f.revision, f.created_at, f.updated_at,
+                            EXISTS(
+                                SELECT 1 FROM file_connection_secrets s
+                                WHERE s.connection_id = f.id AND s.key = 'password'
+                            )
+                     FROM file_connections f
+                     ORDER BY lower(f.name), f.id",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement.query_map([], map_file_connection_row).map_err(|error| error.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_file_connection(&self, id: &str) -> Result<Option<FileConnectionStorageRecord>, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT f.id, f.name, f.kind, f.config_json, f.revision, f.created_at, f.updated_at,
+                        EXISTS(
+                            SELECT 1 FROM file_connection_secrets s
+                            WHERE s.connection_id = f.id AND s.key = 'password'
+                        )
+                 FROM file_connections f
+                 WHERE f.id = ?1",
+                [&id],
+                map_file_connection_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_file_connection_secret(&self, id: &str, key: &str) -> Result<Option<String>, String> {
+        let id = id.to_string();
+        let key = key.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT secret FROM file_connection_secrets WHERE connection_id = ?1 AND key = ?2",
+                params![id, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_file_connection_password(
+        &self,
+        id: &str,
+        expected_scope: &str,
+    ) -> Result<Option<String>, String> {
+        let id = id.to_string();
+        let expected_scope = expected_scope.to_string();
+        self.with_conn(move |conn| {
+            let password = conn
+                .query_row(
+                    "SELECT secret FROM file_connection_secrets WHERE connection_id = ?1 AND key = 'password'",
+                    [&id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(password) = password else {
+                return Ok(None);
+            };
+            let scope = conn
+                .query_row(
+                    "SELECT secret FROM file_connection_secrets
+                     WHERE connection_id = ?1 AND key = 'password_scope'",
+                    [&id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if scope.as_deref() != Some(expected_scope.as_str()) {
+                return Err("Stored FTP password does not match the endpoint and username; re-enter it".to_string());
+            }
+            Ok(Some(password))
+        })
+        .await
+    }
+
+    pub async fn delete_file_connection(&self, id: &str) -> Result<bool, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            tx.execute("DELETE FROM file_connection_secrets WHERE connection_id = ?1", [&id])
+                .map_err(|error| error.to_string())?;
+            let deleted =
+                tx.execute("DELETE FROM file_connections WHERE id = ?1", [&id]).map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
+}
+
+fn map_file_connection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileConnectionStorageRecord> {
+    Ok(FileConnectionStorageRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        kind: row.get(2)?,
+        config_json: row.get(3)?,
+        revision: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+        has_secret: row.get(7)?,
+    })
+}
+
+fn query_file_connection_record(conn: &Connection, id: &str) -> Result<FileConnectionStorageRecord, String> {
+    conn.query_row(
+        "SELECT f.id, f.name, f.kind, f.config_json, f.revision, f.created_at, f.updated_at,
+                EXISTS(
+                    SELECT 1 FROM file_connection_secrets s
+                    WHERE s.connection_id = f.id AND s.key = 'password'
+                )
+         FROM file_connections f
+         WHERE f.id = ?1",
+        [id],
+        map_file_connection_row,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn inspect_sqlite_db_file(path: &Path) -> Result<SqliteDbFileState, String> {
@@ -5230,6 +5498,145 @@ mod tests {
         storage.save_ai_global_custom_instructions("   \n  \t  ").await.unwrap();
         let loaded = storage.load_ai_global_custom_instructions().await.unwrap();
         assert_eq!(loaded, "");
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn file_connection_crud_separates_secret_and_increments_revision() {
+        let db = temp_db_path("file-connection-crud");
+        let storage = Storage::open(&db).await.unwrap();
+
+        let created = storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP".into(),
+                "ftp".into(),
+                r#"{"endpoint":"ftp://localhost:21","root":"/","username":"demo"}"#.into(),
+                Some("secret-1".into()),
+                "ftp\nlocalhost\n21\ndemo".into(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.revision, 1);
+        assert!(created.has_secret);
+        assert!(!created.config_json.contains("secret-1"));
+
+        let updated = storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP edited".into(),
+                "ftp".into(),
+                r#"{"endpoint":"ftp://localhost:21","root":"/nested","username":"demo"}"#.into(),
+                None,
+                "ftp\nlocalhost\n21\ndemo".into(),
+                false,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.revision, 2);
+        assert_eq!(
+            storage.load_file_connection_secret("ftp-1", "password").await.unwrap().as_deref(),
+            Some("secret-1")
+        );
+        assert_eq!(
+            storage.load_file_connection_password("ftp-1", "ftp\nlocalhost\n21\ndemo").await.unwrap().as_deref(),
+            Some("secret-1")
+        );
+
+        let changed_scope = storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP moved".into(),
+                "ftp".into(),
+                r#"{"endpoint":"ftp://localhost:2121","root":"/nested","username":"demo"}"#.into(),
+                None,
+                "ftp\nlocalhost\n2121\ndemo".into(),
+                false,
+                Some(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(changed_scope.contains("Re-enter or clear"));
+        assert!(storage
+            .load_file_connection_password("ftp-1", "ftp\nlocalhost\n2121\ndemo")
+            .await
+            .unwrap_err()
+            .contains("does not match"));
+
+        let changed_username = storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP moved".into(),
+                "ftp".into(),
+                r#"{"endpoint":"ftp://localhost:21","root":"/nested","username":"other"}"#.into(),
+                None,
+                "ftp\nlocalhost\n21\nother".into(),
+                false,
+                Some(2),
+            )
+            .await
+            .unwrap_err();
+        assert!(changed_username.contains("Re-enter or clear"));
+
+        let rotated = storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP moved".into(),
+                "ftp".into(),
+                r#"{"endpoint":"ftp://localhost:2121","root":"/nested","username":"demo"}"#.into(),
+                Some("secret-2".into()),
+                "ftp\nlocalhost\n2121\ndemo".into(),
+                true,
+                Some(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rotated.revision, 3);
+        assert_eq!(
+            storage.load_file_connection_password("ftp-1", "ftp\nlocalhost\n2121\ndemo").await.unwrap().as_deref(),
+            Some("secret-2")
+        );
+
+        let conflict = storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "stale".into(),
+                "ftp".into(),
+                rotated.config_json.clone(),
+                None,
+                "ftp\nlocalhost\n2121\ndemo".into(),
+                false,
+                Some(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(conflict.contains("revision conflict"));
+
+        let cleared = storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP edited".into(),
+                "ftp".into(),
+                rotated.config_json.clone(),
+                None,
+                "ftp\nlocalhost\n2121\ndemo".into(),
+                true,
+                Some(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.revision, 4);
+        assert!(!cleared.has_secret);
+
+        let listed = storage.list_file_connections().await.unwrap();
+        assert_eq!(listed, vec![cleared]);
+        assert!(storage.delete_file_connection("ftp-1").await.unwrap());
+        assert!(storage.load_file_connection("ftp-1").await.unwrap().is_none());
+        assert!(storage.load_file_connection_secret("ftp-1", "password").await.unwrap().is_none());
 
         std::fs::remove_file(&db).ok();
     }

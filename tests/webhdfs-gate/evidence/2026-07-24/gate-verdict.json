@@ -1,0 +1,1 @@
+{"candidate":"streaming-put","verdict":"LOCAL-GO","scope":"Hadoop 3.4.1 simple-auth fixture","samples":6,"min_rss_kib":8672,"max_rss_kib":27824}

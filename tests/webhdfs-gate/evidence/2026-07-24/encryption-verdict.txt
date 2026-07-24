@@ -1,0 +1,4 @@
+encryption_zones=pass
+same_zone_atomic_concat=fail_closed
+same_zone_streaming_write_copy=pass
+cross_zone_atomic_concat=fail_closed

@@ -1,0 +1,5 @@
+os=Darwin
+kernel=24.6.0
+arch=arm64
+docker_server=29.4.0
+hadoop_image=sha256:69ffa97339aff768c4e6120c3fb27aa04c121402b1c8158408a5fb5be586a30e

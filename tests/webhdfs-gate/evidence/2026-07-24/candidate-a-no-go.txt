@@ -1,0 +1,1 @@
+Candidate A is No-Go: OpenDAL 0.57 abort_block deletes root/UUID instead of atomic_write_dir/UUID, and close uses CONCAT -> DELETE destination -> RENAME.

@@ -1,0 +1,8 @@
+trusted_tls=pass
+invalid_tls=fail_closed
+proxy_route=pass
+proxy_bypass=pass
+hostname_mapping=pass
+missing_hostname_mapping=fail_closed
+delegation_forwarding=pass
+invalid_delegation=fail_closed

@@ -1,0 +1,44 @@
+services:
+  kms:
+    image: apache/hadoop:3.4.1
+    platform: linux/amd64
+    hostname: kms
+    command: ["/opt/hadoop/sbin/kms.sh", "run"]
+    ports:
+      - "9600:9600"
+    volumes:
+      - ./core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./kms-site.xml:/opt/hadoop/etc/hadoop/kms-site.xml:ro
+
+  namenode:
+    image: apache/hadoop:3.4.1
+    platform: linux/amd64
+    hostname: namenode
+    depends_on:
+      - kms
+    command:
+      - bash
+      - -lc
+      - |
+        until (echo >/dev/tcp/kms/9600) >/dev/null 2>&1; do sleep 1; done
+        hadoop key create dbx-gate-key -size 128 -provider kms://http@kms:9600/kms || true
+        hdfs namenode -format -force -nonInteractive
+        exec hdfs namenode
+    ports:
+      - "9870:9870"
+    volumes:
+      - ./core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hdfs-site-encryption.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
+
+  datanode:
+    image: apache/hadoop:3.4.1
+    platform: linux/amd64
+    hostname: datanode
+    command: ["hdfs", "datanode"]
+    depends_on:
+      - namenode
+    ports:
+      - "9864:9864"
+    volumes:
+      - ./core-site.xml:/opt/hadoop/etc/hadoop/core-site.xml:ro
+      - ./hdfs-site-encryption.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro

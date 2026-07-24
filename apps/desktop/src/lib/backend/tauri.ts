@@ -177,6 +177,50 @@ export interface McpGlobalPolicy {
   configured: boolean;
 }
 
+export interface FtpFileConnectionConfig {
+  type: "ftp";
+  endpoint: string;
+  root: string;
+  username: string;
+}
+
+export interface FileConnectionInput {
+  id?: string | null;
+  expectedRevision?: number | null;
+  name: string;
+  config: FtpFileConnectionConfig;
+  secrets?: { password?: string | null; clearPassword?: boolean } | null;
+}
+
+export interface FileConnection {
+  id: string;
+  name: string;
+  config: FtpFileConnectionConfig;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+  hasPassword: boolean;
+}
+
+export interface FileConnectionTestStage {
+  stage: "configuration" | "dns" | "tcp" | "authentication" | "root";
+  status: "passed" | "failed" | "skipped";
+  message?: string | null;
+}
+
+export interface FileConnectionTestResult {
+  success: boolean;
+  stages: FileConnectionTestStage[];
+}
+
+export interface FileManagerEntry {
+  path: string;
+  name: string;
+  kind: "file" | "directory";
+  size: number;
+  lastModified?: string | null;
+}
+
 export interface SavedSqlSyncEntry {
   folderName?: string;
   fileName: string;
@@ -1243,6 +1287,26 @@ export async function saveConnections(configs: ConnectionConfig[]): Promise<void
 
 export async function loadConnections(): Promise<ConnectionConfig[]> {
   return invoke("load_connections");
+}
+
+export async function listFileConnections(): Promise<FileConnection[]> {
+  return invoke("list_file_connections");
+}
+
+export async function saveFileConnection(input: FileConnectionInput): Promise<FileConnection> {
+  return invoke("save_file_connection", { input });
+}
+
+export async function deleteFileConnection(connectionId: string): Promise<void> {
+  return invoke("delete_file_connection", { connectionId });
+}
+
+export async function testFileConnection(input: FileConnectionInput): Promise<FileConnectionTestResult> {
+  return invoke("test_file_connection", { input });
+}
+
+export async function listFileRoot(connectionId: string): Promise<FileManagerEntry[]> {
+  return invoke("list_file_root", { connectionId });
 }
 
 export async function loadTunnelProfiles(): Promise<TunnelProfile[]> {
