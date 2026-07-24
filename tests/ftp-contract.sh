@@ -3,7 +3,7 @@ set -euo pipefail
 
 image="delfer/alpine-ftp-server@sha256:60bb774d8408d9d4d5c74d05d1c086a34ce192c6c1a142ffac268cac0dbc6fac"
 container=""
-control_port="${DBX_TEST_FTP_CONTROL_PORT:-2121}"
+control_port="${DBX_TEST_FTP_CONTROL_PORT:-22121}"
 passive_min_port="${DBX_TEST_FTP_PASSIVE_MIN_PORT:-21000}"
 passive_max_port="${DBX_TEST_FTP_PASSIVE_MAX_PORT:-21010}"
 

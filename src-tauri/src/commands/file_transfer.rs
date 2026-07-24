@@ -1622,7 +1622,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_contract_authorizes_starts_cancels_and_queries_without_streaming_bytes_over_ipc() {
-        use super::super::file_manager::{FileConnectionConfig, FtpConnectionConfig};
+        use super::super::file_manager::{password_scope, FileConnectionConfig, FtpConnectionConfig};
 
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
@@ -1632,6 +1632,7 @@ mod tests {
             root: "/".to_string(),
             username: "dbx".to_string(),
         });
+        let scope = password_scope(&config).unwrap();
         storage
             .save_file_connection(
                 "ftp-command".into(),
@@ -1639,7 +1640,7 @@ mod tests {
                 "ftp".into(),
                 serde_json::to_string(&config).unwrap(),
                 Some("password".into()),
-                "ftp\n127.0.0.1\n9\ndbx".into(),
+                scope,
                 true,
                 None,
             )
@@ -2504,7 +2505,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "run through tests/ftp-contract.sh with a pinned FTP image"]
     async fn fixed_ftp_worker_success_cancel_and_disconnect_contract() {
-        use super::super::file_manager::{FileConnectionConfig, FtpConnectionConfig};
+        use super::super::file_manager::{password_scope, FileConnectionConfig, FtpConnectionConfig};
 
         let endpoint = std::env::var("DBX_TEST_FTP_ENDPOINT").expect("DBX_TEST_FTP_ENDPOINT is required");
         let username = std::env::var("DBX_TEST_FTP_USERNAME").unwrap_or_else(|_| "dbx".to_string());
@@ -2515,6 +2516,7 @@ mod tests {
         let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
         let config =
             FileConnectionConfig::Ftp(FtpConnectionConfig { endpoint, root: "/ftp/dbx".to_string(), username });
+        let scope = password_scope(&config).unwrap();
         storage
             .save_file_connection(
                 "ftp-contract".into(),
@@ -2522,7 +2524,7 @@ mod tests {
                 "ftp".into(),
                 serde_json::to_string(&config).unwrap(),
                 Some(password),
-                "ftp\n127.0.0.1\n2121\ndbx".into(),
+                scope,
                 true,
                 None,
             )

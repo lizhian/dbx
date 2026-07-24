@@ -1547,7 +1547,7 @@ fn file_stat_from_metadata(path: &str, metadata: &Metadata) -> FileStat {
     }
 }
 
-fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
+pub(super) fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
             let (host, port) = endpoint_host_port(&config.endpoint)?;
