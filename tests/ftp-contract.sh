@@ -30,15 +30,29 @@ docker run -d \
   -e "MAX_PORT=${passive_max_port}" \
   -p "${control_port}:21" \
   -p "${passive_min_port}-${passive_max_port}:${passive_min_port}-${passive_max_port}" \
-  "${image}" >/dev/null
+  "${image}" \
+  /usr/sbin/vsftpd \
+  /etc/vsftpd/vsftpd.conf \
+  -obackground=NO \
+  "-opasv_min_port=${passive_min_port}" \
+  "-opasv_max_port=${passive_max_port}" \
+  -opasv_address=127.0.0.1 >/dev/null
 
+# Run vsftpd in the foreground so Docker readiness cannot race the image's
+# pidproxy setup and accidentally attach the container to a session child.
 for _ in $(seq 1 30); do
-  if docker exec "${container}" pgrep vsftpd >/dev/null 2>&1; then
+  if docker exec "${container}" sh -c '
+    test "$(cat /proc/1/comm)" = "tini" &&
+    pidof vsftpd >/dev/null
+  ' >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-docker exec "${container}" pgrep vsftpd >/dev/null
+docker exec "${container}" sh -c '
+  test "$(cat /proc/1/comm)" = "tini" &&
+  pidof vsftpd >/dev/null
+' >/dev/null
 for _ in $(seq 1 30); do
   if nc -z 127.0.0.1 "${control_port}" >/dev/null 2>&1; then
     break

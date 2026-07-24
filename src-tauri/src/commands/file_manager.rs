@@ -31,7 +31,7 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const FTP_SESSION_ATTEMPTS: usize = 3;
-const FTP_SESSION_RETRY_DELAY: Duration = Duration::from_millis(500);
+const FTP_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 #[cfg(test)]
 static FTP_SESSION_ESTABLISHMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -1039,31 +1039,59 @@ async fn open_ftp_root_session(config: &FtpConnectionConfig, password: Option<&s
     validate_ftp_session_arguments(config, password)?;
     let (host, port) = endpoint_host_port(&config.endpoint)?;
     let addresses = resolve_addresses(&host, port).await.map_err(|error| format!("DNS stage failed: {error}"))?;
-    open_ftp_root_session_with_addresses(config, password, &addresses).await
+    open_ftp_root_session_with_addresses(config, password, &addresses).await.map_err(|failure| failure.message)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FtpConnectionStage {
+    Tcp,
+    Authentication,
+    Root,
+}
+
+#[derive(Debug)]
+struct FtpSessionFailure {
+    stage: FtpConnectionStage,
+    message: String,
+}
+
+impl FtpSessionFailure {
+    fn new(stage: FtpConnectionStage, message: String) -> Self {
+        Self { stage, message }
+    }
 }
 
 enum FtpSessionOpenError {
-    Retryable(String),
-    Definite(String),
+    Retryable(FtpSessionFailure),
+    Definite(FtpSessionFailure),
+}
+
+fn retain_deepest_ftp_failure(current: &mut FtpSessionFailure, candidate: FtpSessionFailure) {
+    if candidate.stage >= current.stage {
+        *current = candidate;
+    }
 }
 
 async fn open_ftp_root_session_with_addresses(
     config: &FtpConnectionConfig,
     password: Option<&str>,
     addresses: &[SocketAddr],
-) -> Result<AsyncFtpStream, String> {
-    let mut last_error = "No address available".to_string();
+) -> Result<AsyncFtpStream, FtpSessionFailure> {
+    let mut deepest_failure =
+        FtpSessionFailure::new(FtpConnectionStage::Tcp, "TCP stage failed: No address available".to_string());
     for attempt in 0..FTP_SESSION_ATTEMPTS {
         match open_ftp_root_session_once(config, password, addresses).await {
             Ok(ftp) => return Ok(ftp),
-            Err(FtpSessionOpenError::Definite(error)) => return Err(error),
-            Err(FtpSessionOpenError::Retryable(error)) => last_error = error,
+            Err(FtpSessionOpenError::Definite(failure)) => return Err(failure),
+            Err(FtpSessionOpenError::Retryable(failure)) => {
+                retain_deepest_ftp_failure(&mut deepest_failure, failure);
+            }
         }
         if attempt + 1 < FTP_SESSION_ATTEMPTS {
             tokio::time::sleep(FTP_SESSION_RETRY_DELAY * (attempt as u32 + 1)).await;
         }
     }
-    Err(last_error)
+    Err(deepest_failure)
 }
 
 async fn open_ftp_root_session_once(
@@ -1071,7 +1099,8 @@ async fn open_ftp_root_session_once(
     password: Option<&str>,
     addresses: &[SocketAddr],
 ) -> Result<AsyncFtpStream, FtpSessionOpenError> {
-    let mut last_error = "No address available".to_string();
+    let mut deepest_failure =
+        FtpSessionFailure::new(FtpConnectionStage::Tcp, "TCP stage failed: No address available".to_string());
     let mut connected = None;
     for address in addresses {
         match tokio::time::timeout(CONNECTION_TIMEOUT, AsyncFtpStream::connect(address)).await {
@@ -1082,45 +1111,76 @@ async fn open_ftp_root_session_once(
             Ok(Err(error)) => {
                 let stage = match &error {
                     FtpError::ConnectionError(io_error) if io_error.kind() != std::io::ErrorKind::UnexpectedEof => {
-                        "TCP"
+                        FtpConnectionStage::Tcp
                     }
-                    _ => "Authentication",
+                    _ => FtpConnectionStage::Authentication,
                 };
-                last_error = format!("{stage} stage failed: {}", redact_ftp_error(error, password));
+                let stage_name = match stage {
+                    FtpConnectionStage::Tcp => "TCP",
+                    FtpConnectionStage::Authentication => "Authentication",
+                    FtpConnectionStage::Root => unreachable!("connect cannot reach the root stage"),
+                };
+                retain_deepest_ftp_failure(
+                    &mut deepest_failure,
+                    FtpSessionFailure::new(
+                        stage,
+                        format!("{stage_name} stage failed: {}", redact_ftp_error(error, password)),
+                    ),
+                );
             }
-            Err(_) => last_error = "Authentication stage failed: FTP greeting timed out".to_string(),
+            Err(_) => {
+                retain_deepest_ftp_failure(
+                    &mut deepest_failure,
+                    FtpSessionFailure::new(
+                        FtpConnectionStage::Authentication,
+                        "Authentication stage failed: FTP greeting timed out".to_string(),
+                    ),
+                );
+            }
         }
     }
-    let mut ftp = connected.ok_or(FtpSessionOpenError::Retryable(last_error))?;
+    let mut ftp = connected.ok_or(FtpSessionOpenError::Retryable(deepest_failure))?;
     let (username, resolved_password) = ftp_credentials(config, password);
     match tokio::time::timeout(CONNECTION_TIMEOUT, ftp.login(&username, &resolved_password)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             let retryable = ftp_session_is_unusable(&error);
-            let message = format!("Authentication stage failed: {}", redact_ftp_error(error, password));
+            let failure = FtpSessionFailure::new(
+                FtpConnectionStage::Authentication,
+                format!("Authentication stage failed: {}", redact_ftp_error(error, password)),
+            );
             return Err(if retryable {
-                FtpSessionOpenError::Retryable(message)
+                FtpSessionOpenError::Retryable(failure)
             } else {
-                FtpSessionOpenError::Definite(message)
+                FtpSessionOpenError::Definite(failure)
             });
         }
         Err(_) => {
-            return Err(FtpSessionOpenError::Retryable("Authentication stage failed: FTP login timed out".to_string()));
+            return Err(FtpSessionOpenError::Retryable(FtpSessionFailure::new(
+                FtpConnectionStage::Authentication,
+                "Authentication stage failed: FTP login timed out".to_string(),
+            )));
         }
     }
     match tokio::time::timeout(CONNECTION_TIMEOUT, ftp.cwd(&config.root)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             let retryable = ftp_session_is_unusable(&error);
-            let message = format!("Root stage failed: {}", redact_ftp_error(error, password));
+            let failure = FtpSessionFailure::new(
+                FtpConnectionStage::Root,
+                format!("Root stage failed: {}", redact_ftp_error(error, password)),
+            );
             return Err(if retryable {
-                FtpSessionOpenError::Retryable(message)
+                FtpSessionOpenError::Retryable(failure)
             } else {
-                FtpSessionOpenError::Definite(message)
+                FtpSessionOpenError::Definite(failure)
             });
         }
         Err(_) => {
-            return Err(FtpSessionOpenError::Retryable("Root stage failed: FTP root check timed out".to_string()));
+            return Err(FtpSessionOpenError::Retryable(FtpSessionFailure::new(
+                FtpConnectionStage::Root,
+                "Root stage failed: FTP root check timed out".to_string(),
+            )));
         }
     }
     #[cfg(test)]
@@ -1162,28 +1222,24 @@ async fn test_ftp_connection(input: &FileConnectionInput, password: Option<&str>
             let _ = ftp.quit().await;
             FileConnectionTestResult { success: true, stages }
         }
-        Err(error) if error.starts_with("TCP stage failed:") => {
-            stages.push(failed_stage("tcp", error));
+        Err(failure) if failure.stage == FtpConnectionStage::Tcp => {
+            stages.push(failed_stage("tcp", failure.message));
             append_skipped_stages(&mut stages, &["authentication", "root"]);
             FileConnectionTestResult { success: false, stages }
         }
-        Err(error) if error.starts_with("Authentication stage failed:") => {
+        Err(failure) if failure.stage == FtpConnectionStage::Authentication => {
             stages.push(passed_stage("tcp"));
-            stages.push(failed_stage("authentication", error));
+            stages.push(failed_stage("authentication", failure.message));
             stages.push(skipped_stage("root"));
             FileConnectionTestResult { success: false, stages }
         }
-        Err(error) if error.starts_with("Root stage failed:") => {
+        Err(failure) if failure.stage == FtpConnectionStage::Root => {
             stages.push(passed_stage("tcp"));
             stages.push(passed_stage("authentication"));
-            stages.push(failed_stage("root", error));
+            stages.push(failed_stage("root", failure.message));
             FileConnectionTestResult { success: false, stages }
         }
-        Err(error) => {
-            stages.push(failed_stage("tcp", error));
-            append_skipped_stages(&mut stages, &["authentication", "root"]);
-            FileConnectionTestResult { success: false, stages }
-        }
+        Err(_) => unreachable!("all FTP connection stages are handled"),
     }
 }
 
@@ -1398,7 +1454,7 @@ async fn stat_remote_metadata(
     for attempt in 0..FTP_SESSION_ATTEMPTS {
         match stat_remote_metadata_once(operator, config, path).await {
             Ok(metadata) => return Ok(metadata),
-            Err(error) if error.kind() == ErrorKind::Unexpected && attempt + 1 < FTP_SESSION_ATTEMPTS => {
+            Err(error) if should_retry_ftp_stat(&error) && attempt + 1 < FTP_SESSION_ATTEMPTS => {
                 last_error = Some(error);
                 tokio::time::sleep(FTP_SESSION_RETRY_DELAY * (attempt as u32 + 1)).await;
             }
@@ -1406,6 +1462,10 @@ async fn stat_remote_metadata(
         }
     }
     Err(redact_error(last_error.expect("a transient stat failure is recorded before retry").to_string(), password))
+}
+
+fn should_retry_ftp_stat(error: &opendal::Error) -> bool {
+    error.kind() == ErrorKind::Unexpected && error.is_temporary()
 }
 
 async fn stat_remote_metadata_once(
@@ -1605,6 +1665,37 @@ mod tests {
                 Some(FileConnectionSecrets { password: Some(injected.to_string()), clear_password: false });
             assert!(validate_input(&password_input).unwrap_err().contains("FTP password"));
         }
+    }
+
+    #[test]
+    fn multi_address_failures_keep_the_deepest_completed_stage() {
+        let mut failure =
+            FtpSessionFailure::new(FtpConnectionStage::Tcp, "last address refused the connection".to_string());
+        retain_deepest_ftp_failure(
+            &mut failure,
+            FtpSessionFailure::new(
+                FtpConnectionStage::Authentication,
+                "an earlier address reached the FTP greeting".to_string(),
+            ),
+        );
+        retain_deepest_ftp_failure(
+            &mut failure,
+            FtpSessionFailure::new(FtpConnectionStage::Tcp, "final address refused the connection".to_string()),
+        );
+
+        assert_eq!(failure.stage, FtpConnectionStage::Authentication);
+        assert!(failure.message.contains("earlier address"));
+    }
+
+    #[test]
+    fn ftp_stat_retry_requires_a_temporary_unexpected_error() {
+        let temporary = opendal::Error::new(ErrorKind::Unexpected, "temporary protocol desync").set_temporary();
+        let permanent = opendal::Error::new(ErrorKind::Unexpected, "permanent FTP error");
+        let temporary_not_found = opendal::Error::new(ErrorKind::NotFound, "temporary missing entry").set_temporary();
+
+        assert!(should_retry_ftp_stat(&temporary));
+        assert!(!should_retry_ftp_stat(&permanent));
+        assert!(!should_retry_ftp_stat(&temporary_not_found));
     }
 
     #[tokio::test]
