@@ -1168,6 +1168,7 @@ pub fn run() {
         .manage(CloseBehaviorState::new())
         .manage(AppLocaleState::new())
         .manage(commands::file_manager::FileManagerRuntime::default())
+        .manage(commands::file_transfer::FileTransferRuntime::default())
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
                 if let Some(state) = webview.app_handle().try_state::<CloseBehaviorState>() {
@@ -1240,6 +1241,7 @@ pub fn run() {
             state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
             let state = Arc::new(state);
             app.manage(state.clone());
+            tauri::async_runtime::spawn(commands::file_transfer::recover_interrupted_downloads(app.handle().clone()));
             app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());

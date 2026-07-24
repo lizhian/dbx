@@ -2178,7 +2178,7 @@ mod tests {
         }
 
         direct = direct_ftp(&input, &password).await;
-        assert_eq!(direct.size(injection_victim).await.unwrap(), b"must survive".len() as usize);
+        assert_eq!(direct.size(injection_victim).await.unwrap(), b"must survive".len());
         direct.rm(injection_victim).await.unwrap();
         direct.quit().await.unwrap();
 

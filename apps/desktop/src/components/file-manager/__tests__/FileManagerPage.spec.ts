@@ -6,15 +6,20 @@ import type { FileConnection, FileManagerEntry, FileTransfer } from "@/lib/backe
 
 const mocks = vi.hoisted(() => ({
   cancelFileTransfer: vi.fn(),
+  closeFileListCursor: vi.fn(),
+  createFileDirectory: vi.fn(),
   deleteFileConnection: vi.fn(),
+  deleteFileEntry: vi.fn(),
   getFileTransfer: vi.fn(),
   listFileConnections: vi.fn(),
-  listFileRoot: vi.fn(),
+  listFileEntries: vi.fn(),
+  listFileEntriesNext: vi.fn(),
   listFileTransfers: vi.fn(),
   listenFileTransferProgress: vi.fn(),
   saveDialog: vi.fn(),
   saveFileConnection: vi.fn(),
   startFileDownload: vi.fn(),
+  statFileEntry: vi.fn(),
   testFileConnection: vi.fn(),
   toast: vi.fn(),
   unlisten: vi.fn(),
@@ -32,9 +37,11 @@ function passthrough(tag: string): Component {
 
 vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ save: mocks.saveDialog }));
-vi.mock("@lucide/vue", () => {
+vi.mock("@lucide/vue", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@lucide/vue")>();
   const Icon = passthrough("span");
   return {
+    ...actual,
     AlertTriangle: Icon,
     CheckCircle2: Icon,
     Download: Icon,
@@ -64,14 +71,19 @@ vi.mock("@/components/ui/PasswordInput.vue", () => ({ default: passthrough("inpu
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
 vi.mock("@/lib/backend/api", () => ({
   cancelFileTransfer: mocks.cancelFileTransfer,
+  closeFileListCursor: mocks.closeFileListCursor,
+  createFileDirectory: mocks.createFileDirectory,
   deleteFileConnection: mocks.deleteFileConnection,
+  deleteFileEntry: mocks.deleteFileEntry,
   getFileTransfer: mocks.getFileTransfer,
   listFileConnections: mocks.listFileConnections,
-  listFileRoot: mocks.listFileRoot,
+  listFileEntries: mocks.listFileEntries,
+  listFileEntriesNext: mocks.listFileEntriesNext,
   listFileTransfers: mocks.listFileTransfers,
   listenFileTransferProgress: mocks.listenFileTransferProgress,
   saveFileConnection: mocks.saveFileConnection,
   startFileDownload: mocks.startFileDownload,
+  statFileEntry: mocks.statFileEntry,
   testFileConnection: mocks.testFileConnection,
 }));
 
@@ -128,6 +140,7 @@ async function mountPage() {
   app.mount(root);
   await vi.waitFor(() => {
     expect(mocks.listFileConnections).toHaveBeenCalledOnce();
+    expect(mocks.listFileEntries).toHaveBeenCalledOnce();
     expect(mocks.listFileTransfers).toHaveBeenCalledOnce();
   });
   await nextTick();
@@ -135,8 +148,9 @@ async function mountPage() {
 
 beforeEach(() => {
   mocks.progressListener = null;
+  mocks.closeFileListCursor.mockResolvedValue(undefined);
   mocks.listFileConnections.mockResolvedValue([connection]);
-  mocks.listFileRoot.mockResolvedValue([remoteEntry]);
+  mocks.listFileEntries.mockResolvedValue({ entries: [remoteEntry], cursor: null });
   mocks.listFileTransfers.mockResolvedValue([]);
   mocks.listenFileTransferProgress.mockImplementation(async (listener: (value: FileTransfer) => void) => {
     mocks.progressListener = listener;
