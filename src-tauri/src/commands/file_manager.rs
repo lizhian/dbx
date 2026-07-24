@@ -741,9 +741,11 @@ where
             result.map_err(|_| format!("{operation} timed out"))?
         }
     };
-    if result.is_err() {
-        runtime.evict_revision(connection_id, revision);
-    }
+    // FTP mutations and their verification commonly finish on a 550/NotFound
+    // response. OpenDAL 0.57 can leave that pooled control connection
+    // unsuitable for the next command, so mutations always retire the cached
+    // operator before the UI refreshes.
+    runtime.evict_revision(connection_id, revision);
     result
 }
 
@@ -1380,6 +1382,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_mutation_retires_the_cached_operator() {
+        let runtime = FileManagerRuntime::default();
+        let config = input("ftp://example.test:21", "/");
+        let operator = build_operator(&config.config, None).unwrap();
+        runtime.operators.write().unwrap().insert("ftp-1".to_string(), CachedOperator { revision: 1, operator });
+        assert_eq!(runtime.operator_count(), 1);
+
+        run_mutation_operation(&runtime, "ftp-1", 1, &CancellationSignal::default(), "Mutation", async {
+            Ok::<_, String>(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(runtime.operator_count(), 0);
+    }
+
+    #[tokio::test]
     async fn queued_mutation_is_cancelled_when_connection_deletion_starts() {
         let runtime = Arc::new(FileManagerRuntime::default());
         let acquired = Arc::new(Notify::new());
@@ -1555,7 +1573,7 @@ mod tests {
             .unwrap();
         assert_eq!(updated.revision, 2);
 
-        let operator = build_operator(&input.config, Some(&password)).unwrap();
+        let mut operator = build_operator(&input.config, Some(&password)).unwrap();
         let mut direct = direct_ftp(&input, &password).await;
         let list_path = configured_root_list_path(&input.config);
         let entries = operator.list(&list_path).await.unwrap();
@@ -1618,13 +1636,16 @@ mod tests {
         assert_eq!(stat.name, "/");
         assert_eq!(stat.size, 0);
 
+        operator = build_operator(&input.config, Some(&password)).unwrap();
         let empty_directory = RemotePath::parse("ticket-4-empty").unwrap();
         operator.create_dir(&configured_operation_path(&input.config, &empty_directory, true)).await.unwrap();
+        operator = build_operator(&input.config, Some(&password)).unwrap();
         assert!(matches!(
             delete_entry(&operator, &input.config, &empty_directory, Some(&password)).await.unwrap().outcome,
             FileMutationOutcome::Completed
         ));
 
+        operator = build_operator(&input.config, Some(&password)).unwrap();
         let removable_file = RemotePath::parse("ticket-4-file.txt").unwrap();
         let removable_file_path = configured_operation_path(&input.config, &removable_file, false);
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-file.txt", b"delete me").await;
@@ -1633,6 +1654,7 @@ mod tests {
             FileMutationOutcome::Completed
         ));
         assert_eq!(operator.stat(&removable_file_path).await.unwrap_err().kind(), ErrorKind::NotFound);
+        operator = build_operator(&input.config, Some(&password)).unwrap();
 
         for (literal_name, decoded_name) in
             [("ticket-4%20literal-dir", "ticket-4 literal-dir"), ("ticket-4%2Fliteral-dir", "ticket-4/literal-dir")]
@@ -1641,6 +1663,7 @@ mod tests {
             let literal_directory_path = configured_operation_path(&input.config, &literal_directory, true);
             operator.create_dir(&literal_directory_path).await.unwrap();
             assert!(operator.stat(&literal_directory_path).await.unwrap().mode().is_dir());
+            operator = build_operator(&input.config, Some(&password)).unwrap();
             direct.cwd(format!("/ftp/dbx/{literal_name}")).await.unwrap();
             direct.cwd("/ftp/dbx").await.unwrap();
             assert!(direct.cwd(format!("/ftp/dbx/{decoded_name}")).await.is_err());
@@ -1650,6 +1673,7 @@ mod tests {
             ));
             assert!(direct.cwd(format!("/ftp/dbx/{literal_name}")).await.is_err());
             direct.cwd("/ftp/dbx").await.unwrap();
+            operator = build_operator(&input.config, Some(&password)).unwrap();
         }
 
         let percent_space_file = RemotePath::parse("ticket-4%20literal-file").unwrap();
@@ -1661,6 +1685,7 @@ mod tests {
         assert!(direct.size("/ftp/dbx/ticket-4%20literal-file").await.is_err());
         assert_eq!(direct.size("/ftp/dbx/ticket-4 literal-file").await.unwrap(), 14);
         direct.rm("/ftp/dbx/ticket-4 literal-file").await.unwrap();
+        operator = build_operator(&input.config, Some(&password)).unwrap();
 
         direct.mkdir("/ftp/dbx/ticket-4-decoded").await.unwrap();
         let percent_slash_file = RemotePath::parse("ticket-4-decoded%2Fliteral-file").unwrap();
@@ -1673,16 +1698,19 @@ mod tests {
         assert_eq!(direct.size("/ftp/dbx/ticket-4-decoded/literal-file").await.unwrap(), 14);
         direct.rm("/ftp/dbx/ticket-4-decoded/literal-file").await.unwrap();
         direct.rmdir("/ftp/dbx/ticket-4-decoded").await.unwrap();
+        operator = build_operator(&input.config, Some(&password)).unwrap();
 
         let nonempty_directory = RemotePath::parse("ticket-4-nonempty").unwrap();
         let nonempty_directory_path = configured_operation_path(&input.config, &nonempty_directory, true);
         operator.create_dir(&nonempty_directory_path).await.unwrap();
+        operator = build_operator(&input.config, Some(&password)).unwrap();
         let nonempty_child = format!("{nonempty_directory_path}child.txt");
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-nonempty/child.txt", b"keep me").await;
         assert!(delete_entry(&operator, &input.config, &nonempty_directory, Some(&password))
             .await
             .unwrap_err()
             .contains("not empty"));
+        operator = build_operator(&input.config, Some(&password)).unwrap();
         operator.stat(&nonempty_child).await.unwrap();
 
         // Model a remote writer racing the preflight. The exact FTP RMD must
@@ -1690,6 +1718,7 @@ mod tests {
         let raced_directory = RemotePath::parse("ticket-4-raced").unwrap();
         let raced_directory_path = configured_operation_path(&input.config, &raced_directory, true);
         operator.create_dir(&raced_directory_path).await.unwrap();
+        operator = build_operator(&input.config, Some(&password)).unwrap();
         let evidence = inspect_directory_delete(
             &operator,
             &raced_directory_path,
@@ -1704,7 +1733,10 @@ mod tests {
         );
         let raced_child = format!("{raced_directory_path}concurrent.txt");
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-raced/concurrent.txt", b"created after preflight").await;
-        assert!(delete_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.is_err());
+        let raced_delete_error =
+            delete_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.unwrap_err();
+        assert!(raced_delete_error.contains("recursive delete is unsupported"), "{raced_delete_error}");
+        operator = build_operator(&input.config, Some(&password)).unwrap();
         operator.stat(&raced_child).await.unwrap();
 
         for unsafe_path in ["/ftp/dbx/fixture.txt", "../fixture.txt", "%2e%2e/fixture.txt", "safe%2f..%2ffixture.txt"] {
@@ -1720,13 +1752,14 @@ mod tests {
         assert!(RemotePath::parse("whitespace-proof ").unwrap_err().contains("storage runtime"));
 
         operator.delete(&nonempty_child).await.unwrap();
-        delete_ftp_directory_exact(&input.config, &nonempty_directory, Some(&password)).await.unwrap();
+        direct.rmdir("/ftp/dbx/ticket-4-nonempty").await.unwrap();
         operator.delete(&raced_child).await.unwrap();
-        delete_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.unwrap();
+        direct.rmdir("/ftp/dbx/ticket-4-raced").await.unwrap();
         direct.rm("/ftp/dbx/whitespace-proof").await.unwrap();
         direct.rm("/ftp/dbx/whitespace-proof ").await.unwrap();
         direct.quit().await.unwrap();
 
+        operator = build_operator(&input.config, Some(&password)).unwrap();
         let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.endpoint.clone(),

@@ -54,6 +54,16 @@ docker exec "${container}" sh -c "
   chown -R dbx:dbx /ftp/dbx
 "
 
+for _ in $(seq 1 30); do
+  if curl --silent --show-error --fail --user "dbx:dbx-password" --list-only \
+    "ftp://127.0.0.1:${control_port}/" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+curl --silent --show-error --fail --user "dbx:dbx-password" --list-only \
+  "ftp://127.0.0.1:${control_port}/" >/dev/null
+
 DBX_TEST_FTP_ENDPOINT="ftp://127.0.0.1:${control_port}" \
 DBX_TEST_FTP_USERNAME="dbx" \
 DBX_TEST_FTP_PASSWORD="dbx-password" \
