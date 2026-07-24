@@ -7,46 +7,52 @@ pub(super) struct RemotePath(String);
 
 impl RemotePath {
     pub(super) fn parse(input: &str) -> Result<Self, String> {
-        let decoded = percent_decode_str(input)
-            .decode_utf8()
-            .map_err(|_| "Remote path contains invalid percent-encoded UTF-8".to_string())?;
-        if decoded.is_empty() {
+        if input.is_empty() {
             return Err("Remote path is required".to_string());
         }
-        if decoded.trim() != decoded {
+        if input.trim() != input {
             return Err(
                 "Remote path cannot begin or end with whitespace because the storage runtime would normalize it"
                     .to_string(),
             );
         }
-        if decoded.starts_with('/') {
-            return Err("Remote path must be relative to the configured root".to_string());
-        }
-        if decoded.contains('\0') || decoded.contains('\\') {
-            return Err("Remote path contains an invalid character".to_string());
-        }
 
-        let without_trailing_slash = decoded.strip_suffix('/').unwrap_or(&decoded);
-        if without_trailing_slash.is_empty() {
-            return Err("The configured root cannot be changed or deleted".to_string());
-        }
+        validate_path_shadow(input.as_bytes())?;
+        let decoded = percent_decode_str(input).collect::<Vec<_>>();
+        validate_path_shadow(&decoded)?;
 
-        let mut segments = Vec::new();
-        for segment in without_trailing_slash.split('/') {
-            if segment.is_empty() {
-                return Err("Remote path cannot contain empty path segments".to_string());
-            }
-            if matches!(segment, "." | "..") {
-                return Err("Remote path cannot contain '.' or '..' path segments".to_string());
-            }
-            segments.push(segment);
-        }
-        Ok(Self(segments.join("/")))
+        // Percent decoding is only a safety shadow. OpenDAL and protocol
+        // clients must receive the literal name returned by the remote system.
+        Ok(Self(input.strip_suffix('/').unwrap_or(input).to_string()))
     }
 
     pub(super) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn validate_path_shadow(path: &[u8]) -> Result<(), String> {
+    if path.starts_with(b"/") {
+        return Err("Remote path must be relative to the configured root".to_string());
+    }
+    if path.contains(&b'\0') || path.contains(&b'\\') {
+        return Err("Remote path contains an invalid character".to_string());
+    }
+
+    let without_trailing_slash = path.strip_suffix(b"/").unwrap_or(path);
+    if without_trailing_slash.is_empty() {
+        return Err("The configured root cannot be changed or deleted".to_string());
+    }
+
+    for segment in without_trailing_slash.split(|byte| *byte == b'/') {
+        if segment.is_empty() {
+            return Err("Remote path cannot contain empty path segments".to_string());
+        }
+        if matches!(segment, b"." | b"..") {
+            return Err("Remote path cannot contain '.' or '..' path segments".to_string());
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn join_configured_root(root: &str, path: &RemotePath, directory: bool) -> String {
@@ -131,11 +137,15 @@ mod tests {
             "safe%5cescape",
             "safe%00escape",
             "file ",
-            "%20file",
+            " file",
         ] {
             assert!(RemotePath::parse(unsafe_path).is_err(), "{unsafe_path:?} must be rejected");
         }
-        assert_eq!(RemotePath::parse("safe%20name/report.txt").unwrap().as_str(), "safe name/report.txt");
+        assert_eq!(RemotePath::parse("safe%20name/report.txt").unwrap().as_str(), "safe%20name/report.txt");
+        assert_eq!(RemotePath::parse("a%2Fb").unwrap().as_str(), "a%2Fb");
+        assert_eq!(RemotePath::parse("%20file").unwrap().as_str(), "%20file");
+        assert_eq!(RemotePath::parse("file%20").unwrap().as_str(), "file%20");
+        assert_eq!(RemotePath::parse("literal%FFname").unwrap().as_str(), "literal%FFname");
         assert_eq!(RemotePath::parse("folder/").unwrap().as_str(), "folder");
     }
 
@@ -149,10 +159,13 @@ mod tests {
                 value /= alphabet.len() as u64;
             }
             if let Ok(path) = RemotePath::parse(&candidate) {
+                assert_eq!(path.as_str(), candidate.strip_suffix('/').unwrap_or(&candidate));
                 assert!(!path.as_str().starts_with('/'));
                 assert!(!path.as_str().contains('\\'));
                 assert!(!path.as_str().contains('\0'));
-                assert!(path.as_str().split('/').all(|segment| !matches!(segment, "" | "." | "..")));
+                let decoded = percent_decode_str(path.as_str()).decode_utf8().unwrap();
+                let decoded = decoded.strip_suffix('/').unwrap_or(&decoded);
+                assert!(decoded.split('/').all(|segment| !matches!(segment, "" | "." | "..")));
             }
         }
     }

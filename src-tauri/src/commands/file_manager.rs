@@ -1634,6 +1634,46 @@ mod tests {
         ));
         assert_eq!(operator.stat(&removable_file_path).await.unwrap_err().kind(), ErrorKind::NotFound);
 
+        for (literal_name, decoded_name) in
+            [("ticket-4%20literal-dir", "ticket-4 literal-dir"), ("ticket-4%2Fliteral-dir", "ticket-4/literal-dir")]
+        {
+            let literal_directory = RemotePath::parse(literal_name).unwrap();
+            let literal_directory_path = configured_operation_path(&input.config, &literal_directory, true);
+            operator.create_dir(&literal_directory_path).await.unwrap();
+            assert!(operator.stat(&literal_directory_path).await.unwrap().mode().is_dir());
+            direct.cwd(format!("/ftp/dbx/{literal_name}")).await.unwrap();
+            direct.cwd("/ftp/dbx").await.unwrap();
+            assert!(direct.cwd(format!("/ftp/dbx/{decoded_name}")).await.is_err());
+            assert!(matches!(
+                delete_entry(&operator, &input.config, &literal_directory, Some(&password)).await.unwrap().outcome,
+                FileMutationOutcome::Completed
+            ));
+            assert!(direct.cwd(format!("/ftp/dbx/{literal_name}")).await.is_err());
+            direct.cwd("/ftp/dbx").await.unwrap();
+        }
+
+        let percent_space_file = RemotePath::parse("ticket-4%20literal-file").unwrap();
+        let percent_space_file_path = configured_operation_path(&input.config, &percent_space_file, false);
+        direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4%20literal-file", b"literal").await;
+        direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4 literal-file", b"decoded-target").await;
+        assert_eq!(operator.stat(&percent_space_file_path).await.unwrap().content_length(), 7);
+        delete_entry(&operator, &input.config, &percent_space_file, Some(&password)).await.unwrap();
+        assert!(direct.size("/ftp/dbx/ticket-4%20literal-file").await.is_err());
+        assert_eq!(direct.size("/ftp/dbx/ticket-4 literal-file").await.unwrap(), 14);
+        direct.rm("/ftp/dbx/ticket-4 literal-file").await.unwrap();
+
+        direct.mkdir("/ftp/dbx/ticket-4-decoded").await.unwrap();
+        let percent_slash_file = RemotePath::parse("ticket-4-decoded%2Fliteral-file").unwrap();
+        let percent_slash_file_path = configured_operation_path(&input.config, &percent_slash_file, false);
+        direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-decoded%2Fliteral-file", b"raw").await;
+        direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-decoded/literal-file", b"decoded-target").await;
+        assert_eq!(operator.stat(&percent_slash_file_path).await.unwrap().content_length(), 3);
+        delete_entry(&operator, &input.config, &percent_slash_file, Some(&password)).await.unwrap();
+        assert!(direct.size("/ftp/dbx/ticket-4-decoded%2Fliteral-file").await.is_err());
+        assert_eq!(direct.size("/ftp/dbx/ticket-4-decoded/literal-file").await.unwrap(), 14);
+        direct.rm("/ftp/dbx/ticket-4-decoded/literal-file").await.unwrap();
+        direct.rmdir("/ftp/dbx/ticket-4-decoded").await.unwrap();
+
         let nonempty_directory = RemotePath::parse("ticket-4-nonempty").unwrap();
         let nonempty_directory_path = configured_operation_path(&input.config, &nonempty_directory, true);
         operator.create_dir(&nonempty_directory_path).await.unwrap();
