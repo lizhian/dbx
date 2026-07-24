@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, File, Folder, FolderPlus, Loader2, Pencil, Plus, RefreshCcw, Server, Trash2, X, XCircle } from "@lucide/vue";
+import { save } from "@tauri-apps/plugin-dialog";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, Download, File, Folder, FolderPlus, Loader2, Pencil, Plus, RefreshCcw, Server, Trash2, X, XCircle } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -9,7 +11,7 @@ import { Label } from "@/components/ui/label";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
 import { useToast } from "@/composables/useToast";
 import * as api from "@/lib/backend/api";
-import type { FileConnection, FileConnectionInput, FileConnectionTestResult, FileEntryStat, FileManagerEntry } from "@/lib/backend/tauri";
+import type { FileConnection, FileConnectionInput, FileConnectionTestResult, FileEntryStat, FileManagerEntry, FileTransfer, FileTransferStatus } from "@/lib/backend/tauri";
 
 const LIST_PAGE_SIZE = 200;
 
@@ -65,6 +67,18 @@ const text = computed(() => ({
   version: t("fileManager.version"),
   loadedCount: t("fileManager.loadedCount"),
   actions: t("fileManager.actions"),
+  download: t("fileManager.download"),
+  transfers: t("fileManager.transfers"),
+  noTransfers: t("fileManager.noTransfers"),
+  cancelTransfer: t("fileManager.cancelTransfer"),
+  transferStatus: {
+    queued: t("fileManager.transferQueued"),
+    running: t("fileManager.transferRunning"),
+    cancelling: t("fileManager.transferCancelling"),
+    completed: t("fileManager.transferCompleted"),
+    failed: t("fileManager.transferFailed"),
+    cancelled: t("fileManager.transferCancelled"),
+  } satisfies Record<FileTransferStatus, string>,
 }));
 
 const connections = ref<FileConnection[]>([]);
@@ -75,6 +89,7 @@ const listCursor = ref<string | null>(null);
 const selectedEntry = ref<FileManagerEntry | null>(null);
 const entryStat = ref<FileEntryStat | null>(null);
 const statError = ref<string | null>(null);
+const transfers = ref<FileTransfer[]>([]);
 const rootError = ref<string | null>(null);
 const loadingConnections = ref(false);
 const loadingEntries = ref(false);
@@ -98,6 +113,8 @@ let connectionsGeneration = 0;
 let rootGeneration = 0;
 let statGeneration = 0;
 let navigationGeneration = 0;
+let unlistenTransfers: UnlistenFn | null = null;
+let transferPoll: ReturnType<typeof setInterval> | null = null;
 
 const selectedConnection = computed(() => connections.value.find((connection) => connection.id === selectedId.value));
 const canSubmit = computed(() => !!form.value.name.trim() && !!form.value.endpoint.trim() && form.value.root.startsWith("/"));
@@ -398,12 +415,79 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 ** exponent).toFixed(exponent ? 1 : 0)} ${units[exponent]}`;
 }
 
-onMounted(() => void loadConnections());
+function upsertTransfer(transfer: FileTransfer) {
+  const index = transfers.value.findIndex((item) => item.id === transfer.id);
+  if (index >= 0) {
+    transfers.value.splice(index, 1, transfer);
+  } else {
+    transfers.value.unshift(transfer);
+  }
+  transfers.value.sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  transfers.value = transfers.value.slice(0, 100);
+}
+
+async function refreshTransfers() {
+  try {
+    transfers.value = await api.listFileTransfers();
+  } catch (error) {
+    toast(String(error), 5000);
+  }
+}
+
+async function downloadEntry(entry: FileManagerEntry) {
+  if (!selectedId.value || entry.kind !== "file") return;
+  const localPath = await save({ defaultPath: entry.name });
+  if (!localPath) return;
+  try {
+    const started = await api.startFileDownload({
+      connectionId: selectedId.value,
+      remotePath: entry.path,
+      localPath,
+    });
+    upsertTransfer(await api.getFileTransfer(started.transferId));
+  } catch (error) {
+    toast(String(error), 5000);
+  }
+}
+
+async function cancelTransfer(transfer: FileTransfer) {
+  if (!["queued", "running"].includes(transfer.status)) return;
+  try {
+    upsertTransfer(await api.cancelFileTransfer(transfer.id));
+  } catch (error) {
+    toast(String(error), 5000);
+  }
+}
+
+function transferPercent(transfer: FileTransfer): number {
+  if (!transfer.totalBytes) return transfer.status === "completed" ? 100 : 0;
+  return Math.min(100, Math.round((transfer.bytesTransferred / transfer.totalBytes) * 100));
+}
+
+function localFileName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
+
+onMounted(async () => {
+  try {
+    unlistenTransfers = await api.listenFileTransferProgress(upsertTransfer);
+  } catch (error) {
+    toast(String(error), 5000);
+  }
+  await Promise.all([loadConnections(), refreshTransfers()]);
+  transferPoll = setInterval(() => {
+    if (transfers.value.some((transfer) => ["queued", "running", "cancelling"].includes(transfer.status))) {
+      void refreshTransfers();
+    }
+  }, 2_000);
+});
 onBeforeUnmount(() => {
   navigationGeneration += 1;
   rootGeneration += 1;
   statGeneration += 1;
   void closeActiveCursor();
+  unlistenTransfers?.();
+  if (transferPoll) clearInterval(transferPoll);
 });
 </script>
 
@@ -475,7 +559,7 @@ onBeforeUnmount(() => {
                 <th class="hidden w-24 px-3 py-2 font-medium md:table-cell">{{ text.type }}</th>
                 <th class="hidden w-28 px-3 py-2 text-right font-medium sm:table-cell">{{ text.size }}</th>
                 <th class="hidden w-48 px-3 py-2 font-medium lg:table-cell">{{ text.modified }}</th>
-                <th class="w-14 px-3 py-2 text-right font-medium">{{ text.actions }}</th>
+                <th class="w-20 px-3 py-2 text-right font-medium">{{ text.actions }}</th>
               </tr>
             </thead>
             <tbody>
@@ -500,6 +584,9 @@ onBeforeUnmount(() => {
                 <td class="hidden px-3 py-2 text-right font-mono text-xs text-muted-foreground sm:table-cell">{{ entry.kind === "file" ? formatSize(entry.size) : "" }}</td>
                 <td class="hidden truncate px-3 py-2 text-xs text-muted-foreground lg:table-cell">{{ entry.lastModified ? new Date(entry.lastModified).toLocaleString() : "" }}</td>
                 <td class="px-2 py-1 text-right">
+                  <Button v-if="entry.kind === 'file'" size="icon" variant="ghost" class="h-7 w-7" :title="text.download" :aria-label="`${text.download}: ${entry.name}`" @click.stop="void downloadEntry(entry)">
+                    <Download class="h-3.5 w-3.5" />
+                  </Button>
                   <Button variant="ghost" size="icon" class="h-7 w-7 text-destructive hover:text-destructive" :disabled="mutating" :title="text.deleteEntry" :aria-label="`${text.deleteEntry}: ${entry.name}`" @click.stop="openDeleteEntry(entry)">
                     <Trash2 class="h-3.5 w-3.5" />
                   </Button>
@@ -572,6 +659,31 @@ onBeforeUnmount(() => {
           </dl>
         </aside>
       </div>
+
+      <section class="max-h-48 shrink-0 overflow-auto border-t bg-muted/10" :aria-label="text.transfers">
+        <div class="sticky top-0 z-10 flex h-8 items-center border-b bg-background/95 px-3 text-xs font-medium">{{ text.transfers }}</div>
+        <div v-if="!transfers.length" class="px-3 py-4 text-center text-xs text-muted-foreground">{{ text.noTransfers }}</div>
+        <div v-for="transfer in transfers.slice(0, 8)" :key="transfer.id" class="grid min-h-12 grid-cols-[minmax(0,1fr)_7rem_2rem] items-center gap-3 border-b px-3 py-1.5">
+          <div class="min-w-0">
+            <div class="flex min-w-0 items-center gap-2 text-xs">
+              <Download class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+              <span class="truncate font-medium" :title="transfer.localPath">{{ localFileName(transfer.localPath) }}</span>
+              <span class="shrink-0 text-muted-foreground">{{ text.transferStatus[transfer.status] }}</span>
+            </div>
+            <div class="mt-1 h-1 overflow-hidden rounded-sm bg-muted">
+              <div class="h-full bg-primary transition-[width] duration-200" :class="{ 'bg-destructive': transfer.status === 'failed', 'bg-muted-foreground': transfer.status === 'cancelled' }" :style="{ width: `${transferPercent(transfer)}%` }" />
+            </div>
+            <div v-if="transfer.error" class="mt-0.5 truncate text-[10px] text-destructive" :title="transfer.error">{{ transfer.error }}</div>
+          </div>
+          <div class="text-right font-mono text-[10px] text-muted-foreground">
+            {{ formatSize(transfer.bytesTransferred) }}<span v-if="transfer.totalBytes"> / {{ formatSize(transfer.totalBytes) }}</span>
+          </div>
+          <Button v-if="['queued', 'running'].includes(transfer.status)" size="icon" variant="ghost" class="h-7 w-7" :title="text.cancelTransfer" :aria-label="text.cancelTransfer" @click="void cancelTransfer(transfer)">
+            <X class="h-3.5 w-3.5" />
+          </Button>
+          <span v-else />
+        </div>
+      </section>
     </section>
   </div>
 

@@ -245,6 +245,30 @@ export interface FileMutationResult {
   outcome: "completed" | "no_op";
 }
 
+export type FileTransferStatus = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
+
+export interface FileTransfer {
+  id: string;
+  connectionId: string;
+  direction: "download";
+  remotePath: string;
+  localPath: string;
+  tempPath?: string | null;
+  status: FileTransferStatus;
+  bytesTransferred: number;
+  totalBytes?: number | null;
+  error?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+}
+
+export interface StartDownloadInput {
+  connectionId: string;
+  remotePath: string;
+  localPath: string;
+}
+
 export interface SavedSqlSyncEntry {
   folderName?: string;
   fileName: string;
@@ -1351,6 +1375,26 @@ export async function createFileDirectory(connectionId: string, path: string): P
 
 export async function deleteFileEntry(connectionId: string, path: string, recursive = false): Promise<FileMutationResult> {
   return invoke("delete_file_entry", { connectionId, path, recursive });
+}
+
+export async function startFileDownload(input: StartDownloadInput): Promise<{ transferId: string }> {
+  return invoke("start_download", { input });
+}
+
+export async function getFileTransfer(transferId: string): Promise<FileTransfer> {
+  return invoke("get_file_transfer", { transferId });
+}
+
+export async function listFileTransfers(connectionId?: string | null): Promise<FileTransfer[]> {
+  return invoke("list_file_transfers", { connectionId: connectionId || null });
+}
+
+export async function cancelFileTransfer(transferId: string): Promise<FileTransfer> {
+  return invoke("cancel_file_transfer", { transferId });
+}
+
+export async function listenFileTransferProgress(onProgress: (transfer: FileTransfer) => void): Promise<UnlistenFn> {
+  return listen<FileTransfer>("file-transfer-progress", (event) => onProgress(event.payload));
 }
 
 export async function loadTunnelProfiles(): Promise<TunnelProfile[]> {

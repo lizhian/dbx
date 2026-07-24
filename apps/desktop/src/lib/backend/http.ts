@@ -122,6 +122,8 @@ import type {
   FileListOptions,
   FileListPage,
   FileMutationResult,
+  FileTransfer,
+  StartDownloadInput,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -339,6 +341,26 @@ export async function createFileDirectory(_connectionId: string, _path: string):
 }
 
 export async function deleteFileEntry(_connectionId: string, _path: string, _recursive = false): Promise<FileMutationResult> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function startFileDownload(_input: StartDownloadInput): Promise<{ transferId: string }> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function getFileTransfer(_transferId: string): Promise<FileTransfer> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function listFileTransfers(_connectionId?: string | null): Promise<FileTransfer[]> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function cancelFileTransfer(_transferId: string): Promise<FileTransfer> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function listenFileTransferProgress(_onProgress: (transfer: FileTransfer) => void): Promise<import("@tauri-apps/api/event").UnlistenFn> {
   return desktopFileManagerUnavailable();
 }
 

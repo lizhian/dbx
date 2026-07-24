@@ -55,10 +55,11 @@ rustls = { version = "0.23", features = ["aws-lc-rs"] }
 portpicker = "0.1.1"
 duckdb = { version = "1.3.2", optional = true }
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "chrono", "rust_decimal", "rustls", "sql-browser-tokio"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "rt"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
 bytes = "1"
+tempfile = "3"
 opendal = { version = "=0.57.0", default-features = false, features = ["executors-tokio", "reqwest-rustls-tls", "services-ftp", "services-webhdfs"] }
 mongodb = "3.2.5"
 percent-encoding = "2"
@@ -76,6 +77,9 @@ tauri-plugin-clipboard-manager = "2.3.2"
 sys-locale = "0.3"
 suppaftp = { version = "8.0.3", default-features = false, features = ["tokio"] }
 url = "2"
+
+[dev-dependencies]
+tauri = { version = "2.10.3", features = ["test"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }

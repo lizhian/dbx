@@ -62,7 +62,7 @@ struct ConnectionRuntimeState {
 }
 
 #[derive(Default)]
-struct CancellationSignal {
+pub(super) struct CancellationSignal {
     cancelled: AtomicBool,
     notify: Notify,
 }
@@ -89,6 +89,14 @@ struct CachedOperatorRetirement<'a> {
     runtime: &'a FileManagerRuntime,
     connection_id: &'a str,
     revision: i64,
+}
+
+pub(super) struct PreparedFileOperation {
+    pub operator: Operator,
+    pub revision: i64,
+    pub remote_path: String,
+    pub cancellation: Arc<CancellationSignal>,
+    _lease: OperationLease,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -519,11 +527,33 @@ impl FileManagerRuntime {
         self.list_sessions.invalidate_connection(connection_id);
     }
 
-    fn evict_revision(&self, connection_id: &str, revision: i64) {
+    pub(super) fn evict_revision(&self, connection_id: &str, revision: i64) {
         let mut operators = self.operators.write().unwrap_or_else(|error| error.into_inner());
         if operators.get(connection_id).is_some_and(|cached| cached.revision == revision) {
             operators.remove(connection_id);
         }
+    }
+
+    pub(super) async fn prepare_file_operation(
+        &self,
+        state: &AppState,
+        connection_id: &str,
+        remote_path: &str,
+    ) -> Result<PreparedFileOperation, String> {
+        let relative_path = validate_remote_relative_path(remote_path)?;
+        let lease = self.begin_operation(connection_id)?;
+        let record = state
+            .storage
+            .load_file_connection(connection_id)
+            .await?
+            .ok_or_else(|| "File connection not found".to_string())?;
+        let revision = record.revision;
+        let config = parse_storage_config(&record).inspect_err(|_| self.evict_revision(connection_id, revision))?;
+        let scope = password_scope(&config)?;
+        let password = state.storage.load_file_connection_password(connection_id, &scope).await?;
+        let operator = self.operator_for(&record, &config, password.as_deref())?;
+        let remote_path = configured_entry_path(&config, &relative_path, false);
+        Ok(PreparedFileOperation { operator, revision, remote_path, cancellation: lease.cancellation(), _lease: lease })
     }
 
     fn operator_for(
@@ -588,7 +618,7 @@ impl CancellationSignal {
         self.notify.notify_waiters();
     }
 
-    async fn cancelled(&self) {
+    pub(super) async fn cancelled(&self) {
         loop {
             let notified = self.notify.notified();
             if self.cancelled.load(Ordering::Acquire) {
@@ -1290,7 +1320,7 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16), String> {
     Ok((host.to_string(), url.port().unwrap_or(21)))
 }
 
-fn build_operator(config: &FileConnectionConfig, password: Option<&str>) -> Result<Operator, String> {
+pub(super) fn build_operator(config: &FileConnectionConfig, password: Option<&str>) -> Result<Operator, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
             validate_ftp_session_arguments(config, password)?;
@@ -1391,6 +1421,10 @@ fn normalize_relative_remote_path(path: &str, allow_root: bool) -> Result<String
     }
     validate_decoded_path_shadow(path)?;
     Ok(path.to_string())
+}
+
+pub(super) fn validate_remote_relative_path(path: &str) -> Result<String, String> {
+    normalize_relative_remote_path(path, false)
 }
 
 fn validate_decoded_path_shadow(path: &str) -> Result<(), String> {
@@ -1984,6 +2018,15 @@ mod tests {
         assert!(normalize_relative_remote_path(" folder /../escape", false).is_err());
         assert!(normalize_relative_remote_path("safe\r\nDELE victim", false).is_err());
         assert!(normalize_relative_remote_path("safe%0d%0aDELE%20victim", false).is_err());
+    }
+
+    #[test]
+    fn transfer_paths_cannot_escape_the_configured_root() {
+        assert_eq!(validate_remote_relative_path("reports/2026.csv").unwrap(), "reports/2026.csv");
+        assert!(validate_remote_relative_path(" reports/final.csv ").unwrap_err().contains("whitespace"));
+        for path in ["/absolute", "../escape", "safe/../escape", "safe\\escape", "safe/%2e%2e/escape", "safe//file"] {
+            assert!(validate_remote_relative_path(path).is_err(), "{path} should be rejected");
+        }
     }
 
     #[tokio::test]

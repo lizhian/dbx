@@ -35,6 +35,7 @@ const USER_DATA_TABLES: &[&str] = &[
     "connection_secrets",
     "file_connections",
     "file_connection_secrets",
+    "file_transfers",
     "history",
     "ai_conversations",
     "mq_token_records",
@@ -121,6 +122,24 @@ pub struct FileConnectionStorageRecord {
     pub created_at: String,
     pub updated_at: String,
     pub has_secret: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTransferStorageRecord {
+    pub id: String,
+    pub connection_id: String,
+    pub direction: String,
+    pub remote_path: String,
+    pub local_path: String,
+    pub temp_path: Option<String>,
+    pub status: String,
+    pub bytes_transferred: i64,
+    pub total_bytes: Option<i64>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +311,25 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         PRIMARY KEY (connection_id, key),
         FOREIGN KEY (connection_id) REFERENCES file_connections(id) ON DELETE CASCADE
     )",
+    "CREATE TABLE IF NOT EXISTS file_transfers (
+        id TEXT PRIMARY KEY,
+        connection_id TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        remote_path TEXT NOT NULL,
+        local_path TEXT NOT NULL,
+        temp_path TEXT,
+        status TEXT NOT NULL,
+        bytes_transferred INTEGER NOT NULL DEFAULT 0,
+        total_bytes INTEGER,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_file_transfers_created_at
+        ON file_transfers(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_file_transfers_connection_id
+        ON file_transfers(connection_id, created_at DESC)",
     "CREATE TABLE IF NOT EXISTS history (
         id TEXT PRIMARY KEY,
         connection_id TEXT NOT NULL DEFAULT '',
@@ -653,6 +691,168 @@ impl Storage {
         })
         .await
     }
+
+    pub async fn create_file_transfer(
+        &self,
+        id: String,
+        connection_id: String,
+        direction: String,
+        remote_path: String,
+        local_path: String,
+    ) -> Result<FileTransferStorageRecord, String> {
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO file_transfers (
+                    id, connection_id, direction, remote_path, local_path, status,
+                    bytes_transferred, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 0, ?6, ?6)",
+                params![id, connection_id, direction, remote_path, local_path, now],
+            )
+            .map_err(|error| error.to_string())?;
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
+    pub async fn update_file_transfer(
+        &self,
+        id: &str,
+        status: String,
+        bytes_transferred: i64,
+        total_bytes: Option<i64>,
+        temp_path: Option<String>,
+        error: Option<String>,
+        terminal: bool,
+    ) -> Result<FileTransferStorageRecord, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let completed_at = terminal.then_some(now.clone());
+            let changed = conn
+                .execute(
+                    "UPDATE file_transfers
+                     SET status = ?2, bytes_transferred = ?3, total_bytes = ?4,
+                         temp_path = ?5, error = ?6, updated_at = ?7, completed_at = ?8
+                     WHERE id = ?1
+                       AND (?9 = 1 OR status IN ('queued', 'running'))",
+                    params![id, status, bytes_transferred, total_bytes, temp_path, error, now, completed_at, terminal],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed == 0 {
+                return query_file_transfer_record(conn, &id);
+            }
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
+    pub async fn request_file_transfer_cancel(&self, id: &str) -> Result<FileTransferStorageRecord, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE file_transfers
+                 SET status = 'cancelling', updated_at = ?2
+                 WHERE id = ?1 AND status IN ('queued', 'running')",
+                params![id, now],
+            )
+            .map_err(|error| error.to_string())?;
+            query_file_transfer_record(conn, &id)
+        })
+        .await
+    }
+
+    pub async fn get_file_transfer(&self, id: &str) -> Result<Option<FileTransferStorageRecord>, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(&format!("{FILE_TRANSFER_SELECT} WHERE id = ?1"), [&id], map_file_transfer_row)
+                .optional()
+                .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn list_file_transfers(
+        &self,
+        connection_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<FileTransferStorageRecord>, String> {
+        let connection_id = connection_id.map(str::to_string);
+        let limit = i64::try_from(limit.clamp(1, 200)).unwrap_or(200);
+        self.with_conn(move |conn| {
+            let sql = if connection_id.is_some() {
+                format!("{FILE_TRANSFER_SELECT} WHERE connection_id = ?1 ORDER BY created_at DESC LIMIT ?2")
+            } else {
+                format!("{FILE_TRANSFER_SELECT} ORDER BY created_at DESC LIMIT ?1")
+            };
+            let mut statement = conn.prepare(&sql).map_err(|error| error.to_string())?;
+            let rows = match connection_id {
+                Some(connection_id) => statement
+                    .query_map(params![connection_id, limit], map_file_transfer_row)
+                    .map_err(|error| error.to_string())?,
+                None => statement.query_map([limit], map_file_transfer_row).map_err(|error| error.to_string())?,
+            };
+            rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn recover_interrupted_file_transfers(&self) -> Result<Vec<FileTransferStorageRecord>, String> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let interrupted = {
+                let sql = format!(
+                    "{FILE_TRANSFER_SELECT} WHERE status IN ('queued', 'running', 'cancelling') ORDER BY created_at"
+                );
+                let mut statement = tx.prepare(&sql).map_err(|error| error.to_string())?;
+                let rows = statement.query_map([], map_file_transfer_row).map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?
+            };
+            let now = chrono::Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE file_transfers
+                 SET status = 'failed',
+                     error = 'The application exited before the transfer completed',
+                     updated_at = ?1,
+                     completed_at = ?1
+                 WHERE status IN ('queued', 'running', 'cancelling')",
+                [&now],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(interrupted)
+        })
+        .await
+    }
+}
+
+const FILE_TRANSFER_SELECT: &str = "SELECT
+    id, connection_id, direction, remote_path, local_path, temp_path, status,
+    bytes_transferred, total_bytes, error, created_at, updated_at, completed_at
+    FROM file_transfers";
+
+fn map_file_transfer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileTransferStorageRecord> {
+    Ok(FileTransferStorageRecord {
+        id: row.get(0)?,
+        connection_id: row.get(1)?,
+        direction: row.get(2)?,
+        remote_path: row.get(3)?,
+        local_path: row.get(4)?,
+        temp_path: row.get(5)?,
+        status: row.get(6)?,
+        bytes_transferred: row.get(7)?,
+        total_bytes: row.get(8)?,
+        error: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        completed_at: row.get(12)?,
+    })
+}
+
+fn query_file_transfer_record(conn: &Connection, id: &str) -> Result<FileTransferStorageRecord, String> {
+    conn.query_row(&format!("{FILE_TRANSFER_SELECT} WHERE id = ?1"), [id], map_file_transfer_row)
+        .map_err(|error| error.to_string())
 }
 
 fn map_file_connection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileConnectionStorageRecord> {
@@ -5638,6 +5838,99 @@ mod tests {
         assert!(storage.load_file_connection("ftp-1").await.unwrap().is_none());
         assert!(storage.load_file_connection_secret("ftp-1", "password").await.unwrap().is_none());
 
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn file_transfer_terminal_state_is_queryable_and_cannot_be_regressed_by_late_progress() {
+        let db = temp_db_path("file-transfer-terminal");
+        let storage = Storage::open(&db).await.unwrap();
+        let created = storage
+            .create_file_transfer(
+                "transfer-1".into(),
+                "ftp-1".into(),
+                "download".into(),
+                "remote/file.bin".into(),
+                "/tmp/file.bin".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status, "queued");
+        assert!(storage.get_file_transfer("missing-transfer").await.unwrap().is_none());
+        assert_eq!(storage.get_file_transfer("transfer-1").await.unwrap(), Some(created.clone()));
+
+        let running = storage
+            .update_file_transfer(
+                "transfer-1",
+                "running".into(),
+                4,
+                Some(8),
+                Some("/tmp/.dbx-download-transfer-1-random.part".into()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(running.status, "running");
+
+        let cancelling = storage.request_file_transfer_cancel("transfer-1").await.unwrap();
+        assert_eq!(cancelling.status, "cancelling");
+        let late_progress =
+            storage.update_file_transfer("transfer-1", "running".into(), 8, Some(8), None, None, false).await.unwrap();
+        assert_eq!(late_progress.status, "cancelling");
+
+        let terminal = storage
+            .update_file_transfer(
+                "transfer-1",
+                "cancelled".into(),
+                4,
+                Some(8),
+                None,
+                Some("Download cancelled".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(terminal.status, "cancelled");
+        assert!(terminal.completed_at.is_some());
+        assert_eq!(storage.get_file_transfer("transfer-1").await.unwrap(), Some(terminal.clone()));
+        assert_eq!(storage.list_file_transfers(Some("ftp-1"), 100).await.unwrap(), vec![terminal]);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn interrupted_file_transfers_are_failed_for_crash_recovery() {
+        let db = temp_db_path("file-transfer-recovery");
+        let storage = Storage::open(&db).await.unwrap();
+        storage
+            .create_file_transfer(
+                "transfer-1".into(),
+                "ftp-1".into(),
+                "download".into(),
+                "remote/file.bin".into(),
+                "/tmp/file.bin".into(),
+            )
+            .await
+            .unwrap();
+        storage
+            .update_file_transfer(
+                "transfer-1",
+                "running".into(),
+                10,
+                Some(20),
+                Some("/tmp/.dbx-download-transfer-1-random.part".into()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let interrupted = storage.recover_interrupted_file_transfers().await.unwrap();
+        assert_eq!(interrupted.len(), 1);
+        let recovered = storage.get_file_transfer("transfer-1").await.unwrap().unwrap();
+        assert_eq!(recovered.status, "failed");
+        assert!(recovered.completed_at.is_some());
+        assert!(recovered.error.unwrap().contains("exited"));
         std::fs::remove_file(&db).ok();
     }
 }

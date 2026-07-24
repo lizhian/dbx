@@ -9,7 +9,7 @@ passive_max_port="${DBX_TEST_FTP_PASSIVE_MAX_PORT:-21010}"
 
 # Compile before starting the service so a cold Rust build cannot consume the
 # fixed image's entire readiness window.
-cargo test -p dbx --lib file_manager::tests::fixed_ftp_service_contract --no-default-features --no-run
+cargo test -p dbx --lib fixed_ftp_ --no-default-features --no-run
 
 cleanup() {
   result=$?
@@ -62,6 +62,7 @@ done
 nc -z 127.0.0.1 "${control_port}"
 docker exec "${container}" sh -c "
   printf 'dbx ftp fixture\n' > /ftp/dbx/fixture.txt
+  dd if=/dev/zero of=/ftp/dbx/large.bin bs=1M count=256 status=none
   mkdir -p /ftp/dbx/nested
   mkdir -p /ftp/dbx/a
   printf 'literal-percent-space\n' > '/ftp/dbx/a%20b'
@@ -87,4 +88,5 @@ curl --silent --show-error --fail --user "dbx:dbx-password" --list-only \
 DBX_TEST_FTP_ENDPOINT="ftp://127.0.0.1:${control_port}" \
 DBX_TEST_FTP_USERNAME="dbx" \
 DBX_TEST_FTP_PASSWORD="dbx-password" \
-  cargo test -p dbx --lib file_manager::tests::fixed_ftp_service_contract --no-default-features -- --ignored
+DBX_TEST_FTP_CONTAINER="${container}" \
+  cargo test -p dbx --lib fixed_ftp_ --no-default-features -- --ignored --test-threads=1
