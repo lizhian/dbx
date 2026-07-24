@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-#[cfg(test)]
-use super::file_manager_paths::join_configured_root;
 use super::file_manager_paths::{reject_ftp_command_injection, reject_recursive_delete, RemotePath};
 use dbx_core::connection::AppState;
 use dbx_core::storage::FileConnectionStorageRecord;
@@ -15,8 +15,9 @@ use opendal::services::Ftp;
 use opendal::{ErrorKind, Metadata, Operator};
 use serde::{Deserialize, Serialize};
 use suppaftp::tokio::AsyncFtpStream;
+use suppaftp::{FtpError, Status};
 use tauri::State;
-use tokio::net::{lookup_host, TcpStream};
+use tokio::net::lookup_host;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use url::Url;
 use uuid::Uuid;
@@ -30,7 +31,9 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const DELETE_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const FTP_SESSION_ATTEMPTS: usize = 3;
-const FTP_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
+const FTP_SESSION_RETRY_DELAY: Duration = Duration::from_millis(500);
+#[cfg(test)]
+static FTP_SESSION_ESTABLISHMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Default)]
 pub struct FileManagerRuntime {
@@ -794,95 +797,147 @@ async fn delete_entry(
     password: Option<&str>,
 ) -> Result<FileMutationResult, String> {
     let FileConnectionConfig::Ftp(ftp_config) = config;
-    if ftp_entry_is_directory(ftp_config, path, password).await? {
-        if ftp_directory_has_children(ftp_config, path, password).await? {
-            return Err("Directory is not empty; recursive delete is unsupported".to_string());
-        }
-        // Exact RMD remains authoritative if a child is created after the
-        // preflight; no recursive fallback is attempted.
-        delete_ftp_directory_exact(config, path, password).await?;
-    } else {
-        delete_ftp_file_exact(config, path, password).await?;
-    }
+    let mut ftp = open_ftp_root_session(ftp_config, password).await?;
+    let kind = prepare_ftp_delete_in_session(&mut ftp, ftp_config, path, password).await?;
+    delete_ftp_entry_in_session(ftp, ftp_config, path, kind, password).await?;
     Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
 }
 
-async fn ftp_entry_is_directory(
+#[derive(Clone, Copy)]
+enum FtpEntryKind {
+    File,
+    Directory,
+}
+
+async fn prepare_ftp_delete_in_session(
+    ftp: &mut AsyncFtpStream,
     config: &FtpConnectionConfig,
     path: &RemotePath,
     password: Option<&str>,
-) -> Result<bool, String> {
-    let mut ftp = open_ftp_root_session(config, password).await?;
+) -> Result<FtpEntryKind, String> {
     let directory_result = ftp.cwd(path.as_str()).await;
-    let _ = ftp.quit().await;
     if directory_result.is_ok() {
-        return Ok(true);
+        ftp.cwd(&config.root)
+            .await
+            .map_err(|error| format!("Could not return to the FTP root: {}", redact_ftp_error(error, password)))?;
+        let entries = ftp
+            .nlst(Some(path.as_str()))
+            .await
+            .map_err(|error| format!("Directory preflight failed: {}", redact_ftp_error(error, password)))?;
+        if !entries.is_empty() {
+            return Err("Directory is not empty; recursive delete is unsupported".to_string());
+        }
+        return Ok(FtpEntryKind::Directory);
     }
-    if ftp_entry_exists(config, path, password).await? {
-        Ok(false)
-    } else {
-        Err("File or directory not found".to_string())
+
+    let directory_error = directory_result.unwrap_err();
+    if !ftp_error_is_file_unavailable(&directory_error) {
+        return Err(format!(
+            "File or directory classification failed: {}",
+            redact_ftp_error(directory_error, password)
+        ));
+    }
+    match ftp_entry_exists_in_session(ftp, config, path).await {
+        Ok(true) => Ok(FtpEntryKind::File),
+        Ok(false) => Err("File or directory not found".to_string()),
+        Err(error) => Err(format!("File classification failed: {}", redact_ftp_error(error, password))),
     }
 }
 
-async fn ftp_directory_has_children(
-    config: &FtpConnectionConfig,
-    path: &RemotePath,
-    password: Option<&str>,
-) -> Result<bool, String> {
-    let mut ftp = open_ftp_root_session(config, password).await?;
-    let result = ftp.nlst(Some(path.as_str())).await;
-    let _ = ftp.quit().await;
-    let entries =
-        result.map_err(|error| format!("Directory preflight failed: {}", redact_error(error.to_string(), password)))?;
-    Ok(!entries.is_empty())
-}
-
+#[cfg(test)]
 async fn delete_ftp_directory_exact(
     config: &FileConnectionConfig,
     path: &RemotePath,
     password: Option<&str>,
 ) -> Result<(), String> {
     let FileConnectionConfig::Ftp(config) = config;
-    let mut ftp = open_ftp_root_session(config, password).await?;
-    let result = ftp.rmdir(path.as_str()).await;
-    result.map_err(|error| {
-        format!(
-            "Directory changed, is not empty, or cannot be removed; recursive delete is unsupported: {}",
-            redact_error(error.to_string(), password)
-        )
-    })?;
-    let verification = ftp_entry_exists_in_session(&mut ftp, config, path, password).await;
-    let _ = ftp.quit().await;
-    let exists = match verification {
-        Ok(exists) => exists,
-        Err(_) => ftp_entry_exists(config, path, password).await?,
-    };
-    if exists {
-        return Err("Directory delete could not be verified because the target still exists".to_string());
-    }
-    Ok(())
+    let ftp = open_ftp_root_session(config, password).await?;
+    delete_ftp_entry_in_session(ftp, config, path, FtpEntryKind::Directory, password).await
 }
 
+#[cfg(test)]
 async fn delete_ftp_file_exact(
     config: &FileConnectionConfig,
     path: &RemotePath,
     password: Option<&str>,
 ) -> Result<(), String> {
     let FileConnectionConfig::Ftp(config) = config;
-    let mut ftp = open_ftp_root_session(config, password).await?;
-    let result = ftp.rm(path.as_str()).await;
-    result.map_err(|error| format!("File could not be deleted: {}", redact_error(error.to_string(), password)))?;
-    let verification = ftp_entry_exists_in_session(&mut ftp, config, path, password).await;
-    let _ = ftp.quit().await;
-    let exists = match verification {
-        Ok(exists) => exists,
-        Err(_) => ftp_entry_exists(config, path, password).await?,
+    let ftp = open_ftp_root_session(config, password).await?;
+    delete_ftp_entry_in_session(ftp, config, path, FtpEntryKind::File, password).await
+}
+
+async fn delete_ftp_entry_in_session(
+    mut ftp: AsyncFtpStream,
+    config: &FtpConnectionConfig,
+    path: &RemotePath,
+    kind: FtpEntryKind,
+    password: Option<&str>,
+) -> Result<(), String> {
+    let mutation = match kind {
+        FtpEntryKind::File => ftp.rm(path.as_str()).await,
+        FtpEntryKind::Directory => ftp.rmdir(path.as_str()).await,
     };
-    if exists {
-        return Err("File delete could not be verified because the target still exists".to_string());
+    let mutation_error = match mutation {
+        Ok(()) => None,
+        Err(error) if ftp_session_is_unusable(&error) => Some(format_ftp_delete_error(kind, error, password)),
+        Err(error) => {
+            let _ = ftp.quit().await;
+            return Err(format_ftp_delete_error(kind, error, password));
+        }
+    };
+
+    let fallback_context = if let Some(error) = mutation_error.as_ref() {
+        error.clone()
+    } else {
+        match ftp_entry_exists_in_session(&mut ftp, config, path).await {
+            Ok(exists) => {
+                let _ = ftp.quit().await;
+                return finish_ftp_delete_verification(kind, exists, None);
+            }
+            Err(error) if ftp_session_is_unusable(&error) => {
+                format!("Mutation verification failed: {}", redact_ftp_error(error, password))
+            }
+            Err(error) => {
+                let _ = ftp.quit().await;
+                return Err(format!("Mutation verification failed: {}", redact_ftp_error(error, password)));
+            }
+        }
+    };
+
+    drop(ftp);
+    let mut fallback = open_ftp_root_session(config, password).await.map_err(|fallback_error| {
+        format!("{fallback_context}; read-only verification fallback could not start: {fallback_error}")
+    })?;
+    let fallback_result = ftp_entry_exists_in_session(&mut fallback, config, path)
+        .await
+        .map_err(|error| format!("Read-only verification fallback failed: {}", redact_ftp_error(error, password)));
+    let _ = fallback.quit().await;
+    let exists = fallback_result?;
+    finish_ftp_delete_verification(kind, exists, mutation_error)
+}
+
+fn finish_ftp_delete_verification(
+    kind: FtpEntryKind,
+    exists: bool,
+    mutation_error: Option<String>,
+) -> Result<(), String> {
+    if !exists {
+        return Ok(());
     }
-    Ok(())
+    Err(mutation_error.unwrap_or_else(|| match kind {
+        FtpEntryKind::File => "File delete could not be verified because the target still exists".to_string(),
+        FtpEntryKind::Directory => "Directory delete could not be verified because the target still exists".to_string(),
+    }))
+}
+
+fn format_ftp_delete_error(kind: FtpEntryKind, error: FtpError, password: Option<&str>) -> String {
+    match kind {
+        FtpEntryKind::File => format!("File could not be deleted: {}", redact_ftp_error(error, password)),
+        FtpEntryKind::Directory => format!(
+            "Directory changed, is not empty, or cannot be removed; recursive delete is unsupported: {}",
+            redact_ftp_error(error, password)
+        ),
+    }
 }
 
 async fn create_ftp_directory_exact(
@@ -893,48 +948,59 @@ async fn create_ftp_directory_exact(
     let FileConnectionConfig::Ftp(config) = config;
     let mut ftp = open_ftp_root_session(config, password).await?;
     let create_result = ftp.mkdir(path.as_str()).await;
-    match create_result {
-        Ok(()) => {
-            let verification = ftp.cwd(path.as_str()).await;
-            let _ = ftp.quit().await;
-            if verification.is_ok() {
-                return Ok(());
-            }
-        }
-        Err(create_error) => {
-            let _ = ftp.quit().await;
-            // A 550 is ambiguous (already exists, permission denied, or a
-            // non-directory target). Verify on a separate control connection
-            // instead of continuing on the connection that received it.
-            let mut verify = open_ftp_root_session(config, password).await?;
-            let verify_result = verify.cwd(path.as_str()).await;
-            let _ = verify.quit().await;
-            if verify_result.is_err() {
-                return Err(format!(
-                    "Directory could not be created: {}",
-                    redact_error(create_error.to_string(), password)
-                ));
-            }
-            return Ok(());
-        }
+    let create_error = create_result
+        .as_ref()
+        .err()
+        .map(|error| format!("Directory could not be created: {}", redact_error(error.to_string(), password)));
+    if create_result.as_ref().is_err_and(ftp_session_is_unusable) {
+        drop(ftp);
+        return verify_created_directory_in_fresh_session(
+            config,
+            path,
+            password,
+            create_error.expect("failed create has an error"),
+        )
+        .await;
     }
 
-    let mut verify = open_ftp_root_session(config, password).await?;
-    let result = verify.cwd(path.as_str()).await.map_err(|error| {
-        format!("Directory creation could not be verified: {}", redact_error(error.to_string(), password))
-    });
-    let _ = verify.quit().await;
-    result
+    match ftp.cwd(path.as_str()).await {
+        Ok(()) => {
+            let _ = ftp.quit().await;
+            Ok(())
+        }
+        Err(error) if ftp_session_is_unusable(&error) => {
+            let context = create_error.unwrap_or_else(|| {
+                format!("Directory creation could not be verified: {}", redact_ftp_error(error, password))
+            });
+            drop(ftp);
+            verify_created_directory_in_fresh_session(config, path, password, context).await
+        }
+        Err(error) => {
+            let _ = ftp.quit().await;
+            Err(create_error.unwrap_or_else(|| {
+                format!("Directory creation could not be verified: {}", redact_ftp_error(error, password))
+            }))
+        }
+    }
 }
 
-async fn ftp_entry_exists(
+async fn verify_created_directory_in_fresh_session(
     config: &FtpConnectionConfig,
     path: &RemotePath,
     password: Option<&str>,
-) -> Result<bool, String> {
-    let mut ftp = open_ftp_root_session(config, password).await?;
-    let result = ftp_entry_exists_in_session(&mut ftp, config, path, password).await;
-    let _ = ftp.quit().await;
+    context: String,
+) -> Result<(), String> {
+    let mut verify = open_ftp_root_session(config, password)
+        .await
+        .map_err(|error| format!("{context}; read-only verification fallback could not start: {error}"))?;
+    let result = match verify.cwd(path.as_str()).await {
+        Ok(()) => Ok(()),
+        Err(error) if ftp_error_is_file_unavailable(&error) => Err(context),
+        Err(error) => {
+            Err(format!("{context}; read-only verification fallback failed: {}", redact_ftp_error(error, password)))
+        }
+    };
+    let _ = verify.quit().await;
     result
 }
 
@@ -942,13 +1008,9 @@ async fn ftp_entry_exists_in_session(
     ftp: &mut AsyncFtpStream,
     config: &FtpConnectionConfig,
     path: &RemotePath,
-    password: Option<&str>,
-) -> Result<bool, String> {
+) -> Result<bool, FtpError> {
     let (parent, basename) = path.as_str().rsplit_once('/').unwrap_or(("", path.as_str()));
-    let entries = ftp
-        .nlst((!parent.is_empty()).then_some(parent))
-        .await
-        .map_err(|error| format!("Mutation verification failed: {}", redact_error(error.to_string(), password)))?;
+    let entries = ftp.nlst((!parent.is_empty()).then_some(parent)).await?;
     let relative = path.as_str();
     let rooted = if config.root == "/" {
         format!("/{relative}")
@@ -961,15 +1023,41 @@ async fn ftp_entry_exists_in_session(
     }))
 }
 
+fn ftp_error_is_file_unavailable(error: &FtpError) -> bool {
+    matches!(error, FtpError::UnexpectedResponse(response) if response.status == Status::FileUnavailable)
+}
+
+fn ftp_session_is_unusable(error: &FtpError) -> bool {
+    !matches!(error, FtpError::UnexpectedResponse(_))
+}
+
+fn redact_ftp_error(error: FtpError, password: Option<&str>) -> String {
+    redact_error(error.to_string(), password)
+}
+
 async fn open_ftp_root_session(config: &FtpConnectionConfig, password: Option<&str>) -> Result<AsyncFtpStream, String> {
     validate_ftp_session_arguments(config, password)?;
     let (host, port) = endpoint_host_port(&config.endpoint)?;
     let addresses = resolve_addresses(&host, port).await.map_err(|error| format!("DNS stage failed: {error}"))?;
+    open_ftp_root_session_with_addresses(config, password, &addresses).await
+}
+
+enum FtpSessionOpenError {
+    Retryable(String),
+    Definite(String),
+}
+
+async fn open_ftp_root_session_with_addresses(
+    config: &FtpConnectionConfig,
+    password: Option<&str>,
+    addresses: &[SocketAddr],
+) -> Result<AsyncFtpStream, String> {
     let mut last_error = "No address available".to_string();
     for attempt in 0..FTP_SESSION_ATTEMPTS {
-        match open_ftp_root_session_once(config, password, &addresses).await {
+        match open_ftp_root_session_once(config, password, addresses).await {
             Ok(ftp) => return Ok(ftp),
-            Err(error) => last_error = error,
+            Err(FtpSessionOpenError::Definite(error)) => return Err(error),
+            Err(FtpSessionOpenError::Retryable(error)) => last_error = error,
         }
         if attempt + 1 < FTP_SESSION_ATTEMPTS {
             tokio::time::sleep(FTP_SESSION_RETRY_DELAY * (attempt as u32 + 1)).await;
@@ -982,7 +1070,7 @@ async fn open_ftp_root_session_once(
     config: &FtpConnectionConfig,
     password: Option<&str>,
     addresses: &[SocketAddr],
-) -> Result<AsyncFtpStream, String> {
+) -> Result<AsyncFtpStream, FtpSessionOpenError> {
     let mut last_error = "No address available".to_string();
     let mut connected = None;
     for address in addresses {
@@ -991,20 +1079,52 @@ async fn open_ftp_root_session_once(
                 connected = Some(ftp);
                 break;
             }
-            Ok(Err(error)) => last_error = redact_error(error.to_string(), password),
-            Err(_) => last_error = "FTP greeting timed out".to_string(),
+            Ok(Err(error)) => {
+                let stage = match &error {
+                    FtpError::ConnectionError(io_error) if io_error.kind() != std::io::ErrorKind::UnexpectedEof => {
+                        "TCP"
+                    }
+                    _ => "Authentication",
+                };
+                last_error = format!("{stage} stage failed: {}", redact_ftp_error(error, password));
+            }
+            Err(_) => last_error = "Authentication stage failed: FTP greeting timed out".to_string(),
         }
     }
-    let mut ftp = connected.ok_or_else(|| format!("Authentication stage failed: {last_error}"))?;
+    let mut ftp = connected.ok_or(FtpSessionOpenError::Retryable(last_error))?;
     let (username, resolved_password) = ftp_credentials(config, password);
-    tokio::time::timeout(CONNECTION_TIMEOUT, ftp.login(&username, &resolved_password))
-        .await
-        .map_err(|_| "Authentication stage failed: FTP login timed out".to_string())?
-        .map_err(|error| format!("Authentication stage failed: {}", redact_error(error.to_string(), password)))?;
-    tokio::time::timeout(CONNECTION_TIMEOUT, ftp.cwd(&config.root))
-        .await
-        .map_err(|_| "Root stage failed: FTP root check timed out".to_string())?
-        .map_err(|error| format!("Root stage failed: {}", redact_error(error.to_string(), password)))?;
+    match tokio::time::timeout(CONNECTION_TIMEOUT, ftp.login(&username, &resolved_password)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let retryable = ftp_session_is_unusable(&error);
+            let message = format!("Authentication stage failed: {}", redact_ftp_error(error, password));
+            return Err(if retryable {
+                FtpSessionOpenError::Retryable(message)
+            } else {
+                FtpSessionOpenError::Definite(message)
+            });
+        }
+        Err(_) => {
+            return Err(FtpSessionOpenError::Retryable("Authentication stage failed: FTP login timed out".to_string()));
+        }
+    }
+    match tokio::time::timeout(CONNECTION_TIMEOUT, ftp.cwd(&config.root)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let retryable = ftp_session_is_unusable(&error);
+            let message = format!("Root stage failed: {}", redact_ftp_error(error, password));
+            return Err(if retryable {
+                FtpSessionOpenError::Retryable(message)
+            } else {
+                FtpSessionOpenError::Definite(message)
+            });
+        }
+        Err(_) => {
+            return Err(FtpSessionOpenError::Retryable("Root stage failed: FTP root check timed out".to_string()));
+        }
+    }
+    #[cfg(test)]
+    FTP_SESSION_ESTABLISHMENT_COUNT.fetch_add(1, Ordering::Relaxed);
     Ok(ftp)
 }
 
@@ -1034,75 +1154,37 @@ async fn test_ftp_connection(input: &FileConnectionInput, password: Option<&str>
     }
     stages.push(passed_stage("dns"));
 
-    let address = match connect_first(&addresses).await {
-        Ok(address) => address,
-        Err(error) => {
-            stages.push(failed_stage("tcp", error));
-            append_skipped_stages(&mut stages, &["authentication", "root"]);
-            return FileConnectionTestResult { success: false, stages };
-        }
-    };
-    stages.push(passed_stage("tcp"));
-
-    let mut ftp = match tokio::time::timeout(CONNECTION_TIMEOUT, AsyncFtpStream::connect(address)).await {
-        Ok(Ok(ftp)) => ftp,
-        Ok(Err(error)) => {
-            stages.push(failed_stage("authentication", redact_error(error.to_string(), password)));
-            stages.push(skipped_stage("root"));
-            return FileConnectionTestResult { success: false, stages };
-        }
-        Err(_) => {
-            stages.push(failed_stage("authentication", "FTP greeting timed out".to_string()));
-            stages.push(skipped_stage("root"));
-            return FileConnectionTestResult { success: false, stages };
-        }
-    };
-    let (username, resolved_password) = ftp_credentials(config, password);
-    match tokio::time::timeout(CONNECTION_TIMEOUT, ftp.login(&username, &resolved_password)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            stages.push(failed_stage("authentication", redact_error(error.to_string(), password)));
-            stages.push(skipped_stage("root"));
-            return FileConnectionTestResult { success: false, stages };
-        }
-        Err(_) => {
-            stages.push(failed_stage("authentication", "FTP login timed out".to_string()));
-            stages.push(skipped_stage("root"));
-            return FileConnectionTestResult { success: false, stages };
-        }
-    }
-    stages.push(passed_stage("authentication"));
-
-    match tokio::time::timeout(CONNECTION_TIMEOUT, ftp.cwd(&config.root)).await {
-        Ok(Ok(())) => {
+    match open_ftp_root_session_with_addresses(config, password, &addresses).await {
+        Ok(mut ftp) => {
+            stages.push(passed_stage("tcp"));
+            stages.push(passed_stage("authentication"));
             stages.push(passed_stage("root"));
             let _ = ftp.quit().await;
             FileConnectionTestResult { success: true, stages }
         }
-        Ok(Err(error)) => {
-            stages.push(failed_stage("root", redact_error(error.to_string(), password)));
+        Err(error) if error.starts_with("TCP stage failed:") => {
+            stages.push(failed_stage("tcp", error));
+            append_skipped_stages(&mut stages, &["authentication", "root"]);
             FileConnectionTestResult { success: false, stages }
         }
-        Err(_) => {
-            stages.push(failed_stage("root", "FTP root check timed out".to_string()));
+        Err(error) if error.starts_with("Authentication stage failed:") => {
+            stages.push(passed_stage("tcp"));
+            stages.push(failed_stage("authentication", error));
+            stages.push(skipped_stage("root"));
+            FileConnectionTestResult { success: false, stages }
+        }
+        Err(error) if error.starts_with("Root stage failed:") => {
+            stages.push(passed_stage("tcp"));
+            stages.push(passed_stage("authentication"));
+            stages.push(failed_stage("root", error));
+            FileConnectionTestResult { success: false, stages }
+        }
+        Err(error) => {
+            stages.push(failed_stage("tcp", error));
+            append_skipped_stages(&mut stages, &["authentication", "root"]);
             FileConnectionTestResult { success: false, stages }
         }
     }
-}
-
-async fn connect_first(addresses: &[SocketAddr]) -> Result<SocketAddr, String> {
-    let mut last_error = "No address available".to_string();
-    for address in addresses {
-        match tokio::time::timeout(CONNECTION_TIMEOUT, TcpStream::connect(address)).await {
-            Ok(Ok(stream)) => {
-                drop(stream);
-                return Ok(*address);
-            }
-            Ok(Err(error)) => last_error = error.to_string(),
-            Err(_) => last_error = "TCP connection timed out".to_string(),
-        }
-    }
-    Err(last_error)
 }
 
 async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
@@ -1115,23 +1197,7 @@ async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, Str
 
 async fn verify_ftp_root_read_only(config: &FileConnectionConfig, password: Option<&str>) -> Result<(), String> {
     let FileConnectionConfig::Ftp(config) = config;
-    validate_ftp_session_arguments(config, password)?;
-    let (host, port) = endpoint_host_port(&config.endpoint)?;
-    let addresses = resolve_addresses(&host, port).await.map_err(|error| format!("DNS stage failed: {error}"))?;
-    let address = connect_first(&addresses).await.map_err(|error| format!("TCP stage failed: {error}"))?;
-    let mut ftp = tokio::time::timeout(CONNECTION_TIMEOUT, AsyncFtpStream::connect(address))
-        .await
-        .map_err(|_| "Authentication stage failed: FTP greeting timed out".to_string())?
-        .map_err(|error| format!("Authentication stage failed: {}", redact_error(error.to_string(), password)))?;
-    let (username, resolved_password) = ftp_credentials(config, password);
-    tokio::time::timeout(CONNECTION_TIMEOUT, ftp.login(&username, &resolved_password))
-        .await
-        .map_err(|_| "Authentication stage failed: FTP login timed out".to_string())?
-        .map_err(|error| format!("Authentication stage failed: {}", redact_error(error.to_string(), password)))?;
-    tokio::time::timeout(CONNECTION_TIMEOUT, ftp.cwd(&config.root))
-        .await
-        .map_err(|_| "Root stage failed: FTP root check timed out".to_string())?
-        .map_err(|error| format!("Root stage failed: {}", redact_error(error.to_string(), password)))?;
+    let mut ftp = open_ftp_root_session(config, password).await?;
     let _ = ftp.quit().await;
     Ok(())
 }
@@ -1328,14 +1394,33 @@ async fn stat_remote_metadata(
     path: &str,
     password: Option<&str>,
 ) -> Result<Metadata, String> {
+    let mut last_error = None;
+    for attempt in 0..FTP_SESSION_ATTEMPTS {
+        match stat_remote_metadata_once(operator, config, path).await {
+            Ok(metadata) => return Ok(metadata),
+            Err(error) if error.kind() == ErrorKind::Unexpected && attempt + 1 < FTP_SESSION_ATTEMPTS => {
+                last_error = Some(error);
+                tokio::time::sleep(FTP_SESSION_RETRY_DELAY * (attempt as u32 + 1)).await;
+            }
+            Err(error) => return Err(redact_error(error.to_string(), password)),
+        }
+    }
+    Err(redact_error(last_error.expect("a transient stat failure is recorded before retry").to_string(), password))
+}
+
+async fn stat_remote_metadata_once(
+    operator: &Operator,
+    config: &FileConnectionConfig,
+    path: &str,
+) -> Result<Metadata, opendal::Error> {
     let file_path = configured_entry_path(config, path, path.is_empty());
     match operator.stat(&file_path).await {
         Ok(metadata) => Ok(metadata),
         Err(error) if !path.is_empty() && error.kind() == ErrorKind::NotFound => {
             let directory_path = configured_entry_path(config, path, true);
-            operator.stat(&directory_path).await.map_err(|error| redact_error(error.to_string(), password))
+            operator.stat(&directory_path).await
         }
-        Err(error) => Err(redact_error(error.to_string(), password)),
+        Err(error) => Err(error),
     }
 }
 
@@ -1361,13 +1446,6 @@ fn file_stat_from_metadata(path: &str, metadata: &Metadata) -> FileStat {
         cache_control: metadata.cache_control().map(ToString::to_string),
         content_md5: metadata.content_md5().map(ToString::to_string),
         user_metadata: metadata.user_metadata().cloned().unwrap_or_default(),
-    }
-}
-
-#[cfg(test)]
-fn configured_operation_path(config: &FileConnectionConfig, path: &RemotePath, directory: bool) -> String {
-    match config {
-        FileConnectionConfig::Ftp(config) => join_configured_root(&config.root, path, directory),
     }
 }
 
@@ -1487,6 +1565,10 @@ mod tests {
         let mut stream = ftp.put_with_stream(path).await.unwrap();
         stream.write_all(content).await.unwrap();
         ftp.finalize_put_stream(stream).await.unwrap();
+    }
+
+    fn ftp_session_establishment_count() -> usize {
+        FTP_SESSION_ESTABLISHMENT_COUNT.load(Ordering::Relaxed)
     }
 
     #[test]
@@ -1960,33 +2042,55 @@ mod tests {
         direct.quit().await.unwrap();
 
         let empty_directory = RemotePath::parse("ticket-4-empty").unwrap();
+        let sessions_before_create = ftp_session_establishment_count();
         create_ftp_directory_exact(&input.config, &empty_directory, Some(&password)).await.unwrap();
+        assert_eq!(
+            ftp_session_establishment_count() - sessions_before_create,
+            1,
+            "normal directory create must use one control session"
+        );
+        let sessions_before_directory_delete = ftp_session_establishment_count();
         assert!(matches!(
             delete_entry(&input.config, &empty_directory, Some(&password)).await.unwrap().outcome,
             FileMutationOutcome::Completed
         ));
+        assert_eq!(
+            ftp_session_establishment_count() - sessions_before_directory_delete,
+            1,
+            "normal directory delete must use one control session"
+        );
 
         let removable_file = RemotePath::parse("ticket-4-file.txt").unwrap();
-        let removable_file_path = configured_operation_path(&input.config, &removable_file, false);
         direct = direct_ftp(&input, &password).await;
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-file.txt", b"delete me").await;
         direct.quit().await.unwrap();
+        let sessions_before_file_delete = ftp_session_establishment_count();
         assert!(matches!(
             delete_entry(&input.config, &removable_file, Some(&password)).await.unwrap().outcome,
             FileMutationOutcome::Completed
         ));
+        assert_eq!(
+            ftp_session_establishment_count() - sessions_before_file_delete,
+            1,
+            "normal file delete must use one control session"
+        );
         operator = build_operator(&input.config, Some(&password)).unwrap();
-        assert_eq!(operator.stat(&removable_file_path).await.unwrap_err().kind(), ErrorKind::NotFound);
+        assert!(stat_remote_metadata(&operator, &input.config, removable_file.as_str(), Some(&password))
+            .await
+            .is_err());
 
         for (literal_name, decoded_name) in
             [("ticket-4%20literal-dir", "ticket-4 literal-dir"), ("ticket-4%2Fliteral-dir", "ticket-4/literal-dir")]
         {
             let literal_directory = RemotePath::parse(literal_name).unwrap();
-            let literal_directory_path = configured_operation_path(&input.config, &literal_directory, true);
             drop(operator);
             create_ftp_directory_exact(&input.config, &literal_directory, Some(&password)).await.unwrap();
             operator = build_operator(&input.config, Some(&password)).unwrap();
-            assert!(operator.stat(&literal_directory_path).await.unwrap().mode().is_dir());
+            assert!(stat_remote_metadata(&operator, &input.config, literal_name, Some(&password))
+                .await
+                .unwrap()
+                .mode()
+                .is_dir());
             drop(operator);
             direct = direct_ftp(&input, &password).await;
             direct.cwd(format!("/ftp/dbx/{literal_name}")).await.unwrap();
@@ -2005,10 +2109,15 @@ mod tests {
         }
 
         let percent_space_file = RemotePath::parse("ticket-4%20literal-file").unwrap();
-        let percent_space_file_path = configured_operation_path(&input.config, &percent_space_file, false);
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4%20literal-file", b"literal").await;
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4 literal-file", b"decoded-target").await;
-        assert_eq!(operator.stat(&percent_space_file_path).await.unwrap().content_length(), 7);
+        assert_eq!(
+            stat_remote_metadata(&operator, &input.config, percent_space_file.as_str(), Some(&password))
+                .await
+                .unwrap()
+                .content_length(),
+            7
+        );
         drop(operator);
         direct.quit().await.unwrap();
         delete_entry(&input.config, &percent_space_file, Some(&password)).await.unwrap();
@@ -2024,10 +2133,15 @@ mod tests {
         direct = direct_ftp(&input, &password).await;
         direct.mkdir("/ftp/dbx/ticket-4-decoded").await.unwrap();
         let percent_slash_file = RemotePath::parse("ticket-4-decoded%2Fliteral-file").unwrap();
-        let percent_slash_file_path = configured_operation_path(&input.config, &percent_slash_file, false);
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-decoded%2Fliteral-file", b"raw").await;
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-decoded/literal-file", b"decoded-target").await;
-        assert_eq!(operator.stat(&percent_slash_file_path).await.unwrap().content_length(), 3);
+        assert_eq!(
+            stat_remote_metadata(&operator, &input.config, percent_slash_file.as_str(), Some(&password))
+                .await
+                .unwrap()
+                .content_length(),
+            3
+        );
         drop(operator);
         direct.quit().await.unwrap();
         delete_entry(&input.config, &percent_slash_file, Some(&password)).await.unwrap();
@@ -2041,9 +2155,7 @@ mod tests {
         direct.quit().await.unwrap();
 
         let nonempty_directory = RemotePath::parse("ticket-4-nonempty").unwrap();
-        let nonempty_directory_path = configured_operation_path(&input.config, &nonempty_directory, true);
         create_ftp_directory_exact(&input.config, &nonempty_directory, Some(&password)).await.unwrap();
-        let nonempty_child = format!("{nonempty_directory_path}child.txt");
         direct = direct_ftp(&input, &password).await;
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-nonempty/child.txt", b"keep me").await;
         direct.quit().await.unwrap();
@@ -2052,17 +2164,20 @@ mod tests {
             .unwrap_err()
             .contains("not empty"));
         operator = build_operator(&input.config, Some(&password)).unwrap();
-        operator.stat(&nonempty_child).await.unwrap();
+        stat_remote_metadata(&operator, &input.config, "ticket-4-nonempty/child.txt", Some(&password)).await.unwrap();
 
         // Model a remote writer racing the preflight. The exact FTP RMD must
         // fail once the child exists; no recursive fallback is attempted.
         let raced_directory = RemotePath::parse("ticket-4-raced").unwrap();
-        let raced_directory_path = configured_operation_path(&input.config, &raced_directory, true);
         drop(operator);
         create_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.unwrap();
         let FileConnectionConfig::Ftp(ftp_config) = &input.config;
-        assert!(!ftp_directory_has_children(ftp_config, &raced_directory, Some(&password)).await.unwrap());
-        let raced_child = format!("{raced_directory_path}concurrent.txt");
+        let mut preflight = direct_ftp(&input, &password).await;
+        assert!(matches!(
+            prepare_ftp_delete_in_session(&mut preflight, ftp_config, &raced_directory, Some(&password)).await.unwrap(),
+            FtpEntryKind::Directory
+        ));
+        preflight.quit().await.unwrap();
         direct = direct_ftp(&input, &password).await;
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-raced/concurrent.txt", b"created after preflight").await;
         direct.quit().await.unwrap();
@@ -2070,19 +2185,25 @@ mod tests {
             delete_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.unwrap_err();
         assert!(raced_delete_error.contains("recursive delete is unsupported"), "{raced_delete_error}");
         operator = build_operator(&input.config, Some(&password)).unwrap();
-        operator.stat(&raced_child).await.unwrap();
+        stat_remote_metadata(&operator, &input.config, "ticket-4-raced/concurrent.txt", Some(&password)).await.unwrap();
 
         for unsafe_path in ["/ftp/dbx/fixture.txt", "../fixture.txt", "%2e%2e/fixture.txt", "safe%2f..%2ffixture.txt"] {
             assert!(RemotePath::parse(unsafe_path).is_err());
         }
-        operator.stat(&format!("{list_path}fixture.txt")).await.unwrap();
+        stat_remote_metadata(&operator, &input.config, "fixture.txt", Some(&password)).await.unwrap();
 
         direct = direct_ftp(&input, &password).await;
         direct_ftp_write(&mut direct, "/ftp/dbx/whitespace-proof", b"x").await;
         direct_ftp_write(&mut direct, "/ftp/dbx/whitespace-proof ", b"yy").await;
         assert_eq!(direct.size("/ftp/dbx/whitespace-proof").await.unwrap(), 1);
         assert_eq!(direct.size("/ftp/dbx/whitespace-proof ").await.unwrap(), 2);
-        assert_eq!(operator.stat(&format!("{list_path}whitespace-proof ")).await.unwrap().content_length(), 1);
+        assert_eq!(
+            stat_remote_metadata(&operator, &input.config, "whitespace-proof ", Some(&password))
+                .await
+                .unwrap()
+                .content_length(),
+            1
+        );
         assert!(RemotePath::parse("whitespace-proof ").unwrap_err().contains("storage runtime"));
         direct.quit().await.unwrap();
         drop(operator);
@@ -2110,7 +2231,6 @@ mod tests {
         direct.rm("/ftp/dbx/whitespace-proof ").await.unwrap();
         direct.quit().await.unwrap();
 
-        operator = build_operator(&input.config, Some(&password)).unwrap();
         let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.endpoint.clone(),
@@ -2120,11 +2240,13 @@ mod tests {
                 FileConnectionConfig::Ftp(config) => config.username.clone(),
             },
         });
-        let before =
-            operator.list(&list_path).await.unwrap().iter().map(|entry| entry.path().to_string()).collect::<Vec<_>>();
+        direct = direct_ftp(&input, &password).await;
+        let before = direct.nlst(None).await.unwrap();
+        direct.quit().await.unwrap();
         assert!(verify_ftp_root_read_only(&missing_config, Some(&password)).await.is_err());
-        let after =
-            operator.list(&list_path).await.unwrap().iter().map(|entry| entry.path().to_string()).collect::<Vec<_>>();
+        direct = direct_ftp(&input, &password).await;
+        let after = direct.nlst(None).await.unwrap();
+        direct.quit().await.unwrap();
         assert_eq!(after, before);
         assert!(!after.iter().any(|path| path.contains("must-not-be-created")));
 

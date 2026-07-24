@@ -12,7 +12,13 @@ passive_max_port="${DBX_TEST_FTP_PASSIVE_MAX_PORT:-21010}"
 cargo test -p dbx --lib file_manager::tests::fixed_ftp_service_contract --no-default-features --no-run
 
 cleanup() {
+  result=$?
+  if [ "${result}" -ne 0 ]; then
+    docker inspect --format 'container={{.State.Status}} running={{.State.Running}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}' "${container}" >&2 || true
+    docker logs "${container}" >&2 || true
+  fi
   docker rm -f "${container}" >/dev/null 2>&1 || true
+  exit "${result}"
 }
 trap cleanup EXIT
 
