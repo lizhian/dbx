@@ -221,6 +221,26 @@ export interface FileManagerEntry {
   lastModified?: string | null;
 }
 
+export interface FileListOptions {
+  pageSize?: number | null;
+}
+
+export interface FileListPage {
+  entries: FileManagerEntry[];
+  cursor?: string | null;
+}
+
+export interface FileEntryStat extends FileManagerEntry {
+  etag?: string | null;
+  version?: string | null;
+  contentType?: string | null;
+  contentEncoding?: string | null;
+  contentDisposition?: string | null;
+  cacheControl?: string | null;
+  contentMd5?: string | null;
+  userMetadata: Record<string, string>;
+}
+
 export interface SavedSqlSyncEntry {
   folderName?: string;
   fileName: string;
@@ -1306,7 +1326,23 @@ export async function testFileConnection(input: FileConnectionInput): Promise<Fi
 }
 
 export async function listFileRoot(connectionId: string): Promise<FileManagerEntry[]> {
-  return invoke("list_file_root", { connectionId });
+  return (await listFileEntries(connectionId, "")).entries;
+}
+
+export async function listFileEntries(connectionId: string, path: string, options?: FileListOptions): Promise<FileListPage> {
+  return invoke("list_file_entries", { connectionId, path, options });
+}
+
+export async function listFileEntriesNext(connectionId: string, cursor: string, path: string, options?: FileListOptions): Promise<FileListPage> {
+  return invoke("list_file_entries_next", { connectionId, cursor, path, options });
+}
+
+export async function closeFileListCursor(connectionId: string, cursor: string): Promise<void> {
+  return invoke("close_file_list_cursor", { connectionId, cursor });
+}
+
+export async function statFileEntry(connectionId: string, path: string): Promise<FileEntryStat> {
+  return invoke("stat_file_entry", { connectionId, path });
 }
 
 export async function loadTunnelProfiles(): Promise<TunnelProfile[]> {

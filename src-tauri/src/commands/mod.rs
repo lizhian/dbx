@@ -15,6 +15,7 @@ pub mod etcd_cmd;
 pub mod external_db;
 pub mod external_sql;
 pub mod file_manager;
+mod file_manager_list;
 pub mod fs_open;
 pub mod history;
 pub mod keychain;

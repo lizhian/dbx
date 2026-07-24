@@ -118,6 +118,9 @@ import type {
   FileConnection,
   FileConnectionInput,
   FileConnectionTestResult,
+  FileEntryStat,
+  FileListOptions,
+  FileListPage,
   FileManagerEntry,
 } from "@/lib/backend/tauri";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
@@ -316,6 +319,22 @@ export async function testFileConnection(_input: FileConnectionInput): Promise<F
 }
 
 export async function listFileRoot(_connectionId: string): Promise<FileManagerEntry[]> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function listFileEntries(_connectionId: string, _path: string, _options?: FileListOptions): Promise<FileListPage> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function listFileEntriesNext(_connectionId: string, _cursor: string, _path: string, _options?: FileListOptions): Promise<FileListPage> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function closeFileListCursor(_connectionId: string, _cursor: string): Promise<void> {
+  return desktopFileManagerUnavailable();
+}
+
+export async function statFileEntry(_connectionId: string, _path: string): Promise<FileEntryStat> {
   return desktopFileManagerUnavailable();
 }
 

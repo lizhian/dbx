@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use dbx_core::connection::AppState;
 use dbx_core::storage::FileConnectionStorageRecord;
+use futures::StreamExt;
 use opendal::services::Ftp;
-use opendal::Operator;
+use opendal::{ErrorKind, Metadata, Operator};
 use serde::{Deserialize, Serialize};
 use suppaftp::tokio::AsyncFtpStream;
 use tauri::State;
@@ -16,6 +17,10 @@ use tokio::net::{lookup_host, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use url::Url;
 use uuid::Uuid;
+
+use super::file_manager_list::{
+    FileListOptions, FileListPage, ListSessionBinding, ListSessionRegistry, NormalizedFileListOptions, CURSOR_EXPIRED,
+};
 
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -25,6 +30,7 @@ const DELETE_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct FileManagerRuntime {
     operators: RwLock<HashMap<String, CachedOperator>>,
     lifecycles: Arc<Mutex<HashMap<String, Arc<ConnectionRuntime>>>>,
+    list_sessions: ListSessionRegistry,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,7 +120,7 @@ pub struct FileConnection {
     pub has_password: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntry {
     pub path: String,
@@ -122,6 +128,24 @@ pub struct FileEntry {
     pub kind: String,
     pub size: u64,
     pub last_modified: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStat {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    pub size: u64,
+    pub last_modified: Option<String>,
+    pub etag: Option<String>,
+    pub version: Option<String>,
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_disposition: Option<String>,
+    pub cache_control: Option<String>,
+    pub content_md5: Option<String>,
+    pub user_metadata: HashMap<String, String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -183,6 +207,7 @@ pub async fn delete_file_connection(
     connection_id: String,
 ) -> Result<(), String> {
     let deleting = runtime.start_delete(&connection_id)?;
+    runtime.invalidate_list_sessions(&connection_id);
     if let Err(error) = deleting.wait_for_idle().await {
         deleting.restore_active();
         return Err(error);
@@ -233,11 +258,16 @@ pub async fn test_file_connection(
 }
 
 #[tauri::command]
-pub async fn list_file_root(
+pub async fn list_file_entries(
     state: State<'_, std::sync::Arc<AppState>>,
     runtime: State<'_, FileManagerRuntime>,
     connection_id: String,
-) -> Result<Vec<FileEntry>, String> {
+    path: String,
+    options: Option<FileListOptions>,
+) -> Result<FileListPage, String> {
+    let options = options.unwrap_or_default().normalize()?;
+    let path = normalize_relative_remote_path(&path, true)?;
+    let generation = runtime.list_sessions.generation(&connection_id);
     let lease = runtime.begin_operation(&connection_id)?;
     let record = state
         .storage
@@ -252,31 +282,98 @@ pub async fn list_file_root(
             return Err(error);
         }
     };
+    let binding = list_session_binding(&connection_id, revision, &path, options.clone());
     let cancellation = lease.cancellation();
     run_list_operation(&runtime, &connection_id, revision, &cancellation, LIST_TIMEOUT, async {
-        // The tracer intentionally permits one root browse per connection at a
-        // time so concurrent refreshes cannot create duplicate FTP sessions.
         let _list_guard = lease.entry.list_lock.lock().await;
         let scope = password_scope(&config)?;
         let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
         let operator = runtime.operator_for(&record, &config, password.as_deref())?;
-        verify_ftp_root_read_only(&config, password.as_deref()).await?;
-        let list_path = configured_root_list_path(&config);
-        let entries =
-            operator.list(&list_path).await.map_err(|error| redact_error(error.to_string(), password.as_deref()))?;
-        entries
-            .into_iter()
-            .map(|entry| {
-                let metadata = entry.metadata();
-                Ok(FileEntry {
-                    path: root_relative_entry_path(&list_path, entry.path())?,
-                    name: entry.name().trim_end_matches('/').to_string(),
-                    kind: if metadata.mode().is_dir() { "directory" } else { "file" }.to_string(),
-                    size: metadata.content_length(),
-                    last_modified: metadata.last_modified().map(|value| value.to_string()),
-                })
-            })
-            .collect()
+        if path.is_empty() {
+            verify_ftp_root_read_only(&config, password.as_deref()).await?;
+        }
+        let list_path = configured_directory_path(&config, &path);
+        let lister = operator
+            .lister_with(&list_path)
+            .limit(options.page_size)
+            .await
+            .map_err(|error| redact_error(error.to_string(), password.as_deref()))?;
+        let error_password = password.clone();
+        let configured_root = configured_root_list_path(&config);
+        let stream = lister.map(move |result| {
+            result
+                .map_err(|error| redact_error(error.to_string(), error_password.as_deref()))
+                .and_then(|entry| file_entry_from_opendal(&configured_root, entry))
+        });
+        runtime.list_sessions.open(binding, generation, stream).await
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_file_entries_next(
+    state: State<'_, std::sync::Arc<AppState>>,
+    runtime: State<'_, FileManagerRuntime>,
+    connection_id: String,
+    cursor: String,
+    path: String,
+    options: Option<FileListOptions>,
+) -> Result<FileListPage, String> {
+    let options = options.unwrap_or_default().normalize()?;
+    let path = normalize_relative_remote_path(&path, true)?;
+    let record = state
+        .storage
+        .load_file_connection(&connection_id)
+        .await
+        .map_err(|_| CURSOR_EXPIRED.to_string())?
+        .ok_or_else(|| CURSOR_EXPIRED.to_string())?;
+    let binding = list_session_binding(&connection_id, record.revision, &path, options);
+    runtime.list_sessions.validate(&cursor, &binding)?;
+    let lease = runtime.begin_operation(&connection_id).map_err(|_| CURSOR_EXPIRED.to_string())?;
+    let cancellation = lease.cancellation();
+    let result = run_list_operation(&runtime, &connection_id, record.revision, &cancellation, LIST_TIMEOUT, async {
+        let _list_guard = lease.entry.list_lock.lock().await;
+        runtime.list_sessions.next(&cursor, &binding).await
+    })
+    .await;
+    if result.is_err() {
+        let _ = runtime.list_sessions.invalidate_cursor(&connection_id, &cursor);
+    }
+    result
+}
+
+#[tauri::command]
+pub fn close_file_list_cursor(
+    runtime: State<'_, FileManagerRuntime>,
+    connection_id: String,
+    cursor: String,
+) -> Result<(), String> {
+    runtime.list_sessions.invalidate_cursor(&connection_id, &cursor)
+}
+
+#[tauri::command]
+pub async fn stat_file_entry(
+    state: State<'_, std::sync::Arc<AppState>>,
+    runtime: State<'_, FileManagerRuntime>,
+    connection_id: String,
+    path: String,
+) -> Result<FileStat, String> {
+    let path = normalize_relative_remote_path(&path, true)?;
+    let lease = runtime.begin_operation(&connection_id)?;
+    let record = state
+        .storage
+        .load_file_connection(&connection_id)
+        .await?
+        .ok_or_else(|| "File connection not found".to_string())?;
+    let revision = record.revision;
+    let config = parse_storage_config(&record)?;
+    let cancellation = lease.cancellation();
+    run_list_operation(&runtime, &connection_id, revision, &cancellation, LIST_TIMEOUT, async {
+        let scope = password_scope(&config)?;
+        let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
+        let operator = runtime.operator_for(&record, &config, password.as_deref())?;
+        let metadata = stat_remote_metadata(&operator, &config, &path, password.as_deref()).await?;
+        Ok(file_stat_from_metadata(&path, &metadata))
     })
     .await
 }
@@ -323,6 +420,11 @@ impl FileManagerRuntime {
 
     fn evict(&self, connection_id: &str) {
         self.operators.write().unwrap_or_else(|error| error.into_inner()).remove(connection_id);
+        self.invalidate_list_sessions(connection_id);
+    }
+
+    fn invalidate_list_sessions(&self, connection_id: &str) {
+        self.list_sessions.invalidate_connection(connection_id);
     }
 
     fn evict_revision(&self, connection_id: &str, revision: i64) {
@@ -513,7 +615,7 @@ where
     F: Future<Output = Result<T, String>>,
 {
     let result = run_with_deadline_and_cancellation(cancellation, deadline, future).await;
-    if result.is_err() {
+    if result.as_ref().err().is_some_and(|error| !error.starts_with("CursorExpired:")) {
         runtime.evict_revision(connection_id, revision);
     }
     result
@@ -731,6 +833,132 @@ fn configured_root_list_path(config: &FileConnectionConfig) -> String {
     }
 }
 
+fn configured_directory_path(config: &FileConnectionConfig, path: &str) -> String {
+    configured_entry_path(config, path, true)
+}
+
+fn configured_entry_path(config: &FileConnectionConfig, path: &str, is_directory: bool) -> String {
+    let root = configured_root_list_path(config);
+    let path = path.trim_matches('/');
+    if path.is_empty() {
+        return root;
+    }
+    let joined = if root == "/" { path.to_string() } else { format!("{}{path}", root.trim_start_matches('/')) };
+    if is_directory {
+        format!("{}/", joined.trim_end_matches('/'))
+    } else {
+        joined.trim_end_matches('/').to_string()
+    }
+}
+
+fn normalize_relative_remote_path(path: &str, allow_root: bool) -> Result<String, String> {
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|_| "Remote path contains invalid percent-encoded UTF-8".to_string())?;
+    if decoded.trim() != decoded {
+        return Err("Remote path cannot begin or end with whitespace".to_string());
+    }
+    if decoded.starts_with('/') {
+        return Err("Remote path must be relative to the configured root".to_string());
+    }
+    if decoded.contains('\0') || decoded.contains('\\') {
+        return Err("Remote path contains an invalid character".to_string());
+    }
+    if decoded.is_empty() {
+        return if allow_root { Ok(String::new()) } else { Err("Remote path is required".to_string()) };
+    }
+    let mut normalized = Vec::new();
+    for segment in decoded.split('/') {
+        if segment.is_empty() {
+            return Err("Remote path cannot contain empty path segments".to_string());
+        }
+        if matches!(segment, "." | "..") {
+            return Err("Remote path cannot contain '.' or '..' path segments".to_string());
+        }
+        normalized.push(segment);
+    }
+    Ok(normalized.join("/"))
+}
+
+fn list_session_binding(
+    connection_id: &str,
+    revision: i64,
+    path: &str,
+    options: NormalizedFileListOptions,
+) -> ListSessionBinding {
+    ListSessionBinding { connection_id: connection_id.to_string(), revision, path: path.to_string(), options }
+}
+
+fn file_entry_from_opendal(list_path: &str, entry: opendal::Entry) -> Result<FileEntry, String> {
+    let metadata = entry.metadata();
+    let kind = if metadata.mode().is_dir() {
+        "directory"
+    } else if metadata.mode().is_file() {
+        "file"
+    } else {
+        return Err("Storage returned an entry with an unknown type".to_string());
+    };
+    let relative_path = root_relative_entry_path(list_path, entry.path())?;
+    let relative_path = if kind == "directory" {
+        relative_path
+            .strip_suffix('/')
+            .ok_or_else(|| "Storage returned a directory path without a trailing slash".to_string())?
+    } else {
+        relative_path.as_str()
+    };
+    let path = normalize_relative_remote_path(relative_path, false)?;
+    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+    Ok(FileEntry {
+        path,
+        name,
+        kind: kind.to_string(),
+        size: if metadata.mode().is_file() { metadata.content_length() } else { 0 },
+        last_modified: metadata.last_modified().map(|value| value.to_string()),
+    })
+}
+
+async fn stat_remote_metadata(
+    operator: &Operator,
+    config: &FileConnectionConfig,
+    path: &str,
+    password: Option<&str>,
+) -> Result<Metadata, String> {
+    let file_path = configured_entry_path(config, path, path.is_empty());
+    match operator.stat(&file_path).await {
+        Ok(metadata) => Ok(metadata),
+        Err(error) if !path.is_empty() && error.kind() == ErrorKind::NotFound => {
+            let directory_path = configured_entry_path(config, path, true);
+            operator.stat(&directory_path).await.map_err(|error| redact_error(error.to_string(), password))
+        }
+        Err(error) => Err(redact_error(error.to_string(), password)),
+    }
+}
+
+fn file_stat_from_metadata(path: &str, metadata: &Metadata) -> FileStat {
+    FileStat {
+        path: path.to_string(),
+        name: if path.is_empty() { "/".to_string() } else { path.rsplit('/').next().unwrap_or(path).to_string() },
+        kind: if metadata.mode().is_dir() {
+            "directory"
+        } else if metadata.mode().is_file() {
+            "file"
+        } else {
+            "unknown"
+        }
+        .to_string(),
+        size: if metadata.mode().is_file() { metadata.content_length() } else { 0 },
+        last_modified: metadata.last_modified().map(|value| value.to_string()),
+        etag: metadata.etag().map(ToString::to_string),
+        version: metadata.version().map(ToString::to_string),
+        content_type: metadata.content_type().map(ToString::to_string),
+        content_encoding: metadata.content_encoding().map(ToString::to_string),
+        content_disposition: metadata.content_disposition().map(ToString::to_string),
+        cache_control: metadata.cache_control().map(ToString::to_string),
+        content_md5: metadata.content_md5().map(ToString::to_string),
+        user_metadata: metadata.user_metadata().cloned().unwrap_or_default(),
+    }
+}
+
 fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
@@ -945,6 +1173,17 @@ mod tests {
         assert!(root_relative_entry_path("ftp/dbx/", "ftp/dbx/safe%00escape").is_err());
     }
 
+    #[test]
+    fn remote_paths_reject_opendal_trim_ambiguity_but_preserve_inner_spaces() {
+        assert!(normalize_relative_remote_path(" leading/trailing", false).is_err());
+        assert!(normalize_relative_remote_path("leading/trailing ", false).is_err());
+        assert_eq!(normalize_relative_remote_path("folder /file name.txt", false).unwrap(), "folder /file name.txt");
+        assert_eq!(normalize_relative_remote_path("folder/file%20name.txt", false).unwrap(), "folder/file name.txt");
+        assert!(normalize_relative_remote_path("safe//file", false).is_err());
+        assert!(normalize_relative_remote_path("folder/", false).is_err());
+        assert!(normalize_relative_remote_path(" folder /../escape", false).is_err());
+    }
+
     #[tokio::test]
     #[ignore = "run through tests/ftp-contract.sh with a pinned FTP image"]
     async fn fixed_ftp_service_contract() {
@@ -1001,6 +1240,48 @@ mod tests {
         let paths =
             entries.iter().map(|entry| root_relative_entry_path(&list_path, entry.path()).unwrap()).collect::<Vec<_>>();
         assert!(paths.iter().any(|path| path == "fixture.txt"), "entries: {paths:?}");
+
+        let lister = operator.lister_with(&list_path).limit(50).await.unwrap();
+        let list_root = list_path.clone();
+        let stream = lister.map(move |result| {
+            result.map_err(|error| error.to_string()).and_then(|entry| file_entry_from_opendal(&list_root, entry))
+        });
+        let registry = ListSessionRegistry::default();
+        let binding = list_session_binding(
+            "ftp-contract",
+            updated.revision,
+            "",
+            FileListOptions { page_size: Some(50) }.normalize().unwrap(),
+        );
+        let mut page = registry.open(binding.clone(), registry.generation("ftp-contract"), stream).await.unwrap();
+        let mut paged_paths = page.entries.into_iter().map(|entry| entry.path).collect::<Vec<_>>();
+        while let Some(cursor) = page.cursor {
+            page = registry.next(&cursor, &binding).await.unwrap();
+            assert!(page.entries.len() <= 50);
+            paged_paths.extend(page.entries.iter().map(|entry| entry.path.clone()));
+        }
+        assert_eq!(paged_paths.len(), 207);
+        let unique_paths = paged_paths.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique_paths.len(), paged_paths.len());
+        assert!(paged_paths.iter().any(|path| path == "nested"));
+
+        let metadata = stat_remote_metadata(&operator, &input.config, "fixture.txt", Some(&password)).await.unwrap();
+        let stat = file_stat_from_metadata("fixture.txt", &metadata);
+        assert_eq!(stat.kind, "file");
+        assert_eq!(stat.name, "fixture.txt");
+        assert!(stat.size > 0);
+
+        let metadata = stat_remote_metadata(&operator, &input.config, "nested", Some(&password)).await.unwrap();
+        let stat = file_stat_from_metadata("nested", &metadata);
+        assert_eq!(stat.kind, "directory");
+        assert_eq!(stat.name, "nested");
+        assert_eq!(stat.size, 0);
+
+        let metadata = stat_remote_metadata(&operator, &input.config, "", Some(&password)).await.unwrap();
+        let stat = file_stat_from_metadata("", &metadata);
+        assert_eq!(stat.kind, "directory");
+        assert_eq!(stat.name, "/");
+        assert_eq!(stat.size, 0);
 
         let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: match &input.config {
