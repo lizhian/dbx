@@ -194,7 +194,15 @@ export interface S3FileConnectionConfig {
   anonymous: boolean;
 }
 
-export type FileConnectionConfig = FtpFileConnectionConfig | S3FileConnectionConfig;
+export interface WebdavFileConnectionConfig {
+  type: "webdav";
+  endpoint: string;
+  root: string;
+  authentication: "none" | "basic" | "bearer";
+  username: string;
+}
+
+export type FileConnectionConfig = FtpFileConnectionConfig | S3FileConnectionConfig | WebdavFileConnectionConfig;
 
 export interface FileConnectionInput {
   id?: string | null;
@@ -208,6 +216,8 @@ export interface FileConnectionInput {
     secretAccessKey?: string | null;
     sessionToken?: string | null;
     clearS3Credentials?: boolean;
+    webdavToken?: string | null;
+    clearWebdavCredentials?: boolean;
   } | null;
 }
 

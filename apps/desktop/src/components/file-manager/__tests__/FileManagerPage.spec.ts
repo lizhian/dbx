@@ -231,6 +231,15 @@ describe("FileManagerPage transfer lifecycle", () => {
 
     expect(root?.textContent).not.toContain("fileManager.ftpSecurity");
     expect(root?.textContent).toContain("fileManager.s3Security");
+
+    typeSelect.value = "webdav";
+    typeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    await nextTick();
+
+    expect(root?.textContent).not.toContain("fileManager.s3Security");
+    expect(root?.textContent).toContain("fileManager.webdavSecurity");
+    expect(root?.querySelector("#file-connection-webdav-auth")).toBeTruthy();
+    expect(root?.querySelector("#file-connection-webdav-password")).toBeTruthy();
   });
 
   it("hydrates terminal and active transfers, applies progress, and exposes cancellation", async () => {

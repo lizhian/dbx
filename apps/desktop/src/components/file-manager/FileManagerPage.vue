@@ -27,6 +27,7 @@ const text = computed(() => ({
   connectionType: t("fileManager.connectionType"),
   ftp: "FTP",
   s3: "S3",
+  webdav: "WebDAV",
   region: t("fileManager.region"),
   bucket: t("fileManager.bucket"),
   accessKeyId: t("fileManager.accessKeyId"),
@@ -42,6 +43,13 @@ const text = computed(() => ({
   clearPassword: t("fileManager.clearPassword"),
   ftpSecurity: t("fileManager.ftpSecurity"),
   s3Security: t("fileManager.s3Security"),
+  webdavSecurity: t("fileManager.webdavSecurity"),
+  authentication: t("fileManager.authentication"),
+  authNone: t("fileManager.authNone"),
+  authBasic: t("fileManager.authBasic"),
+  authBearer: t("fileManager.authBearer"),
+  bearerToken: t("fileManager.bearerToken"),
+  clearWebdavCredentials: t("fileManager.clearWebdavCredentials"),
   test: t("fileManager.test"),
   save: t("common.save"),
   cancel: t("common.cancel"),
@@ -90,6 +98,8 @@ const text = computed(() => ({
   copyRenameRisk: t("fileManager.copyRenameRisk"),
   s3CopyRisk: t("fileManager.s3CopyRisk"),
   s3RenameRisk: t("fileManager.s3RenameRisk"),
+  webdavCopyRisk: t("fileManager.webdavCopyRisk"),
+  webdavRenameRisk: t("fileManager.webdavRenameRisk"),
   replaceDestination: t("fileManager.replaceDestination"),
   replaceConfirm: (path: string) => t("fileManager.replaceConfirm", { path }),
   retrySourceDelete: t("fileManager.retrySourceDelete"),
@@ -148,8 +158,9 @@ const replaceDestination = ref(false);
 const directoryPath = ref("");
 const clearPassword = ref(false);
 const clearS3Credentials = ref(false);
+const clearWebdavCredentials = ref(false);
 const form = ref({
-  type: "ftp" as "ftp" | "s3",
+  type: "ftp" as "ftp" | "s3" | "webdav",
   name: "",
   endpoint: "ftp://localhost:21",
   root: "/",
@@ -162,6 +173,8 @@ const form = ref({
   sessionToken: "",
   virtualHostStyle: false,
   anonymous: false,
+  webdavAuthentication: "basic" as "none" | "basic" | "bearer",
+  webdavToken: "",
 });
 let connectionsGeneration = 0;
 let rootGeneration = 0;
@@ -171,7 +184,15 @@ let unlistenTransfers: UnlistenFn | null = null;
 let transferPoll: ReturnType<typeof setInterval> | null = null;
 
 const selectedConnection = computed(() => connections.value.find((connection) => connection.id === selectedId.value));
-const canSubmit = computed(() => !!form.value.name.trim() && !!form.value.endpoint.trim() && form.value.root.startsWith("/") && (form.value.type === "ftp" || (!!form.value.region.trim() && !!form.value.bucket.trim())));
+const connectionSecurityText = computed(() => (form.value.type === "ftp" ? text.value.ftpSecurity : form.value.type === "s3" ? text.value.s3Security : text.value.webdavSecurity));
+const canSubmit = computed(
+  () =>
+    !!form.value.name.trim() &&
+    !!form.value.endpoint.trim() &&
+    form.value.root.startsWith("/") &&
+    (form.value.type !== "s3" || (!!form.value.region.trim() && !!form.value.bucket.trim())) &&
+    (form.value.type !== "webdav" || form.value.webdavAuthentication !== "basic" || !!form.value.username.trim()),
+);
 const breadcrumbs = computed(() => {
   const result = [{ label: "/", path: "" }];
   const segments = currentPath.value.split("/").filter(Boolean);
@@ -210,6 +231,22 @@ function inputFromForm(): FileConnectionInput {
           : undefined,
     };
   }
+  if (form.value.type === "webdav") {
+    const hasCredential = (form.value.webdavAuthentication === "basic" && !!form.value.password) || (form.value.webdavAuthentication === "bearer" && !!form.value.webdavToken);
+    return {
+      id: editingId.value,
+      expectedRevision: editingId.value ? selectedConnection.value?.revision : undefined,
+      name: form.value.name.trim(),
+      config: {
+        type: "webdav",
+        endpoint: form.value.endpoint.trim(),
+        root: form.value.root.trim(),
+        authentication: form.value.webdavAuthentication,
+        username: form.value.webdavAuthentication === "basic" ? form.value.username.trim() : "",
+      },
+      secrets: clearWebdavCredentials.value || form.value.webdavAuthentication === "none" ? { clearWebdavCredentials: true } : hasCredential ? (form.value.webdavAuthentication === "basic" ? { password: form.value.password } : { webdavToken: form.value.webdavToken }) : undefined,
+    };
+  }
   return {
     id: editingId.value,
     expectedRevision: editingId.value ? selectedConnection.value?.revision : undefined,
@@ -222,6 +259,16 @@ function inputFromForm(): FileConnectionInput {
     },
     secrets: clearPassword.value ? { password: null, clearPassword: true } : form.value.password ? { password: form.value.password } : undefined,
   };
+}
+
+function remoteOperationRisk(): string {
+  if (selectedConnection.value?.config.type === "s3") {
+    return remoteOperation.value === "copy" ? text.value.s3CopyRisk : text.value.s3RenameRisk;
+  }
+  if (selectedConnection.value?.config.type === "webdav") {
+    return remoteOperation.value === "copy" ? text.value.webdavCopyRisk : text.value.webdavRenameRisk;
+  }
+  return text.value.copyRenameRisk;
 }
 
 async function loadConnections(preferredId?: string) {
@@ -394,10 +441,13 @@ function openCreate() {
     sessionToken: "",
     virtualHostStyle: false,
     anonymous: false,
+    webdavAuthentication: "basic",
+    webdavToken: "",
   };
   testResult.value = null;
   clearPassword.value = false;
   clearS3Credentials.value = false;
+  clearWebdavCredentials.value = false;
   editorOpen.value = true;
 }
 
@@ -410,7 +460,7 @@ function openEdit() {
     name: connection.name,
     endpoint: connection.config.endpoint,
     root: connection.config.root,
-    username: connection.config.type === "ftp" ? connection.config.username : "",
+    username: connection.config.type === "ftp" || connection.config.type === "webdav" ? connection.config.username : "",
     password: "",
     region: connection.config.type === "s3" ? connection.config.region : "us-east-1",
     bucket: connection.config.type === "s3" ? connection.config.bucket : "",
@@ -419,10 +469,13 @@ function openEdit() {
     sessionToken: "",
     virtualHostStyle: connection.config.type === "s3" && connection.config.virtualHostStyle,
     anonymous: connection.config.type === "s3" && connection.config.anonymous,
+    webdavAuthentication: connection.config.type === "webdav" ? connection.config.authentication : "basic",
+    webdavToken: "",
   };
   testResult.value = null;
   clearPassword.value = false;
   clearS3Credentials.value = false;
+  clearWebdavCredentials.value = false;
   editorOpen.value = true;
 }
 
@@ -918,7 +971,7 @@ onBeforeUnmount(() => {
       <div class="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
         <div class="flex gap-2">
           <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
-          <span>{{ form.type === "ftp" ? text.ftpSecurity : text.s3Security }}</span>
+          <span>{{ connectionSecurityText }}</span>
         </div>
       </div>
       <div class="grid gap-3 py-1">
@@ -929,12 +982,13 @@ onBeforeUnmount(() => {
             v-model="form.type"
             class="h-9 rounded-md border border-input bg-background px-3 text-sm"
             @change="
-              form.endpoint = form.type === 'ftp' ? 'ftp://localhost:21' : 'http://localhost:9000';
+              form.endpoint = form.type === 'ftp' ? 'ftp://localhost:21' : form.type === 's3' ? 'http://localhost:9000' : 'http://localhost:8080';
               testResult = null;
             "
           >
             <option value="ftp">{{ text.ftp }}</option>
             <option value="s3">{{ text.s3 }}</option>
+            <option value="webdav">{{ text.webdav }}</option>
           </select>
         </div>
         <div class="grid gap-1.5">
@@ -943,7 +997,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="grid gap-1.5">
           <Label for="file-connection-endpoint">{{ text.endpoint }}</Label
-          ><Input id="file-connection-endpoint" v-model="form.endpoint" :placeholder="form.type === 'ftp' ? 'ftp://host:21' : 'https://s3.example.com'" />
+          ><Input id="file-connection-endpoint" v-model="form.endpoint" :placeholder="form.type === 'ftp' ? 'ftp://host:21' : form.type === 's3' ? 'https://s3.example.com' : 'https://dav.example.com/webdav'" />
         </div>
         <div v-if="form.type === 'ftp'" class="grid grid-cols-2 gap-3">
           <div class="grid gap-1.5">
@@ -963,7 +1017,7 @@ onBeforeUnmount(() => {
             <span>{{ text.clearPassword }}</span>
           </label>
         </div>
-        <template v-else>
+        <template v-else-if="form.type === 's3'">
           <div class="grid grid-cols-2 gap-3">
             <div class="grid gap-1.5">
               <Label for="file-connection-region">{{ text.region }}</Label>
@@ -1016,6 +1070,48 @@ onBeforeUnmount(() => {
             </label>
           </div>
         </template>
+        <template v-else>
+          <div class="grid gap-1.5">
+            <Label for="file-connection-webdav-root">{{ text.root }}</Label>
+            <Input id="file-connection-webdav-root" v-model="form.root" placeholder="/" />
+          </div>
+          <div class="grid gap-1.5">
+            <Label for="file-connection-webdav-auth">{{ text.authentication }}</Label>
+            <select id="file-connection-webdav-auth" v-model="form.webdavAuthentication" class="h-9 rounded-md border border-input bg-background px-3 text-sm">
+              <option value="none">{{ text.authNone }}</option>
+              <option value="basic">{{ text.authBasic }}</option>
+              <option value="bearer">{{ text.authBearer }}</option>
+            </select>
+          </div>
+          <div v-if="form.webdavAuthentication === 'basic'" class="grid gap-3">
+            <div class="grid gap-1.5">
+              <Label for="file-connection-webdav-username">{{ text.username }}</Label>
+              <Input id="file-connection-webdav-username" v-model="form.username" />
+            </div>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-webdav-password">{{ text.password }}</Label>
+              <PasswordInput id="file-connection-webdav-password" v-model="form.password" :disabled="clearWebdavCredentials" :placeholder="editingId ? text.keepPassword : ''" />
+            </div>
+          </div>
+          <div v-else-if="form.webdavAuthentication === 'bearer'" class="grid gap-1.5">
+            <Label for="file-connection-webdav-token">{{ text.bearerToken }}</Label>
+            <PasswordInput id="file-connection-webdav-token" v-model="form.webdavToken" :disabled="clearWebdavCredentials" :placeholder="editingId ? text.keepPassword : ''" />
+          </div>
+          <label v-if="editingId && selectedConnection?.hasCredentials && form.webdavAuthentication !== 'none'" class="flex items-center gap-2 text-xs text-muted-foreground">
+            <input
+              v-model="clearWebdavCredentials"
+              type="checkbox"
+              class="h-3.5 w-3.5 accent-primary"
+              @change="
+                if (clearWebdavCredentials) {
+                  form.password = '';
+                  form.webdavToken = '';
+                }
+              "
+            />
+            <span>{{ text.clearWebdavCredentials }}</span>
+          </label>
+        </template>
       </div>
       <div v-if="testResult" class="space-y-1 rounded border p-2">
         <div v-for="stage in testResult.stages" :key="stage.stage" class="flex min-w-0 items-start gap-2 text-xs">
@@ -1066,7 +1162,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="flex gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
           <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
-          <span>{{ selectedConnection?.config.type === "s3" ? (remoteOperation === "copy" ? text.s3CopyRisk : text.s3RenameRisk) : text.copyRenameRisk }}</span>
+          <span>{{ remoteOperationRisk() }}</span>
         </div>
         <label class="flex items-center gap-2 text-sm">
           <input v-model="replaceDestination" type="checkbox" class="h-4 w-4 accent-primary" />

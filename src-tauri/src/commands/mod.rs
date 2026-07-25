@@ -18,6 +18,7 @@ pub mod file_manager;
 mod file_manager_list;
 mod file_manager_paths;
 mod file_manager_s3;
+mod file_manager_webdav;
 pub mod file_transfer;
 pub mod fs_open;
 pub mod history;

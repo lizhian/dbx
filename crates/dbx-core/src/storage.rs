@@ -526,14 +526,25 @@ impl Storage {
         replace_secrets: bool,
         expected_revision: Option<i64>,
     ) -> Result<FileConnectionStorageRecord, String> {
-        const ALLOWED_SECRET_KEYS: &[&str] =
-            &["password", "password_scope", "access_key_id", "secret_access_key", "session_token", "s3_scope"];
+        const ALLOWED_SECRET_KEYS: &[&str] = &[
+            "password",
+            "password_scope",
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "s3_scope",
+            "webdav_token",
+            "webdav_scope",
+        ];
         if secret_keys.is_empty()
             || !secret_keys.iter().all(|key| ALLOWED_SECRET_KEYS.contains(&key.as_str()))
             || !ALLOWED_SECRET_KEYS.contains(&secret_scope_key.as_str())
             || secrets.iter().any(|(key, _)| !secret_keys.contains(key))
         {
             return Err("Unsupported file connection secret key".to_string());
+        }
+        if secrets.iter().any(|(_, secret)| secret.is_empty()) {
+            return Err("File connection secrets cannot be empty; use the explicit clear operation".to_string());
         }
 
         self.with_conn(move |conn| {
@@ -760,7 +771,7 @@ impl Storage {
                             EXISTS(
                                 SELECT 1 FROM file_connection_secrets s
                                 WHERE s.connection_id = f.id
-                                  AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token')
+                                  AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token')
                             )
                      FROM file_connections f
                      ORDER BY lower(f.name), f.id",
@@ -780,7 +791,7 @@ impl Storage {
                         EXISTS(
                             SELECT 1 FROM file_connection_secrets s
                             WHERE s.connection_id = f.id
-                              AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token')
+                              AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token')
                         )
                  FROM file_connections f
                  WHERE f.id = ?1",
@@ -1328,7 +1339,7 @@ fn query_file_connection_record(conn: &Connection, id: &str) -> Result<FileConne
                 EXISTS(
                     SELECT 1 FROM file_connection_secrets s
                     WHERE s.connection_id = f.id
-                      AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token')
+                      AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token')
                 )
          FROM file_connections f
          WHERE f.id = ?1",
@@ -6402,6 +6413,76 @@ mod tests {
             .unwrap_err();
         assert!(rejected.contains("Unsupported"));
         assert!(storage.load_file_connection("bad").await.unwrap().is_none());
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn webdav_secret_bundle_is_separate_scoped_and_reported() {
+        let db = temp_db_path("webdav-file-connection-secrets");
+        let storage = Storage::open(&db).await.unwrap();
+        let config = r#"{"type":"webdav","endpoint":"https://dav.example.test/service","root":"/tenant/","authentication":"bearer","username":""}"#;
+        let created = storage
+            .save_file_connection_with_secret_bundle(
+                "webdav-1".into(),
+                "WebDAV".into(),
+                "webdav".into(),
+                config.into(),
+                vec![("webdav_token".into(), "webdav-secret-token".into())],
+                vec!["password".into(), "webdav_token".into()],
+                "webdav_scope".into(),
+                "webdav\ndav.example.test\n443\nhttps://dav.example.test/service\n/tenant/\nBearer\n".into(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(created.has_secret);
+        assert!(!created.config_json.contains("webdav-secret-token"));
+        assert_eq!(
+            storage.load_file_connection_secret("webdav-1", "webdav_token").await.unwrap().as_deref(),
+            Some("webdav-secret-token")
+        );
+        assert!(storage.list_file_connections().await.unwrap()[0].has_secret);
+        assert!(storage.load_file_connection("webdav-1").await.unwrap().unwrap().has_secret);
+
+        let empty_rejected = storage
+            .save_file_connection_with_secret_bundle(
+                "webdav-1".into(),
+                "WebDAV".into(),
+                "webdav".into(),
+                config.into(),
+                vec![("webdav_token".into(), String::new())],
+                vec!["password".into(), "webdav_token".into()],
+                "webdav_scope".into(),
+                "webdav\ndav.example.test\n443\nhttps://dav.example.test/service\n/tenant/\nBearer\n".into(),
+                true,
+                Some(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(empty_rejected.contains("cannot be empty"));
+        assert_eq!(
+            storage.load_file_connection_secret("webdav-1", "webdav_token").await.unwrap().as_deref(),
+            Some("webdav-secret-token")
+        );
+
+        let cleared = storage
+            .save_file_connection_with_secret_bundle(
+                "webdav-1".into(),
+                "WebDAV anonymous".into(),
+                "webdav".into(),
+                config.replace("\"bearer\"", "\"none\""),
+                Vec::new(),
+                vec!["password".into(), "webdav_token".into()],
+                "webdav_scope".into(),
+                "anonymous-scope".into(),
+                true,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert!(!cleared.has_secret);
+        assert!(storage.load_file_connection_secret("webdav-1", "webdav_token").await.unwrap().is_none());
         std::fs::remove_file(&db).ok();
     }
 

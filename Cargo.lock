@@ -1945,6 +1945,7 @@ dependencies = [
  "opendal",
  "percent-encoding",
  "portpicker",
+ "quick-xml 0.39.4",
  "redis",
  "reqwest 0.12.28",
  "russh",
@@ -3428,9 +3429,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.14"
+version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3800,7 +3801,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.6.1",
+ "windows-registry 0.5.3",
 ]
 
 [[package]]
@@ -5588,6 +5589,7 @@ dependencies = [
  "opendal-core",
  "opendal-service-ftp",
  "opendal-service-s3",
+ "opendal-service-webdav",
  "opendal-service-webhdfs",
 ]
 
@@ -5657,6 +5659,22 @@ dependencies = [
  "reqsign-file-read-tokio",
  "serde",
  "url",
+]
+
+[[package]]
+name = "opendal-service-webdav"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9edadbbf8311e4d382400a5c6021bbfcc850f472a60995897bdc5cbf2d1cabd"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "http",
+ "log",
+ "mea",
+ "opendal-core",
+ "quick-xml 0.39.4",
+ "serde",
 ]
 
 [[package]]

@@ -16,6 +16,14 @@ use super::file_manager_s3::{
     stat_directory_or_virtual as stat_s3_directory_or_virtual, test_connection as test_s3_connection,
     validate_config as validate_s3_config, write_object_exact as write_s3_object_exact,
 };
+use super::file_manager_webdav::{
+    build_operator as build_webdav_operator, capabilities as webdav_capabilities, copy_file as copy_webdav_file,
+    delete_entry as delete_webdav_backend_entry, endpoint_host_port as endpoint_host_port_for_webdav,
+    move_file as move_webdav_file, normalize_endpoint as normalize_webdav_endpoint,
+    normalize_root as normalize_webdav_root, put_file as put_webdav_file, test_connection as test_webdav_connection,
+    validate_config as validate_webdav_config, WebdavMutationError,
+};
+pub use super::file_manager_webdav::{WebdavAuthentication, WebdavConnectionConfig};
 use dbx_core::connection::AppState;
 use dbx_core::storage::{FileConnectionStorageRecord, FileTransferStorageRecord};
 use futures::StreamExt;
@@ -203,6 +211,7 @@ impl UploadPolicy {
 pub enum FileConnectionConfig {
     Ftp(FtpConnectionConfig),
     S3(S3ConnectionConfig),
+    Webdav(WebdavConnectionConfig),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -225,10 +234,13 @@ pub struct FileConnectionSecrets {
     pub session_token: Option<String>,
     #[serde(default)]
     pub clear_s3_credentials: Option<bool>,
+    pub webdav_token: Option<String>,
+    #[serde(default)]
+    pub clear_webdav_credentials: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileConnectionInput {
     pub id: Option<String>,
     pub expected_revision: Option<i64>,
@@ -273,6 +285,7 @@ pub(super) struct ResolvedFileSecrets {
     pub(super) access_key_id: Option<String>,
     pub(super) secret_access_key: Option<String>,
     pub(super) session_token: Option<String>,
+    pub(super) webdav_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -372,6 +385,8 @@ pub async fn save_file_connection(
                             "secret_access_key".to_string(),
                             "session_token".to_string(),
                             "s3_scope".to_string(),
+                            "webdav_token".to_string(),
+                            "webdav_scope".to_string(),
                         ],
                         "password_scope".to_string(),
                         password_scope(&input.config)?,
@@ -418,10 +433,51 @@ pub async fn save_file_connection(
                             "access_key_id".to_string(),
                             "secret_access_key".to_string(),
                             "session_token".to_string(),
+                            "webdav_token".to_string(),
+                            "webdav_scope".to_string(),
                         ],
                         "s3_scope".to_string(),
                         password_scope(&input.config)?,
                         replace_secrets || config.anonymous,
+                        input.expected_revision,
+                    )
+                    .await?
+            }
+            FileConnectionConfig::Webdav(config) => {
+                let supplied = input.secrets.as_ref();
+                let clear = supplied.is_some_and(|secrets| secrets.clear_webdav_credentials == Some(true));
+                let replace_secrets = clear
+                    || supplied.is_some_and(|secrets| secrets.password.is_some() || secrets.webdav_token.is_some())
+                    || config.authentication == WebdavAuthentication::None;
+                let mut values = Vec::new();
+                if !clear && config.authentication != WebdavAuthentication::None {
+                    if let Some(value) = supplied.and_then(|secrets| secrets.password.clone()) {
+                        values.push(("password".to_string(), value));
+                    }
+                    if let Some(value) = supplied.and_then(|secrets| secrets.webdav_token.clone()) {
+                        values.push(("webdav_token".to_string(), value));
+                    }
+                }
+                state
+                    .storage
+                    .save_file_connection_with_secret_bundle(
+                        id.clone(),
+                        input.name.trim().to_string(),
+                        config_kind(&input.config).to_string(),
+                        config_json,
+                        values,
+                        vec![
+                            "password".to_string(),
+                            "password_scope".to_string(),
+                            "access_key_id".to_string(),
+                            "secret_access_key".to_string(),
+                            "session_token".to_string(),
+                            "s3_scope".to_string(),
+                            "webdav_token".to_string(),
+                        ],
+                        "webdav_scope".to_string(),
+                        password_scope(&input.config)?,
+                        replace_secrets,
                         input.expected_revision,
                     )
                     .await?
@@ -832,7 +888,7 @@ impl FileManagerRuntime {
         let expected_size = usize::try_from(
             transfer.total_bytes.ok_or_else(|| "Interrupted upload has no durable source size".to_string())?,
         )
-        .map_err(|_| "Upload size is not representable by the FTP client".to_string())?;
+        .map_err(|_| "Upload size is not representable on this platform".to_string())?;
         let lease = self.begin_operation(&transfer.connection_id)?;
         let cancellation = lease.cancellation();
         let _mutation_guard = tokio::select! {
@@ -869,6 +925,14 @@ impl FileManagerRuntime {
                 let target = configured_entry_path(&config, target.as_str(), false);
                 let source_size = s3_file_size_if_exists(&operator, &source, &secrets).await?;
                 let target_size = s3_file_size_if_exists(&operator, &target, &secrets).await?;
+                Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
+            }
+            FileConnectionConfig::Webdav(_) => {
+                let operator = build_operator_with_secrets(&config, &secrets)?;
+                let source = configured_entry_path(&config, partial.as_str(), false);
+                let target = configured_entry_path(&config, target.as_str(), false);
+                let source_size = file_size_if_exists(&operator, &source, &secrets).await?;
+                let target_size = file_size_if_exists(&operator, &target, &secrets).await?;
                 Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
             }
         }
@@ -972,6 +1036,19 @@ impl PreparedFileMutation<'_> {
                     Err(error) => Err(self.redact_remote_error(error.to_string())),
                 }
             }
+            FileConnectionConfig::Webdav(_) => {
+                let configured = self.configured_path(path.as_str())?;
+                match self.operator.stat(&configured).await {
+                    Ok(metadata) if metadata.mode().is_file() => self
+                        .operator
+                        .delete(&configured)
+                        .await
+                        .map_err(|error| self.redact_remote_error(error.to_string())),
+                    Ok(_) => Err("Operation-owned WebDAV partial is not a file".to_string()),
+                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(self.redact_remote_error(error.to_string())),
+                }
+            }
         }
     }
 
@@ -998,7 +1075,43 @@ impl PreparedFileMutation<'_> {
                     .map_err(|error| self.redact_remote_error(error.to_string()))?;
                 Ok(())
             }
+            FileConnectionConfig::Webdav(_) => {
+                let configured = self.configured_path(path.as_str())?;
+                if self
+                    .operator
+                    .exists(&configured)
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?
+                {
+                    return Err("Operation-owned empty upload partial already exists".to_string());
+                }
+                self.operator
+                    .write(&configured, Vec::<u8>::new())
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                Ok(())
+            }
         }
+    }
+
+    pub(super) fn uses_streaming_webdav_upload(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::Webdav(_))
+    }
+
+    pub(super) async fn put_webdav_upload_partial(
+        &self,
+        path: &str,
+        file: tokio::fs::File,
+        size: u64,
+        progress: Arc<dyn Fn(u64) + Send + Sync>,
+        dispatch_started: Arc<AtomicBool>,
+    ) -> Result<(), WebdavMutationError> {
+        let FileConnectionConfig::Webdav(config) = &self.config else {
+            return Err(WebdavMutationError::definitive(
+                "WebDAV streaming upload received a non-WebDAV connection".to_string(),
+            ));
+        };
+        put_webdav_file(config, path, file, size, progress, &self.secrets, dispatch_started).await
     }
 
     pub(super) async fn publish_owned_upload_partial(
@@ -1014,8 +1127,9 @@ impl PreparedFileMutation<'_> {
         let partial = RemotePath::parse(partial_path)?;
         let target = RemotePath::parse(target_path)?;
         let expected_size = usize::try_from(expected_size)
-            .map_err(|_| "Upload size is not representable by the FTP client".to_string())?;
+            .map_err(|_| "Upload size is not representable on this platform".to_string())?;
         let _mutation_guard = tokio::select! {
+            _ = transfer_cancellation.cancelled() => return Err("Upload was cancelled before publish".to_string()),
             _ = self.cancellation.cancelled() => return Err("The file connection was removed before upload publish".to_string()),
             guard = self.mutation_lock.lock() => guard,
         };
@@ -1031,6 +1145,18 @@ impl PreparedFileMutation<'_> {
         if matches!(self.config, FileConnectionConfig::S3(_)) {
             return self
                 .publish_s3_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    false,
+                    "Upload publish",
+                    transfer_cancellation,
+                )
+                .await;
+        }
+        if matches!(self.config, FileConnectionConfig::Webdav(_)) {
+            return self
+                .publish_webdav_owned_partial(
                     &partial,
                     &target,
                     expected_size,
@@ -1109,7 +1235,7 @@ impl PreparedFileMutation<'_> {
                 let _ = ftp.quit().await;
                 fingerprint.ok_or_else(|| "Remote file no longer exists".to_string())
             }
-            FileConnectionConfig::S3(_) => {
+            FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => {
                 let configured = self.configured_path(path.as_str())?;
                 match self.operator.stat(&configured).await {
                     Ok(metadata) if metadata.mode().is_file() => Ok(remote_fingerprint_from_metadata(&metadata)),
@@ -1131,7 +1257,75 @@ impl PreparedFileMutation<'_> {
     }
 
     pub(super) fn uses_server_side_copy(&self) -> bool {
-        matches!(self.config, FileConnectionConfig::S3(_))
+        matches!(self.config, FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_))
+    }
+
+    pub(super) fn uses_native_rename(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::Webdav(_))
+    }
+
+    pub(super) fn uses_native_webdav_copy(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::Webdav(_))
+    }
+
+    pub(super) async fn acquire_mutation_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.mutation_lock.clone().lock_owned().await
+    }
+
+    pub(super) async fn preflight_native_webdav_mutation(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        replace: bool,
+    ) -> Result<(), String> {
+        if !self.uses_native_webdav_copy() {
+            return Err("Native WebDAV mutation received a non-WebDAV connection".to_string());
+        }
+        let source = self.configured_path(source_path)?;
+        let destination = self.configured_path(destination_path)?;
+        let source_metadata =
+            self.operator.stat(&source).await.map_err(|error| self.redact_remote_error(error.to_string()))?;
+        if !source_metadata.mode().is_file() {
+            return Err("Unsupported: directory copy and rename are not available in v1".to_string());
+        }
+        if !replace
+            && self.operator.exists(&destination).await.map_err(|error| self.redact_remote_error(error.to_string()))?
+        {
+            return Err("Remote destination already exists; best_effort_no_clobber does not replace it".to_string());
+        }
+        Ok(())
+    }
+
+    pub(super) async fn dispatch_native_webdav_copy(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        dispatch_started: Arc<AtomicBool>,
+    ) -> Result<(), WebdavMutationError> {
+        let FileConnectionConfig::Webdav(config) = &self.config else {
+            return Err(WebdavMutationError::definitive(
+                "Native WebDAV COPY received a non-WebDAV connection".to_string(),
+            ));
+        };
+        let source = self.configured_path(source_path).map_err(WebdavMutationError::definitive)?;
+        let destination = self.configured_path(destination_path).map_err(WebdavMutationError::definitive)?;
+        copy_webdav_file(config, &source, &destination, &self.secrets, dispatch_started).await
+    }
+
+    pub(super) async fn dispatch_native_webdav_rename(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        dispatch_started: Arc<AtomicBool>,
+    ) -> Result<(), WebdavMutationError> {
+        let FileConnectionConfig::Webdav(config) = &self.config else {
+            return Err(WebdavMutationError::definitive(
+                "Native WebDAV rename received a non-WebDAV connection".to_string(),
+            ));
+        };
+        let source = self.configured_path(source_path).map_err(WebdavMutationError::definitive)?;
+        let destination = self.configured_path(destination_path).map_err(WebdavMutationError::definitive)?;
+        move_webdav_file(config, &source, &destination, &self.secrets, dispatch_started).await
     }
 
     pub(super) fn redact_exact_ftp_error(&self, error: FtpError) -> String {
@@ -1150,8 +1344,11 @@ impl PreparedFileMutation<'_> {
         let partial = RemotePath::parse(partial_path)?;
         let target = RemotePath::parse(target_path)?;
         let expected_size = usize::try_from(expected_size)
-            .map_err(|_| "Remote copy size is not representable by the FTP client".to_string())?;
+            .map_err(|_| "Remote copy size is not representable on this platform".to_string())?;
         let _mutation_guard = tokio::select! {
+            _ = transfer_cancellation.cancelled() => {
+                return Err("Remote copy was cancelled before publish".to_string())
+            },
             _ = self.cancellation.cancelled() => {
                 return Err("The file connection was removed before remote copy publish".to_string())
             },
@@ -1169,6 +1366,18 @@ impl PreparedFileMutation<'_> {
         if matches!(self.config, FileConnectionConfig::S3(_)) {
             return self
                 .publish_s3_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    replace,
+                    "Remote copy publish",
+                    transfer_cancellation,
+                )
+                .await;
+        }
+        if matches!(self.config, FileConnectionConfig::Webdav(_)) {
+            return self
+                .publish_webdav_owned_partial(
                     &partial,
                     &target,
                     expected_size,
@@ -1286,6 +1495,160 @@ impl PreparedFileMutation<'_> {
                     .await
                     .map_err(|error| format!("Copied source could not be deleted: {error}"))
             }
+            FileConnectionConfig::Webdav(_) => {
+                let source_path = self.configured_path(source.as_str())?;
+                let destination_path = self.configured_path(destination.as_str())?;
+                let source_metadata = self
+                    .operator
+                    .stat(&source_path)
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                let destination_metadata = self
+                    .operator
+                    .stat(&destination_path)
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                if remote_fingerprint_from_metadata(&source_metadata) != *expected_source
+                    || remote_fingerprint_from_metadata(&destination_metadata) != *expected_destination
+                {
+                    return Err(
+                        "Source or destination fingerprint changed; source deletion was not attempted".to_string()
+                    );
+                }
+                self.operator.delete(&source_path).await.map_err(|error| {
+                    format!("Copied source could not be deleted: {}", self.redact_remote_error(error.to_string()))
+                })
+            }
+        }
+    }
+
+    async fn publish_webdav_owned_partial(
+        &self,
+        partial: &RemotePath,
+        target: &RemotePath,
+        expected_size: usize,
+        replace: bool,
+        operation: &str,
+        transfer_cancellation: &CancellationToken,
+    ) -> Result<UploadPublishResolution, String> {
+        let partial_path = self.configured_path(partial.as_str())?;
+        let target_path = self.configured_path(target.as_str())?;
+        let partial_metadata =
+            self.operator.stat(&partial_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?;
+        if !partial_metadata.mode().is_file() || partial_metadata.content_length() != expected_size as u64 {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} WebDAV partial is missing or changed"),
+            });
+        }
+        if !replace
+            && self.operator.exists(&target_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?
+        {
+            return Err(format!("{operation} destination already exists"));
+        }
+        if transfer_cancellation.is_cancelled() {
+            return Err(format!("{operation} was cancelled before WebDAV MOVE dispatch"));
+        }
+        self.cancellation.ensure_active()?;
+        let FileConnectionConfig::Webdav(config) = &self.config else {
+            return Err(format!("{operation} WebDAV publish received a non-WebDAV connection"));
+        };
+        let dispatch_started = Arc::new(AtomicBool::new(false));
+        let move_request =
+            move_webdav_file(config, &partial_path, &target_path, &self.secrets, dispatch_started.clone());
+        tokio::pin!(move_request);
+        let result = tokio::select! {
+            biased;
+            result = tokio::time::timeout(MUTATION_TIMEOUT, &mut move_request) => result,
+            _ = transfer_cancellation.cancelled() => {
+                if dispatch_started.load(Ordering::Acquire) {
+                    return self
+                        .reconcile_uncertain_webdav_move(
+                            &partial_path,
+                            &target_path,
+                            expected_size,
+                            format!("{operation} MOVE was cancelled after dispatch"),
+                        )
+                        .await;
+                }
+                return Err(format!("{operation} was cancelled before WebDAV MOVE dispatch"));
+            }
+            _ = self.cancellation.cancelled() => {
+                if dispatch_started.load(Ordering::Acquire) {
+                    return self
+                        .reconcile_uncertain_webdav_move(
+                            &partial_path,
+                            &target_path,
+                            expected_size,
+                            format!("The file connection was removed after {operation} MOVE dispatch"),
+                        )
+                        .await;
+                }
+                return Err(format!("The file connection was removed before {operation} MOVE dispatch"));
+            }
+        };
+        match result {
+            Ok(Ok(())) => {
+                let target_metadata = self
+                    .operator
+                    .stat(&target_path)
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                if !target_metadata.mode().is_file() || target_metadata.content_length() != expected_size as u64 {
+                    return Ok(UploadPublishResolution {
+                        state: UploadPublishState::PartialTarget,
+                        detail: format!("{operation} MOVE completed but destination verification failed"),
+                    });
+                }
+                Ok(UploadPublishResolution {
+                    state: UploadPublishState::Completed,
+                    detail: format!("{operation} completed with native WebDAV MOVE"),
+                })
+            }
+            Ok(Err(error)) if !error.is_outcome_unknown() => Err(error.message),
+            Ok(Err(error)) => {
+                self.reconcile_uncertain_webdav_move(&partial_path, &target_path, expected_size, error.message).await
+            }
+            Err(_) => {
+                self.reconcile_uncertain_webdav_move(
+                    &partial_path,
+                    &target_path,
+                    expected_size,
+                    format!("{operation} MOVE timed out"),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reconcile_uncertain_webdav_move(
+        &self,
+        partial_path: &str,
+        target_path: &str,
+        expected_size: usize,
+        detail: String,
+    ) -> Result<UploadPublishResolution, String> {
+        let source = file_size_if_exists(&self.operator, partial_path, &self.secrets).await;
+        let target = file_size_if_exists(&self.operator, target_path, &self.secrets).await;
+        match (source, target) {
+            (Ok(None), Ok(Some(size))) if size == expected_size => Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialTarget,
+                detail: format!(
+                    "{detail}; destination is present and source is absent, but the MOVE response was lost"
+                ),
+            }),
+            (Ok(Some(size)), Ok(None)) if size == expected_size => Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{detail}; owned partial remains and destination is absent"),
+            }),
+            (Ok(source), Ok(target)) => Ok(UploadPublishResolution {
+                state: UploadPublishState::Unknown,
+                detail: format!("{detail}; source size {source:?}, destination size {target:?}"),
+            }),
+            (Err(error), _) | (_, Err(error)) => Ok(UploadPublishResolution {
+                state: UploadPublishState::Unknown,
+                detail: format!("{detail}; reconciliation failed: {error}"),
+            }),
         }
     }
 
@@ -1584,6 +1947,25 @@ async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) ->
                 });
             }
         }
+        FileConnectionConfig::Webdav(config) => {
+            if config.authentication == WebdavAuthentication::None
+                || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_webdav_credentials == Some(true))
+            {
+                return Ok(ResolvedFileSecrets::default());
+            }
+            if input
+                .secrets
+                .as_ref()
+                .is_some_and(|secrets| secrets.password.is_some() || secrets.webdav_token.is_some())
+            {
+                let secrets = input.secrets.as_ref().expect("checked");
+                return Ok(ResolvedFileSecrets {
+                    password: secrets.password.clone(),
+                    webdav_token: secrets.webdav_token.clone(),
+                    ..ResolvedFileSecrets::default()
+                });
+            }
+        }
     }
 
     let Some(id) = input.id.as_deref() else {
@@ -1621,8 +2003,42 @@ async fn load_file_connection_secrets(
             {
                 return Err("Stored S3 credentials do not match this endpoint and bucket; re-enter them".to_string());
             }
-            Ok(ResolvedFileSecrets { password: None, access_key_id, secret_access_key, session_token })
+            Ok(ResolvedFileSecrets {
+                password: None,
+                access_key_id,
+                secret_access_key,
+                session_token,
+                webdav_token: None,
+            })
         }
+        FileConnectionConfig::Webdav(_) => {
+            let stored_scope = storage.load_file_connection_secret(id, "webdav_scope").await?;
+            let password = storage.load_file_connection_secret(id, "password").await?;
+            let webdav_token = storage.load_file_connection_secret(id, "webdav_token").await?;
+            if (password.is_some() || webdav_token.is_some())
+                && stored_scope.as_deref() != Some(password_scope(config)?.as_str())
+            {
+                return Err(
+                    "Stored WebDAV credentials do not match this endpoint and identity; re-enter them".to_string()
+                );
+            }
+            Ok(ResolvedFileSecrets { password, webdav_token, ..ResolvedFileSecrets::default() })
+        }
+    }
+}
+
+async fn file_size_if_exists(
+    operator: &Operator,
+    path: &str,
+    secrets: &ResolvedFileSecrets,
+) -> Result<Option<usize>, String> {
+    match operator.stat(path).await {
+        Ok(metadata) if metadata.mode().is_file() => usize::try_from(metadata.content_length())
+            .map(Some)
+            .map_err(|_| "Remote file size is not representable".to_string()),
+        Ok(_) => Err("Remote resource is not a file".to_string()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(redact_secrets(error.to_string(), secrets)),
     }
 }
 
@@ -1737,6 +2153,10 @@ async fn delete_entry(
             Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
         }
         FileConnectionConfig::S3(config) => delete_s3_backend_entry(config, path, expected_kind, secrets).await,
+        FileConnectionConfig::Webdav(config) => {
+            let operator = build_webdav_operator(config, secrets)?;
+            delete_webdav_backend_entry(config, &operator, path, expected_kind, secrets).await
+        }
     }
 }
 
@@ -1764,6 +2184,17 @@ async fn create_directory_entry(
             let operator = build_s3_operator(config, secrets)?;
             let marker = format!("{}/", path.as_str().trim_end_matches('/'));
             write_s3_object_exact(&operator, &marker, Buffer::new(), true, secrets).await.map(|_| ())
+        }
+        FileConnectionConfig::Webdav(config) => {
+            let operator = build_webdav_operator(config, secrets)?;
+            let directory = format!("{}/", path.as_str().trim_end_matches('/'));
+            match operator.stat(&directory).await {
+                Ok(_) => Err("WebDAV destination already exists".to_string()),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    operator.create_dir(&directory).await.map_err(|error| redact_secrets(error.to_string(), secrets))
+                }
+                Err(error) => Err(redact_secrets(error.to_string(), secrets)),
+            }
         }
     }
 }
@@ -2508,6 +2939,15 @@ async fn test_connection_for_input(
                     .collect(),
             },
         },
+        FileConnectionConfig::Webdav(config) => match validate_input(input) {
+            Ok(()) => test_webdav_connection(config, &secrets).await,
+            Err(error) => FileConnectionTestResult {
+                success: false,
+                stages: std::iter::once(failed_stage("configuration", error))
+                    .chain(["dns", "tcp", "authentication", "root"].into_iter().map(skipped_stage))
+                    .collect(),
+            },
+        },
     }
 }
 
@@ -2538,9 +2978,18 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
                 secrets.access_key_id.is_some()
                     || secrets.secret_access_key.is_some()
                     || secrets.session_token.is_some()
-                    || secrets.clear_s3_credentials.is_some()
             }) {
-                return Err("FTP connections cannot include S3 credentials or clearS3Credentials".to_string());
+                return Err("FTP connections cannot include S3 credentials".to_string());
+            }
+            if input.secrets.as_ref().is_some_and(|secrets| secrets.clear_s3_credentials.is_some()) {
+                return Err("FTP connections cannot include clearS3Credentials".to_string());
+            }
+            if input
+                .secrets
+                .as_ref()
+                .is_some_and(|secrets| secrets.webdav_token.is_some() || secrets.clear_webdav_credentials.is_some())
+            {
+                return Err("FTP connections cannot include WebDAV credentials".to_string());
             }
             endpoint_host_port(&config.endpoint)?;
             normalize_ftp_root(&config.root)?;
@@ -2551,11 +3000,12 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
             Ok(())
         }
         FileConnectionConfig::S3(config) => {
-            if input
-                .secrets
-                .as_ref()
-                .is_some_and(|secrets| secrets.password.is_some() || secrets.clear_password.is_some())
-            {
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.password.is_some()
+                    || secrets.clear_password.is_some()
+                    || secrets.webdav_token.is_some()
+                    || secrets.clear_webdav_credentials.is_some()
+            }) {
                 return Err("S3 connections cannot include an FTP password or clearPassword".to_string());
             }
             let access_key_id = input.secrets.as_ref().and_then(|secrets| secrets.access_key_id.as_deref());
@@ -2567,6 +3017,66 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
                 secret_access_key,
                 input.secrets.as_ref().and_then(|secrets| secrets.session_token.as_deref()),
             )
+        }
+        FileConnectionConfig::Webdav(config) => {
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.access_key_id.is_some()
+                    || secrets.secret_access_key.is_some()
+                    || secrets.session_token.is_some()
+                    || secrets.clear_s3_credentials.is_some()
+                    || secrets.clear_password.is_some()
+            }) {
+                return Err("WebDAV connections cannot include FTP or S3 secret fields".to_string());
+            }
+            if let Some(secrets) = input.secrets.as_ref() {
+                if secrets.clear_webdav_credentials == Some(true)
+                    && (secrets.password.is_some() || secrets.webdav_token.is_some())
+                {
+                    return Err(
+                        "clearWebdavCredentials=true cannot be combined with a WebDAV password or token".to_string()
+                    );
+                }
+                if secrets.password.as_deref() == Some("") || secrets.webdav_token.as_deref() == Some("") {
+                    return Err(
+                        "WebDAV password and token fields cannot be empty; omit the field to preserve credentials or use clearWebdavCredentials=true"
+                            .to_string(),
+                    );
+                }
+                match config.authentication {
+                    WebdavAuthentication::Basic
+                        if secrets.webdav_token.is_some()
+                            || matches!(secrets.clear_webdav_credentials, Some(false)) =>
+                    {
+                        return Err("WebDAV Basic authentication only accepts the password secret field".to_string());
+                    }
+                    WebdavAuthentication::Bearer
+                        if secrets.password.is_some() || matches!(secrets.clear_webdav_credentials, Some(false)) =>
+                    {
+                        return Err(
+                            "WebDAV bearer authentication only accepts the webdavToken secret field".to_string()
+                        );
+                    }
+                    WebdavAuthentication::None
+                        if secrets.password.is_some()
+                            || secrets.webdav_token.is_some()
+                            || secrets.clear_webdav_credentials != Some(true) =>
+                    {
+                        return Err("Anonymous WebDAV only accepts clearWebdavCredentials=true".to_string());
+                    }
+                    _ => {}
+                }
+            }
+            let password = input
+                .secrets
+                .as_ref()
+                .and_then(|secrets| secrets.password.as_deref())
+                .filter(|value| !value.is_empty());
+            let token = input
+                .secrets
+                .as_ref()
+                .and_then(|secrets| secrets.webdav_token.as_deref())
+                .filter(|value| !value.is_empty());
+            validate_webdav_config(config, input.id.is_none(), password, token)
         }
     }
 }
@@ -2608,6 +3118,7 @@ fn build_operator_with_secrets(
                 .map_err(|error| redact_error(error.to_string(), password))
         }
         FileConnectionConfig::S3(config) => build_s3_operator(config, secrets),
+        FileConnectionConfig::Webdav(config) => build_webdav_operator(config, secrets),
     }
 }
 
@@ -2624,6 +3135,11 @@ fn normalize_input(input: &mut FileConnectionInput) -> Result<(), String> {
             config.region = config.region.trim().to_string();
             config.bucket = config.bucket.trim().to_string();
             config.root = normalize_s3_root(&config.root)?;
+        }
+        FileConnectionConfig::Webdav(config) => {
+            config.endpoint = normalize_webdav_endpoint(&config.endpoint)?;
+            config.root = normalize_webdav_root(&config.root)?;
+            config.username = config.username.trim().to_string();
         }
     }
     Ok(())
@@ -2660,7 +3176,7 @@ fn configured_root_list_path(config: &FileConnectionConfig) -> String {
                 format!("{relative}/")
             }
         }
-        FileConnectionConfig::S3(_) => "/".to_string(),
+        FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => "/".to_string(),
     }
 }
 
@@ -2813,7 +3329,7 @@ async fn stat_remote_metadata_once(
             let directory_path = configured_entry_path(config, path, true);
             match config {
                 FileConnectionConfig::S3(_) => stat_s3_directory_or_virtual(operator, &directory_path).await,
-                FileConnectionConfig::Ftp(_) => operator.stat(&directory_path).await,
+                FileConnectionConfig::Ftp(_) | FileConnectionConfig::Webdav(_) => operator.stat(&directory_path).await,
             }
         }
         Err(error) => Err(error),
@@ -2870,6 +3386,17 @@ pub(super) fn password_scope(config: &FileConnectionConfig) -> Result<String, St
             let (host, port) = endpoint_host_port_for_s3(&config.endpoint)?;
             Ok(format!("s3\n{}\n{port}\n{}\n{}", host.to_ascii_lowercase(), config.region, config.bucket))
         }
+        FileConnectionConfig::Webdav(config) => {
+            let (host, port) = endpoint_host_port_for_webdav(&config.endpoint)?;
+            Ok(format!(
+                "webdav\n{}\n{port}\n{}\n{}\n{:?}\n{}",
+                host.to_ascii_lowercase(),
+                config.endpoint,
+                config.root,
+                config.authentication,
+                config.username
+            ))
+        }
     }
 }
 
@@ -2912,7 +3439,15 @@ fn parse_storage_config(record: &FileConnectionStorageRecord) -> Result<FileConn
 fn file_connection_from_storage(record: FileConnectionStorageRecord) -> Result<FileConnection, String> {
     let config = parse_storage_config(&record)?;
     let capabilities = file_connection_capabilities(&config);
-    let has_password = record.has_secret && matches!(config, FileConnectionConfig::Ftp(_));
+    let has_password = record.has_secret
+        && matches!(
+            config,
+            FileConnectionConfig::Ftp(_)
+                | FileConnectionConfig::Webdav(WebdavConnectionConfig {
+                    authentication: WebdavAuthentication::Basic,
+                    ..
+                })
+        );
     Ok(FileConnection {
         id: record.id,
         name: record.name,
@@ -2930,12 +3465,14 @@ fn config_kind(config: &FileConnectionConfig) -> &'static str {
     match config {
         FileConnectionConfig::Ftp(_) => "ftp",
         FileConnectionConfig::S3(_) => "s3",
+        FileConnectionConfig::Webdav(_) => "webdav",
     }
 }
 
 fn file_connection_capabilities(config: &FileConnectionConfig) -> FileConnectionCapabilities {
     match config {
         FileConnectionConfig::S3(_) => s3_capabilities(),
+        FileConnectionConfig::Webdav(_) => webdav_capabilities(),
         FileConnectionConfig::Ftp(_) => FileConnectionCapabilities {
             read: true,
             write: true,
@@ -2965,6 +3502,7 @@ fn redact_secrets(mut message: String, secrets: &ResolvedFileSecrets) -> String 
         secrets.access_key_id.as_deref(),
         secrets.secret_access_key.as_deref(),
         secrets.session_token.as_deref(),
+        secrets.webdav_token.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -3038,6 +3576,36 @@ mod tests {
         }
     }
 
+    fn webdav_input(authentication: WebdavAuthentication) -> FileConnectionInput {
+        FileConnectionInput {
+            id: None,
+            expected_revision: None,
+            name: "WebDAV".to_string(),
+            config: FileConnectionConfig::Webdav(WebdavConnectionConfig {
+                endpoint: "https://dav.example.test/service".to_string(),
+                root: "/tenant/".to_string(),
+                authentication,
+                username: if authentication == WebdavAuthentication::Basic {
+                    "CaseSensitiveUser".to_string()
+                } else {
+                    String::new()
+                },
+            }),
+            secrets: Some(match authentication {
+                WebdavAuthentication::None => {
+                    FileConnectionSecrets { clear_webdav_credentials: Some(true), ..FileConnectionSecrets::default() }
+                }
+                WebdavAuthentication::Basic => {
+                    FileConnectionSecrets { password: Some("password".to_string()), ..FileConnectionSecrets::default() }
+                }
+                WebdavAuthentication::Bearer => FileConnectionSecrets {
+                    webdav_token: Some("token".to_string()),
+                    ..FileConnectionSecrets::default()
+                },
+            }),
+        }
+    }
+
     #[test]
     fn file_connection_secrets_reject_unknown_fields() {
         let secrets = serde_json::json!({
@@ -3049,7 +3617,7 @@ mod tests {
     }
 
     #[test]
-    fn file_connection_configs_reject_unknown_fields_for_ftp_and_s3() {
+    fn file_connection_configs_reject_unknown_fields_for_ftp_s3_and_webdav() {
         let ftp = serde_json::json!({
             "type": "ftp",
             "endpoint": "ftp://example.test:21",
@@ -3067,9 +3635,18 @@ mod tests {
             "anonymous": false,
             "credentialProvider": "environment"
         });
+        let webdav = serde_json::json!({
+            "type": "webdav",
+            "endpoint": "https://dav.example.test/service",
+            "root": "/",
+            "authentication": "basic",
+            "username": "dbx",
+            "digest": true
+        });
 
         assert!(serde_json::from_value::<FileConnectionConfig>(ftp).is_err());
         assert!(serde_json::from_value::<FileConnectionConfig>(s3).is_err());
+        assert!(serde_json::from_value::<FileConnectionConfig>(webdav).is_err());
     }
 
     #[test]
@@ -3094,6 +3671,29 @@ mod tests {
         secrets.password = None;
         secrets.clear_password = Some(false);
         assert!(validate_input(&s3).unwrap_err().contains("clearPassword"));
+
+        let mut webdav = webdav_input(WebdavAuthentication::Basic);
+        webdav.secrets.as_mut().unwrap().clear_password = Some(false);
+        assert!(validate_input(&webdav).unwrap_err().contains("FTP or S3"));
+        webdav.secrets.as_mut().unwrap().clear_password = None;
+        webdav.secrets.as_mut().unwrap().webdav_token = Some("wrong-mode".to_string());
+        assert!(validate_input(&webdav).unwrap_err().contains("only accepts"));
+
+        let mut bearer = webdav_input(WebdavAuthentication::Bearer);
+        bearer.secrets.as_mut().unwrap().clear_webdav_credentials = Some(false);
+        assert!(validate_input(&bearer).unwrap_err().contains("only accepts"));
+        bearer.secrets.as_mut().unwrap().clear_webdav_credentials = Some(true);
+        assert!(validate_input(&bearer).unwrap_err().contains("cannot be combined"));
+
+        let mut empty_basic = webdav_input(WebdavAuthentication::Basic);
+        empty_basic.id = Some("existing-basic".to_string());
+        empty_basic.secrets.as_mut().unwrap().password = Some(String::new());
+        assert!(validate_input(&empty_basic).unwrap_err().contains("cannot be empty"));
+
+        let mut empty_bearer = webdav_input(WebdavAuthentication::Bearer);
+        empty_bearer.id = Some("existing-bearer".to_string());
+        empty_bearer.secrets.as_mut().unwrap().webdav_token = Some(String::new());
+        assert!(validate_input(&empty_bearer).unwrap_err().contains("cannot be empty"));
     }
 
     #[tokio::test]
@@ -4105,12 +4705,12 @@ mod tests {
         let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.endpoint.clone(),
-                FileConnectionConfig::S3(_) => unreachable!(),
+                FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => unreachable!(),
             },
             root: "/ftp/dbx/must-not-be-created".to_string(),
             username: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.username.clone(),
-                FileConnectionConfig::S3(_) => unreachable!(),
+                FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => unreachable!(),
             },
         });
         direct = direct_ftp(&input, &password).await;

@@ -31,6 +31,7 @@ use super::file_manager::{
     validate_remote_relative_path, CancellationSignal, FileManagerRuntime, PreparedFileMutation, PreparedFileOperation,
     RemoteFileFingerprint, UploadPolicy, UploadPublishResolution, UploadPublishState,
 };
+use super::file_manager_webdav::WebdavMutationErrorKind;
 
 const DOWNLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const UPLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
@@ -1238,8 +1239,25 @@ async fn execute_remote_transfer<R: Runtime>(
         )
         .await;
     }
-    let source_before =
-        prepared.stat_remote_file(source_path).await.map_err(remote_failure).map_err(remote_transfer_before_copy)?;
+    let source_before = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(remote_transfer_before_copy(TransferFailure {
+                status: "cancelled",
+                message: "Remote transfer was cancelled during source preflight".to_string(),
+                invalidate_operator: false,
+            }))
+        }
+        _ = prepared.cancellation.cancelled() => {
+            return Err(remote_transfer_before_copy(TransferFailure {
+                status: "cancelled",
+                message: "The file connection was removed during remote source preflight".to_string(),
+                invalidate_operator: true,
+            }))
+        }
+        result = prepared.stat_remote_file(source_path) => {
+            result.map_err(remote_failure).map_err(remote_transfer_before_copy)?
+        }
+    };
     let total_bytes = i64::try_from(source_before.size)
         .map_err(|_| local_failure("Remote source size is not representable"))
         .map_err(remote_transfer_before_copy)?;
@@ -1684,7 +1702,7 @@ async fn execute_remote_transfer<R: Runtime>(
     })
 }
 
-async fn reconcile_uncertain_s3_copy(
+async fn reconcile_uncertain_server_side_copy(
     prepared: &PreparedFileMutation<'_>,
     source: &RemoteFileFingerprint,
     destination_path: &str,
@@ -1722,6 +1740,121 @@ async fn reconcile_uncertain_s3_copy(
             partial_destination: Some(destination_path.to_string()),
             source_fingerprint: Some(source.encode()),
             destination_fingerprint: Some(destination.encode()),
+        },
+        Err(error) => RemoteTransferFailure {
+            failure: partial_failure(format!("{detail}; destination reconciliation failed: {error}")),
+            operation_outcome: "destination_state_unknown",
+            operation_phase: "copying",
+            partial_destination: None,
+            source_fingerprint: Some(source.encode()),
+            destination_fingerprint: None,
+        },
+    }
+}
+
+async fn reconcile_uncertain_webdav_move(
+    prepared: &PreparedFileMutation<'_>,
+    source_before: &RemoteFileFingerprint,
+    source_path: &str,
+    destination_path: &str,
+    detail: String,
+    cancelled: bool,
+) -> RemoteTransferFailure {
+    let source = prepared.fingerprint_remote_file(source_path).await;
+    let destination = prepared.fingerprint_remote_file(destination_path).await;
+    match (source, destination) {
+        (Err(source_error), Ok(destination))
+            if source_error.contains("no longer exists") && destination.size == source_before.size =>
+        {
+            RemoteTransferFailure {
+                failure: partial_failure(format!(
+                    "{detail}; source is absent and destination is present, but the MOVE response was not observed"
+                )),
+                operation_outcome: "move_committed_response_unknown",
+                operation_phase: "copying",
+                partial_destination: Some(destination_path.to_string()),
+                source_fingerprint: Some(source_before.encode()),
+                destination_fingerprint: Some(destination.encode()),
+            }
+        }
+        (Ok(source), Err(destination_error)) if destination_error.contains("no longer exists") => {
+            RemoteTransferFailure {
+                failure: partial_failure(format!(
+                    "{detail}; source remains and destination is currently absent, but a dispatched MOVE may still commit{}",
+                    if cancelled { " after cancellation" } else { "" }
+                )),
+                operation_outcome: "destination_state_unknown",
+                operation_phase: "copying",
+                partial_destination: None,
+                source_fingerprint: Some(source.encode()),
+                destination_fingerprint: None,
+            }
+        }
+        (Ok(source), Ok(destination)) => RemoteTransferFailure {
+            failure: partial_failure(format!(
+                "{detail}; both source and destination are present, so the server outcome is unproven"
+            )),
+            operation_outcome: "destination_present_unproven",
+            operation_phase: "copying",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source.encode()),
+            destination_fingerprint: Some(destination.encode()),
+        },
+        (source, destination) => RemoteTransferFailure {
+            failure: partial_failure(format!(
+                "{detail}; WebDAV MOVE reconciliation was inconclusive (source={}, destination={})",
+                source.as_ref().map(|_| "present").unwrap_or("unknown"),
+                destination.as_ref().map(|_| "present").unwrap_or("unknown")
+            )),
+            operation_outcome: "destination_state_unknown",
+            operation_phase: "copying",
+            partial_destination: None,
+            source_fingerprint: Some(source_before.encode()),
+            destination_fingerprint: None,
+        },
+    }
+}
+
+async fn reconcile_uncertain_webdav_copy(
+    prepared: &PreparedFileMutation<'_>,
+    source: &RemoteFileFingerprint,
+    destination_path: &str,
+    detail: String,
+) -> RemoteTransferFailure {
+    match prepared.fingerprint_remote_file(destination_path).await {
+        Ok(destination)
+            if destination.size == source.size && source.etag.is_some() && destination.etag == source.etag =>
+        {
+            RemoteTransferFailure {
+                failure: partial_failure(format!(
+                    "{detail}; destination matches the durable source fingerprint, but the COPY response was lost"
+                )),
+                operation_outcome: "copy_committed_response_unknown",
+                operation_phase: "copying",
+                partial_destination: Some(destination_path.to_string()),
+                source_fingerprint: Some(source.encode()),
+                destination_fingerprint: Some(destination.encode()),
+            }
+        }
+        Ok(destination) => RemoteTransferFailure {
+            failure: partial_failure(format!(
+                "{detail}; destination exists but could not be proven to match the source"
+            )),
+            operation_outcome: "destination_present_unproven",
+            operation_phase: "copying",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source.encode()),
+            destination_fingerprint: Some(destination.encode()),
+        },
+        Err(error) if error.contains("no longer exists") => RemoteTransferFailure {
+            failure: partial_failure(format!(
+                "{detail}; destination is currently absent, but a dispatched COPY may still commit"
+            )),
+            operation_outcome: "destination_state_unknown",
+            operation_phase: "copying",
+            partial_destination: None,
+            source_fingerprint: Some(source.encode()),
+            destination_fingerprint: None,
         },
         Err(error) => RemoteTransferFailure {
             failure: partial_failure(format!("{detail}; destination reconciliation failed: {error}")),
@@ -1792,13 +1925,26 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
         .map_err(|_| local_failure("Remote source size is not representable"))
         .map_err(remote_transfer_before_copy)?;
     progress.record_total(Some(total_bytes));
-    if prepared
-        .remote_entry_exists(destination_path)
-        .await
-        .map_err(remote_failure)
-        .map_err(remote_transfer_before_copy)?
-        && !policy.replace()
-    {
+    let destination_exists = tokio::select! {
+        _ = cancellation.cancelled() => {
+            return Err(remote_transfer_before_copy(TransferFailure {
+                status: "cancelled",
+                message: "Remote transfer was cancelled during destination preflight".to_string(),
+                invalidate_operator: false,
+            }))
+        }
+        _ = prepared.cancellation.cancelled() => {
+            return Err(remote_transfer_before_copy(TransferFailure {
+                status: "cancelled",
+                message: "The file connection was removed during destination preflight".to_string(),
+                invalidate_operator: true,
+            }))
+        }
+        result = prepared.remote_entry_exists(destination_path) => {
+            result.map_err(remote_failure).map_err(remote_transfer_before_copy)?
+        }
+    };
+    if destination_exists && !policy.replace() {
         return Err(remote_transfer_before_copy(remote_failure(
             "Remote destination already exists; best_effort_no_clobber does not replace it",
         )));
@@ -1827,6 +1973,328 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
         return Err(remote_transfer_before_copy(cancelled_failure()));
     }
 
+    if operation == "rename" && prepared.uses_native_rename() {
+        let _mutation_guard = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "Remote MOVE was cancelled while waiting for the mutation lock".to_string(),
+                    invalidate_operator: false,
+                }))
+            }
+            _ = prepared.cancellation.cancelled() => {
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed while WebDAV MOVE was waiting for the mutation lock".to_string(),
+                    invalidate_operator: true,
+                }))
+            }
+            guard = prepared.acquire_mutation_guard() => guard,
+        };
+        let preflight = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "Remote MOVE was cancelled before dispatch".to_string(),
+                    invalidate_operator: false,
+                }))
+            }
+            _ = prepared.cancellation.cancelled() => {
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed before WebDAV MOVE dispatch".to_string(),
+                    invalidate_operator: true,
+                }))
+            }
+            result = prepared.preflight_native_webdav_mutation(source_path, destination_path, policy.replace()) => result,
+        };
+        preflight.map_err(remote_failure).map_err(remote_transfer_before_copy)?;
+        if cancellation.is_cancelled() {
+            return Err(remote_transfer_before_copy(TransferFailure {
+                status: "cancelled",
+                message: "Remote MOVE was cancelled before dispatch".to_string(),
+                invalidate_operator: false,
+            }));
+        }
+        if prepared.cancellation.is_cancelled() {
+            return Err(remote_transfer_before_copy(TransferFailure {
+                status: "cancelled",
+                message: "The file connection was removed before WebDAV MOVE dispatch".to_string(),
+                invalidate_operator: true,
+            }));
+        }
+        let dispatch_started = Arc::new(AtomicBool::new(false));
+        let dispatch_for_request = dispatch_started.clone();
+        let mutation = tokio::select! {
+            biased;
+            result = tokio::time::timeout(
+                IO_PROGRESS_WATCHDOG,
+                prepared.dispatch_native_webdav_rename(source_path, destination_path, dispatch_for_request),
+            ) => result,
+            _ = cancellation.cancelled() => {
+                if dispatch_started.load(Ordering::Acquire) {
+                    return Err(reconcile_uncertain_webdav_move(
+                        prepared,
+                        &source_before,
+                        source_path,
+                        destination_path,
+                        "WebDAV MOVE was cancelled after dispatch and its outcome is uncertain".to_string(),
+                        true,
+                    ).await);
+                }
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "Remote MOVE was cancelled before dispatch".to_string(),
+                    invalidate_operator: false,
+                }));
+            }
+            _ = prepared.cancellation.cancelled() => {
+                if dispatch_started.load(Ordering::Acquire) {
+                    return Err(reconcile_uncertain_webdav_move(
+                        prepared,
+                        &source_before,
+                        source_path,
+                        destination_path,
+                        "The file connection was removed after WebDAV MOVE dispatch".to_string(),
+                        true,
+                    ).await);
+                }
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed before WebDAV MOVE dispatch".to_string(),
+                    invalidate_operator: true,
+                }));
+            }
+        };
+        match mutation {
+            Ok(Ok(())) => {
+                let destination = prepared.fingerprint_remote_file(destination_path).await.map_err(|error| {
+                    RemoteTransferFailure {
+                        failure: partial_failure(error),
+                        operation_outcome: "move_committed_verification_failed",
+                        operation_phase: "copying",
+                        partial_destination: Some(destination_path.to_string()),
+                        source_fingerprint: Some(source_before.encode()),
+                        destination_fingerprint: None,
+                    }
+                })?;
+                if destination.size != source_before.size {
+                    return Err(RemoteTransferFailure {
+                        failure: partial_failure("WebDAV MOVE destination size did not match the source"),
+                        operation_outcome: "move_committed_verification_failed",
+                        operation_phase: "copying",
+                        partial_destination: Some(destination_path.to_string()),
+                        source_fingerprint: Some(source_before.encode()),
+                        destination_fingerprint: Some(destination.encode()),
+                    });
+                }
+                match prepared.fingerprint_remote_file(source_path).await {
+                    Err(error) if error.contains("no longer exists") => {}
+                    Ok(source) => {
+                        return Err(RemoteTransferFailure {
+                            failure: partial_failure("WebDAV MOVE returned success but the source is still present"),
+                            operation_outcome: "move_committed_verification_failed",
+                            operation_phase: "copying",
+                            partial_destination: Some(destination_path.to_string()),
+                            source_fingerprint: Some(source.encode()),
+                            destination_fingerprint: Some(destination.encode()),
+                        });
+                    }
+                    Err(error) => {
+                        return Err(RemoteTransferFailure {
+                            failure: partial_failure(error),
+                            operation_outcome: "move_committed_verification_failed",
+                            operation_phase: "copying",
+                            partial_destination: Some(destination_path.to_string()),
+                            source_fingerprint: Some(source_before.encode()),
+                            destination_fingerprint: Some(destination.encode()),
+                        });
+                    }
+                }
+                progress.record_bytes(total_bytes);
+                return Ok(RemoteTransferOutcome {
+                    bytes_transferred: total_bytes,
+                    total_bytes,
+                    operation_outcome: "completed",
+                    operation_phase: "completed",
+                    source_fingerprint: source_before.encode(),
+                    destination_fingerprint: destination.encode(),
+                });
+            }
+            Ok(Err(error)) => {
+                if !error.is_outcome_unknown() {
+                    return Err(remote_transfer_before_copy(remote_failure(error.message)));
+                }
+                return Err(reconcile_uncertain_webdav_move(
+                    prepared,
+                    &source_before,
+                    source_path,
+                    destination_path,
+                    error.message,
+                    false,
+                )
+                .await);
+            }
+            Err(_) => {
+                return Err(reconcile_uncertain_webdav_move(
+                    prepared,
+                    &source_before,
+                    source_path,
+                    destination_path,
+                    "WebDAV MOVE timed out".to_string(),
+                    false,
+                )
+                .await);
+            }
+        }
+    }
+
+    if operation == "copy" && prepared.uses_native_webdav_copy() {
+        let _mutation_guard = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "Remote COPY was cancelled while waiting for the mutation lock".to_string(),
+                    invalidate_operator: false,
+                }))
+            }
+            _ = prepared.cancellation.cancelled() => {
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed while WebDAV COPY was waiting for the mutation lock".to_string(),
+                    invalidate_operator: true,
+                }))
+            }
+            guard = prepared.acquire_mutation_guard() => guard,
+        };
+        let preflight = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "Remote COPY was cancelled before dispatch".to_string(),
+                    invalidate_operator: false,
+                }))
+            }
+            _ = prepared.cancellation.cancelled() => {
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed before WebDAV COPY dispatch".to_string(),
+                    invalidate_operator: true,
+                }))
+            }
+            result = prepared.preflight_native_webdav_mutation(source_path, destination_path, policy.replace()) => result,
+        };
+        preflight.map_err(remote_failure).map_err(remote_transfer_before_copy)?;
+        if cancellation.is_cancelled() {
+            return Err(remote_transfer_before_copy(TransferFailure {
+                status: "cancelled",
+                message: "Remote COPY was cancelled before dispatch".to_string(),
+                invalidate_operator: false,
+            }));
+        }
+        if prepared.cancellation.is_cancelled() {
+            return Err(remote_transfer_before_copy(TransferFailure {
+                status: "cancelled",
+                message: "The file connection was removed before WebDAV COPY dispatch".to_string(),
+                invalidate_operator: true,
+            }));
+        }
+        let dispatch_started = Arc::new(AtomicBool::new(false));
+        let dispatch_for_request = dispatch_started.clone();
+        let mutation = tokio::select! {
+            biased;
+            result = tokio::time::timeout(
+                IO_PROGRESS_WATCHDOG,
+                prepared.dispatch_native_webdav_copy(source_path, destination_path, dispatch_for_request),
+            ) => result,
+            _ = cancellation.cancelled() => {
+                if dispatch_started.load(Ordering::Acquire) {
+                    return Err(reconcile_uncertain_webdav_copy(
+                        prepared,
+                        &source_before,
+                        destination_path,
+                        "WebDAV COPY was cancelled after dispatch".to_string(),
+                    ).await);
+                }
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "Remote COPY was cancelled before dispatch".to_string(),
+                    invalidate_operator: false,
+                }));
+            }
+            _ = prepared.cancellation.cancelled() => {
+                if dispatch_started.load(Ordering::Acquire) {
+                    return Err(reconcile_uncertain_webdav_copy(
+                        prepared,
+                        &source_before,
+                        destination_path,
+                        "The file connection was removed after WebDAV COPY dispatch".to_string(),
+                    ).await);
+                }
+                return Err(remote_transfer_before_copy(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed before WebDAV COPY dispatch".to_string(),
+                    invalidate_operator: true,
+                }));
+            }
+        };
+        match mutation {
+            Ok(Ok(())) => {
+                let source_after = prepared
+                    .fingerprint_remote_file(source_path)
+                    .await
+                    .map_err(remote_failure)
+                    .map_err(remote_transfer_before_copy)?;
+                let destination = prepared.fingerprint_remote_file(destination_path).await.map_err(|error| {
+                    RemoteTransferFailure {
+                        failure: partial_failure(error),
+                        operation_outcome: "failed_with_partial_destination",
+                        operation_phase: "copying",
+                        partial_destination: Some(destination_path.to_string()),
+                        source_fingerprint: Some(source_after.encode()),
+                        destination_fingerprint: None,
+                    }
+                })?;
+                if source_after != source_before || destination.size != source_before.size {
+                    return Err(RemoteTransferFailure {
+                        failure: partial_failure("WebDAV source changed during COPY or destination size did not match"),
+                        operation_outcome: "failed_with_partial_destination",
+                        operation_phase: "copying",
+                        partial_destination: Some(destination_path.to_string()),
+                        source_fingerprint: Some(source_after.encode()),
+                        destination_fingerprint: Some(destination.encode()),
+                    });
+                }
+                progress.record_bytes(total_bytes);
+                return Ok(RemoteTransferOutcome {
+                    bytes_transferred: total_bytes,
+                    total_bytes,
+                    operation_outcome: "completed",
+                    operation_phase: "completed",
+                    source_fingerprint: source_after.encode(),
+                    destination_fingerprint: destination.encode(),
+                });
+            }
+            Ok(Err(error)) => {
+                if !error.is_outcome_unknown() {
+                    return Err(remote_transfer_before_copy(remote_failure(error.message)));
+                }
+                return Err(
+                    reconcile_uncertain_webdav_copy(prepared, &source_before, destination_path, error.message).await
+                );
+            }
+            Err(_) => {
+                return Err(reconcile_uncertain_webdav_copy(
+                    prepared,
+                    &source_before,
+                    destination_path,
+                    "WebDAV COPY timed out".to_string(),
+                )
+                .await);
+            }
+        }
+    }
+
     let copier = prepared
         .operator
         .copier_with(&source_configured, &destination_configured)
@@ -1848,18 +2316,18 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
             _ = cancellation.cancelled() => {
                 let abort = copier.abort().await;
                 let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
-                return Err(reconcile_uncertain_s3_copy(
+                return Err(reconcile_uncertain_server_side_copy(
                     prepared, &source_before, destination_path,
-                    format!("S3 server-side copy cancellation response was uncertain{detail}"),
+                    format!("Server-side COPY cancellation response was uncertain{detail}"),
                     true,
                 ).await);
             }
             _ = prepared.cancellation.cancelled() => {
                 let abort = copier.abort().await;
                 let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
-                return Err(reconcile_uncertain_s3_copy(
+                return Err(reconcile_uncertain_server_side_copy(
                     prepared, &source_before, destination_path,
-                    format!("The file connection was removed during S3 copy{detail}"),
+                    format!("The file connection was removed during server-side COPY{detail}"),
                     true,
                 ).await);
             }
@@ -1895,7 +2363,7 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
             Ok(Err(error)) => {
                 let abort = copier.abort().await;
                 let detail = abort.err().map(|abort| format!("; abort failed: {abort}")).unwrap_or_default();
-                return Err(reconcile_uncertain_s3_copy(
+                return Err(reconcile_uncertain_server_side_copy(
                     prepared,
                     &source_before,
                     destination_path,
@@ -1907,11 +2375,11 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
             Err(_) => {
                 let abort = copier.abort().await;
                 let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
-                return Err(reconcile_uncertain_s3_copy(
+                return Err(reconcile_uncertain_server_side_copy(
                     prepared,
                     &source_before,
                     destination_path,
-                    format!("S3 server-side copy timed out{detail}"),
+                    format!("Server-side COPY timed out{detail}"),
                     false,
                 )
                 .await);
@@ -1921,7 +2389,7 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
 
     #[cfg(test)]
     if take_test_s3_copy_after_commit_response_loss(destination_path) {
-        return Err(reconcile_uncertain_s3_copy(
+        return Err(reconcile_uncertain_server_side_copy(
             prepared,
             &source_before,
             destination_path,
@@ -1951,7 +2419,7 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
     if source_after != source_before || destination.size != source_before.size {
         return Err(RemoteTransferFailure {
             failure: partial_failure(
-                "S3 source changed during server-side copy or destination size did not match; source deletion was not attempted",
+                "Source changed during server-side copy or destination size did not match; source deletion was not attempted",
             ),
             operation_outcome: "failed_with_partial_destination",
             operation_phase: "copying",
@@ -2085,6 +2553,22 @@ async fn execute_upload<R: Runtime>(
             partial_relative,
             local,
             cancellation,
+            policy,
+        )
+        .await;
+    }
+    if prepared.uses_streaming_webdav_upload() {
+        return execute_webdav_streaming_upload(
+            app,
+            state,
+            runtime,
+            transfer_id,
+            prepared,
+            target_relative,
+            partial_relative,
+            local,
+            cancellation,
+            progress_snapshot,
             policy,
         )
         .await;
@@ -2233,6 +2717,180 @@ async fn execute_upload<R: Runtime>(
             partial_relative,
             proof: &proof,
             bytes_transferred,
+            cancellation,
+            policy,
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_webdav_streaming_upload<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    runtime: &FileTransferRuntime,
+    transfer_id: &str,
+    prepared: &PreparedFileMutation<'_>,
+    target_relative: &str,
+    partial_relative: &str,
+    local: ValidatedLocalSource,
+    cancellation: &CancellationToken,
+    progress_snapshot: Arc<TransferProgressSnapshot>,
+    policy: UploadPolicy,
+) -> Result<UploadOutcome, UploadFailure> {
+    let proof = local.proof();
+    let size = u64::try_from(local.total_bytes)
+        .map_err(|_| UploadFailure::from(local_failure("Upload size is not representable")))?;
+    let callback_progress = progress_snapshot.clone();
+    let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |bytes| {
+        callback_progress.record_bytes(i64::try_from(bytes).unwrap_or(i64::MAX));
+    });
+    if cancellation.is_cancelled() {
+        return Err(cleanup_closed_upload_partial(prepared, partial_relative, upload_cancelled_failure()).await);
+    }
+    if prepared.cancellation.is_cancelled() {
+        return Err(cleanup_closed_upload_partial(
+            prepared,
+            partial_relative,
+            TransferFailure {
+                status: "cancelled",
+                message: "The file connection was removed before the WebDAV upload was dispatched".to_string(),
+                invalidate_operator: true,
+            },
+        )
+        .await);
+    }
+    let file = tokio::fs::File::from_std(local.file);
+    let dispatch_started = Arc::new(AtomicBool::new(false));
+    let put_request =
+        prepared.put_webdav_upload_partial(partial_relative, file, size, progress, dispatch_started.clone());
+    tokio::pin!(put_request);
+    let mut tick = tokio::time::interval(PROGRESS_INTERVAL);
+    let started = Instant::now();
+    let mut last_observed_bytes = 0_i64;
+    let mut last_progress_at = Instant::now();
+    let put = loop {
+        tokio::select! {
+            biased;
+            result = &mut put_request => {
+                match result {
+                    Ok(()) => break Ok(()),
+                    Err(error) if error.kind == WebdavMutationErrorKind::FailedBeforeMutation => {
+                        return Err(UploadFailure::from(remote_failure(error.message)));
+                    }
+                    Err(error) if !error.is_outcome_unknown() => {
+                        return Err(
+                            cleanup_closed_upload_partial(
+                                prepared,
+                                partial_relative,
+                                remote_failure(error.message),
+                            )
+                            .await,
+                        );
+                    }
+                    Err(error) => break Err(remote_failure(error.message)),
+                }
+            }
+            _ = cancellation.cancelled() => {
+                if !dispatch_started.load(Ordering::Acquire) {
+                    return Err(
+                        cleanup_closed_upload_partial(
+                            prepared,
+                            partial_relative,
+                            upload_cancelled_failure(),
+                        )
+                        .await,
+                    );
+                }
+                break Err(upload_cancelled_active_failure());
+            }
+            _ = prepared.cancellation.cancelled() => {
+                if !dispatch_started.load(Ordering::Acquire) {
+                    return Err(
+                        cleanup_closed_upload_partial(
+                            prepared,
+                            partial_relative,
+                            TransferFailure {
+                                status: "cancelled",
+                                message: "The file connection was removed before the WebDAV upload was dispatched".to_string(),
+                                invalidate_operator: true,
+                            },
+                        )
+                        .await,
+                    );
+                }
+                break Err(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed while the WebDAV upload was running".to_string(),
+                    invalidate_operator: true,
+                });
+            }
+            _ = tick.tick() => {
+                let bytes = progress_snapshot.bytes();
+                if bytes != last_observed_bytes {
+                    last_observed_bytes = bytes;
+                    last_progress_at = Instant::now();
+                } else if last_progress_at.elapsed() >= IO_PROGRESS_WATCHDOG {
+                    break Err(remote_failure("WebDAV streaming PUT made no progress before the I/O watchdog expired"));
+                }
+                if started.elapsed() >= DOWNLOAD_OPERATION_TIMEOUT {
+                    break Err(remote_failure("WebDAV streaming PUT timed out"));
+                }
+                let update = match state
+                    .storage
+                    .update_file_transfer(
+                        transfer_id,
+                        "running".to_string(),
+                        bytes,
+                        Some(proof.total_bytes),
+                        Some(partial_relative.to_string()),
+                        Some(proof.fingerprint.clone()),
+                        None,
+                        false,
+                    )
+                    .await
+                {
+                    Ok(update) => update,
+                    Err(error) => break Err(local_failure(format!("Failed to persist WebDAV upload progress: {error}"))),
+                };
+                if update.status == "running" && runtime.should_emit_progress() {
+                    emit_transfer(app, &update);
+                }
+            }
+        }
+    };
+    if let Err(failure) = put {
+        return Err(UploadFailure {
+            failure: TransferFailure {
+                status: "partial",
+                message: format!(
+                    "{}; the operation-owned WebDAV partial was retained because the dispatched PUT outcome is uncertain",
+                    failure.message
+                ),
+                invalidate_operator: true,
+            },
+            partial_destination: Some(partial_relative.to_string()),
+            abort_outcome: Some("not_attempted_put_outcome_uncertain".to_string()),
+            publish_outcome: None,
+        });
+    }
+    wait_at_test_upload_after_close_barrier().await;
+    if let Err(error) = verify_upload_source_unchanged(&proof, proof.total_bytes) {
+        return Err(cleanup_closed_upload_partial(prepared, partial_relative, local_failure(error)).await);
+    }
+    if let Err(failure) = ensure_remote_target_absent(prepared, &prepared.remote_path).await {
+        return Err(cleanup_closed_upload_partial(prepared, partial_relative, failure).await);
+    }
+    publish_closed_upload(
+        app,
+        state,
+        ClosedUploadContext {
+            transfer_id,
+            prepared,
+            target_relative,
+            partial_relative,
+            proof: &proof,
+            bytes_transferred: proof.total_bytes,
             cancellation,
             policy,
         },
@@ -6063,6 +6721,49 @@ mod tests {
         (app, state, operator, bucket_operator, directory)
     }
 
+    async fn build_webdav_contract_app(
+    ) -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, opendal::Operator, tempfile::TempDir) {
+        use super::super::file_manager::{
+            build_operator, password_scope, FileConnectionConfig, WebdavAuthentication, WebdavConnectionConfig,
+        };
+
+        let endpoint = std::env::var("DBX_TEST_WEBDAV_ENDPOINT").expect("DBX_TEST_WEBDAV_ENDPOINT is required");
+        let username = std::env::var("DBX_TEST_WEBDAV_USERNAME").unwrap_or_else(|_| "dbx".to_string());
+        let password = std::env::var("DBX_TEST_WEBDAV_PASSWORD").unwrap_or_else(|_| "dbx-password".to_string());
+        let config = FileConnectionConfig::Webdav(WebdavConnectionConfig {
+            endpoint,
+            root: "/tenant/root/".to_string(),
+            authentication: WebdavAuthentication::Basic,
+            username,
+        });
+        let operator = build_operator(&config, Some(&password)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        storage
+            .save_file_connection_with_secret_bundle(
+                "webdav-contract".into(),
+                "WebDAV contract".into(),
+                "webdav".into(),
+                serde_json::to_string(&config).unwrap(),
+                vec![("password".to_string(), password)],
+                vec!["password".to_string(), "webdav_token".to_string()],
+                "webdav_scope".to_string(),
+                password_scope(&config).unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        (app, state, operator, directory)
+    }
+
     async fn assert_no_s3_owned_partial(operator: &opendal::Operator, transfer_id: &str) {
         let upload_prefix = format!(".dbx-upload-{transfer_id}-");
         let copy_prefix = format!(".dbx-copy-{transfer_id}-");
@@ -6138,6 +6839,320 @@ mod tests {
             )
             .await;
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/webdav-contract.sh with a digest-pinned WebDAV server"]
+    async fn fixed_webdav_file_transfer_worker_contract() {
+        let (app, state, operator, directory) = build_webdav_contract_app().await;
+        app.state::<FileTransferRuntime>()
+            .ensure_recovered(&state, app.state::<FileManagerRuntime>().inner())
+            .await
+            .unwrap();
+        let local_root = directory.path().canonicalize().unwrap();
+
+        let upload_source = local_root.join("webdav-upload-success.bin");
+        tokio::fs::write(&upload_source, b"worker upload").await.unwrap();
+        let (_, upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-upload-success",
+            "worker-upload-success.bin",
+            &upload_source,
+        )
+        .await;
+        upload_worker.await.unwrap();
+        let upload = state.storage.get_file_transfer("webdav-upload-success").await.unwrap().unwrap();
+        assert_eq!(upload.status, "completed", "{upload:?}");
+        assert_eq!(upload.publish_outcome.as_deref(), Some("completed"), "{upload:?}");
+        assert_eq!(operator.read("worker-upload-success.bin").await.unwrap().to_vec(), b"worker upload");
+        assert!(upload.partial_destination.is_none(), "{upload:?}");
+
+        operator.write("worker-copy-source.bin", "copy payload").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-copy-success",
+            "copy",
+            "worker-copy-source.bin",
+            "worker-copy-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let copy = state.storage.get_file_transfer("webdav-copy-success").await.unwrap().unwrap();
+        assert_eq!(copy.status, "completed", "{copy:?}");
+        assert_eq!(copy.operation_outcome.as_deref(), Some("completed"), "{copy:?}");
+        assert_eq!(operator.read("worker-copy-target.bin").await.unwrap().to_vec(), b"copy payload");
+
+        operator.write("worker-move-source.bin", "move payload").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-move-success",
+            "rename",
+            "worker-move-source.bin",
+            "worker-move-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let moved = state.storage.get_file_transfer("webdav-move-success").await.unwrap().unwrap();
+        assert_eq!(moved.status, "completed", "{moved:?}");
+        assert_eq!(operator.stat("worker-move-source.bin").await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+
+        operator.write("worker-no-clobber-source.bin", "source").await.unwrap();
+        operator.write("worker-no-clobber-target.bin", "keep").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-copy-no-clobber",
+            "copy",
+            "worker-no-clobber-source.bin",
+            "worker-no-clobber-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let no_clobber = state.storage.get_file_transfer("webdav-copy-no-clobber").await.unwrap().unwrap();
+        assert_eq!(no_clobber.status, "failed", "{no_clobber:?}");
+        assert_eq!(no_clobber.operation_outcome.as_deref(), Some("failed_before_copy"), "{no_clobber:?}");
+        assert_eq!(no_clobber.partial_destination, None);
+        assert_eq!(operator.read("worker-no-clobber-target.bin").await.unwrap().to_vec(), b"keep");
+
+        operator.write("worker-reject-copy-source.bin", "reject").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-copy-reject-403",
+            "copy",
+            "worker-reject-copy-source.bin",
+            "worker-copy-reject-403.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let rejected_copy = state.storage.get_file_transfer("webdav-copy-reject-403").await.unwrap().unwrap();
+        assert_eq!(rejected_copy.status, "failed", "{rejected_copy:?}");
+        assert_eq!(rejected_copy.operation_outcome.as_deref(), Some("failed_before_copy"), "{rejected_copy:?}");
+        assert_eq!(rejected_copy.partial_destination, None);
+        assert!(rejected_copy.error.as_deref().is_some_and(|error| error.contains("HTTP 403")));
+
+        operator.write("worker-reject-move-source.bin", "reject").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-move-reject-507",
+            "rename",
+            "worker-reject-move-source.bin",
+            "worker-move-reject-507.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let rejected_move = state.storage.get_file_transfer("webdav-move-reject-507").await.unwrap().unwrap();
+        assert_eq!(rejected_move.status, "failed", "{rejected_move:?}");
+        assert_eq!(rejected_move.operation_outcome.as_deref(), Some("failed_before_copy"), "{rejected_move:?}");
+        assert_eq!(rejected_move.partial_destination, None);
+        assert!(rejected_move.error.as_deref().is_some_and(|error| error.contains("HTTP 507")));
+        assert!(operator.exists("worker-reject-move-source.bin").await.unwrap());
+
+        let rejected_upload_source = local_root.join("webdav-upload-reject-403.bin");
+        tokio::fs::write(&rejected_upload_source, b"rejected upload").await.unwrap();
+        let (_, rejected_upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-upload-reject-403",
+            "worker-upload-reject-403.bin",
+            &rejected_upload_source,
+        )
+        .await;
+        rejected_upload_worker.await.unwrap();
+        let rejected_upload = state.storage.get_file_transfer("webdav-upload-reject-403").await.unwrap().unwrap();
+        assert_eq!(rejected_upload.status, "failed", "{rejected_upload:?}");
+        assert_eq!(rejected_upload.partial_destination, None, "{rejected_upload:?}");
+        assert!(rejected_upload.error.as_deref().is_some_and(|error| error.contains("HTTP 403")));
+
+        operator.write("worker-copy-loss-source.bin", "response loss").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-copy-response-loss",
+            "copy",
+            "worker-copy-loss-source.bin",
+            "worker-response-loss-copy-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let response_loss_copy = state.storage.get_file_transfer("webdav-copy-response-loss").await.unwrap().unwrap();
+        assert_eq!(response_loss_copy.status, "partial", "{response_loss_copy:?}");
+        assert_eq!(
+            response_loss_copy.operation_outcome.as_deref(),
+            Some("destination_present_unproven"),
+            "{response_loss_copy:?}"
+        );
+        assert_eq!(operator.read("worker-response-loss-copy-target.bin").await.unwrap().to_vec(), b"response loss");
+
+        operator.write("worker-move-loss-source.bin", "move response loss").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-move-response-loss",
+            "rename",
+            "worker-move-loss-source.bin",
+            "worker-response-loss-move-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let response_loss_move = state.storage.get_file_transfer("webdav-move-response-loss").await.unwrap().unwrap();
+        assert_eq!(response_loss_move.status, "partial", "{response_loss_move:?}");
+        assert_eq!(
+            response_loss_move.operation_outcome.as_deref(),
+            Some("move_committed_response_unknown"),
+            "{response_loss_move:?}"
+        );
+        assert!(!operator.exists("worker-move-loss-source.bin").await.unwrap());
+        assert_eq!(
+            operator.read("worker-response-loss-move-target.bin").await.unwrap().to_vec(),
+            b"move response loss"
+        );
+
+        let response_loss_upload_source = local_root.join("webdav-upload-response-loss.bin");
+        tokio::fs::write(&response_loss_upload_source, b"upload response loss").await.unwrap();
+        let (_, response_loss_upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-upload-response-loss",
+            "worker-upload-response-loss-target.bin",
+            &response_loss_upload_source,
+        )
+        .await;
+        response_loss_upload_worker.await.unwrap();
+        let response_loss_upload =
+            state.storage.get_file_transfer("webdav-upload-response-loss").await.unwrap().unwrap();
+        assert_eq!(response_loss_upload.status, "partial", "{response_loss_upload:?}");
+        let response_loss_partial = response_loss_upload
+            .partial_destination
+            .as_deref()
+            .expect("PUT response loss must retain the operation-owned partial");
+        assert!(response_loss_partial.contains(".dbx-upload-webdav-upload-response-loss-"));
+        assert!(operator.exists(response_loss_partial).await.unwrap());
+        assert!(response_loss_upload
+            .abort_outcome
+            .as_deref()
+            .is_some_and(|outcome| outcome.contains("put_outcome_uncertain")));
+
+        operator.write("worker-timeout-copy-source.bin", "timeout").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-copy-timeout",
+            "copy",
+            "worker-timeout-copy-source.bin",
+            "worker-timeout-copy-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let timeout = state.storage.get_file_transfer("webdav-copy-timeout").await.unwrap().unwrap();
+        assert_eq!(timeout.status, "partial", "{timeout:?}");
+        assert_eq!(timeout.operation_outcome.as_deref(), Some("destination_state_unknown"), "{timeout:?}");
+        assert!(!operator.exists("worker-timeout-copy-target.bin").await.unwrap());
+
+        operator.write("worker-cancel-lock-source.bin", "cancel").await.unwrap();
+        let connection = state.storage.load_file_connection("webdav-contract").await.unwrap().unwrap();
+        let file_manager = app.state::<FileManagerRuntime>();
+        let prepared = file_manager
+            .prepare_file_mutation_operation(
+                &state,
+                "webdav-contract",
+                "worker-cancel-lock-source.bin",
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        let guard = prepared.acquire_mutation_guard().await;
+        let cancelled_worker = create_remote_worker_transfer_for_connection(
+            &app,
+            "webdav-contract",
+            "webdav-copy-cancelled-lock",
+            "copy",
+            "worker-cancel-lock-source.bin",
+            "worker-cancelled-before-dispatch.bin",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "webdav-copy-cancelled-lock",
+        )
+        .await
+        .unwrap();
+        cancelled_worker.await.unwrap();
+        drop(guard);
+        drop(prepared);
+        let cancelled = state.storage.get_file_transfer("webdav-copy-cancelled-lock").await.unwrap().unwrap();
+        assert_eq!(cancelled.status, "cancelled", "{cancelled:?}");
+        assert_eq!(cancelled.operation_outcome.as_deref(), Some("failed_before_copy"), "{cancelled:?}");
+        assert_eq!(cancelled.partial_destination, None);
+        assert!(!operator.exists("worker-cancelled-before-dispatch.bin").await.unwrap());
+
+        let recovery_id = "webdav-upload-recovery";
+        let recovery_partial = format!(".dbx-upload-{recovery_id}-owned.part");
+        let recovery_target = "worker-recovery-target.bin";
+        let recovery_payload = b"recovery payload";
+        operator.write(&recovery_partial, Bytes::from_static(recovery_payload)).await.unwrap();
+        state
+            .storage
+            .create_file_upload_transfer(
+                recovery_id.into(),
+                "webdav-contract".into(),
+                recovery_target.into(),
+                local_root.join("recovery-source.bin").to_string_lossy().into_owned(),
+                canonical_directory_identity(&local_root),
+                "recovery-source-fingerprint".into(),
+                i64::try_from(recovery_payload.len()).unwrap(),
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .start_file_upload_transfer(
+                recovery_id,
+                recovery_partial.clone(),
+                "recovery-source-fingerprint".into(),
+                i64::try_from(recovery_payload.len()).unwrap(),
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_transfer(
+                recovery_id,
+                "publishing".into(),
+                i64::try_from(recovery_payload.len()).unwrap(),
+                Some(i64::try_from(recovery_payload.len()).unwrap()),
+                Some(recovery_partial.clone()),
+                Some("recovery-source-fingerprint".into()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        let interrupted = interrupted.iter().find(|transfer| transfer.id == recovery_id).unwrap();
+        recover_interrupted_transfer(&state, app.state::<FileManagerRuntime>().inner(), interrupted).await.unwrap();
+        let recovered = state.storage.get_file_transfer(recovery_id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, "partial", "{recovered:?}");
+        assert_eq!(recovered.publish_outcome.as_deref(), Some("partial_source"), "{recovered:?}");
+        assert_eq!(recovered.partial_destination.as_deref(), Some(recovery_partial.as_str()));
     }
 
     async fn write_ftp_contract_fixture(operator: &opendal::Operator, path: &str, payload: &[u8], replace: bool) {
