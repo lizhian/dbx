@@ -1,6 +1,7 @@
 mod commands;
 mod data_dir;
 mod db;
+mod file_secret_keyring;
 #[cfg(target_os = "macos")]
 mod macos_app_delegate;
 mod models;
@@ -1222,6 +1223,9 @@ pub fn run() {
             let storage = tauri::async_runtime::block_on(async {
                 let s = Storage::open(&db_path).await.expect("Failed to open storage");
                 eprintln!("[STARTUP]   Storage::open in {:?}", t.elapsed());
+                if file_secret_keyring::unlock_storage(&s).await.is_err() {
+                    eprintln!("[STARTUP]   File connection secrets remain locked");
+                }
                 let t2 = Instant::now();
                 s.migrate_from_json(&data_dir).await.expect("Failed to migrate JSON data");
                 eprintln!("[STARTUP]   migrate_from_json in {:?}", t2.elapsed());

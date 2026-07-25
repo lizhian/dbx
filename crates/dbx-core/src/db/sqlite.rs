@@ -21,6 +21,7 @@ const SQLITE_DATABASE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 #[derive(Clone)]
 pub struct SqliteHandle {
     conn: Arc<Mutex<Connection>>,
+    interrupt: Arc<rusqlite::InterruptHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +37,10 @@ impl SqliteHandle {
     {
         let mut conn = self.conn.lock().map_err(|e| e.to_string())?;
         f(&mut conn)
+    }
+
+    pub fn interrupt(&self) {
+        self.interrupt.interrupt();
     }
 }
 
@@ -158,7 +163,8 @@ fn open_sqlite_handle(
         load_sqlite_extensions(&conn, &extensions)?;
         register_sqlite_compat_functions(&conn)?;
 
-        return Ok(SqliteHandle { conn: Arc::new(Mutex::new(conn)) });
+        let interrupt = Arc::new(conn.get_interrupt_handle());
+        return Ok(SqliteHandle { conn: Arc::new(Mutex::new(conn)), interrupt });
     }
 
     Err(unlock_error.unwrap_or_else(|| "SQLCipher database unlock failed.".to_string()))

@@ -27,8 +27,8 @@ use super::file_manager_sftp::{
     build_operator as build_sftp_operator, capabilities as sftp_capabilities, classify_error as classify_sftp_error,
     classify_message as classify_sftp_message, cleanup_crash_residue as cleanup_sftp_crash_residue,
     create_directory as create_sftp_directory, delete_entry as delete_sftp_entry,
-    normalize_root as normalize_sftp_root, redact_temporary_key_paths, secret_scope as sftp_secret_scope,
-    test_connection as test_sftp_connection, validate_config as validate_sftp_config, SftpKeyMaterial, SftpPathGuard,
+    normalize_root as normalize_sftp_root, secret_scope as sftp_secret_scope, test_connection as test_sftp_connection,
+    validate_config as validate_sftp_config, SftpKeyMaterial, SftpPathGuard,
 };
 pub use super::file_manager_sftp::{SftpAuthentication, SftpConnectionConfig};
 use super::file_manager_webdav::{
@@ -45,7 +45,13 @@ use super::file_manager_webhdfs::{
     test_connection as test_webhdfs_connection, validate_config as validate_webhdfs_config, WebhdfsAuthentication,
     WebhdfsConnectionConfig, WebhdfsMutationError, WebhdfsStreamingWriter,
 };
+use super::file_transfer::FileTransferRuntime;
 use dbx_core::connection::AppState;
+#[cfg(test)]
+use dbx_core::file_secrets::FileSecretRootKey;
+use dbx_core::file_secrets::{
+    FileSecret, FileSecretBundle, FileSecretKey, FileSecretProtocol, FileSecretRedactor, FileSecretUpdate,
+};
 use dbx_core::storage::{FileConnectionStorageRecord, FileTransferStorageRecord};
 use futures::StreamExt;
 use opendal::services::Ftp;
@@ -67,7 +73,6 @@ use super::file_manager_list::{
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TIMEOUT: Duration = Duration::from_secs(30);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
-const DELETE_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 const FTP_SESSION_ATTEMPTS: usize = 3;
 const FTP_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 #[cfg(test)]
@@ -115,9 +120,9 @@ enum ConnectionLifecycle {
 
 struct ConnectionRuntime {
     state: Mutex<ConnectionRuntimeState>,
-    idle: Notify,
     list_lock: AsyncMutex<()>,
     mutation_lock: Arc<AsyncMutex<()>>,
+    persistence_lock: AsyncMutex<()>,
 }
 
 struct ConnectionRuntimeState {
@@ -126,13 +131,61 @@ struct ConnectionRuntimeState {
     cancellation: Arc<CancellationSignal>,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct TestPersistenceBarrier {
+    operation: &'static str,
+    connection_id: String,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[cfg(test)]
+static TEST_PERSISTENCE_BARRIER: std::sync::OnceLock<Mutex<Option<TestPersistenceBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_test_persistence_barrier(operation: &'static str, connection_id: &str) -> TestPersistenceBarrier {
+    let barrier = TestPersistenceBarrier {
+        operation,
+        connection_id: connection_id.to_string(),
+        entered: Arc::new(Notify::new()),
+        release: Arc::new(Notify::new()),
+    };
+    let mut slot =
+        TEST_PERSISTENCE_BARRIER.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner());
+    assert!(slot.is_none(), "only one persistence barrier may be installed");
+    *slot = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+fn clear_test_persistence_barrier() {
+    *TEST_PERSISTENCE_BARRIER.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+#[cfg(test)]
+async fn wait_test_persistence_barrier(operation: &'static str, connection_id: &str) {
+    let barrier = TEST_PERSISTENCE_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .filter(|barrier| barrier.operation == operation && barrier.connection_id == connection_id)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.entered.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
 #[derive(Default)]
 pub(super) struct CancellationSignal {
     cancelled: AtomicBool,
     notify: Notify,
 }
 
-struct OperationLease {
+pub(super) struct OperationLease {
     connection_id: String,
     entry: Arc<ConnectionRuntime>,
     lifecycles: Arc<Mutex<HashMap<String, Arc<ConnectionRuntime>>>>,
@@ -184,7 +237,7 @@ pub(super) struct PreparedFileMutation<'a> {
     pub cancellation: Arc<CancellationSignal>,
     pub config_json: String,
     config: FileConnectionConfig,
-    password: Option<String>,
+    password: Option<FileSecret>,
     secrets: ResolvedFileSecrets,
     mutation_lock: Arc<AsyncMutex<()>>,
     connection_id: String,
@@ -310,30 +363,30 @@ pub struct FtpConnectionConfig {
     pub username: String,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileConnectionSecrets {
-    pub password: Option<String>,
+    pub password: Option<FileSecret>,
     #[serde(default)]
     pub clear_password: Option<bool>,
-    pub access_key_id: Option<String>,
-    pub secret_access_key: Option<String>,
-    pub session_token: Option<String>,
+    pub access_key_id: Option<FileSecret>,
+    pub secret_access_key: Option<FileSecret>,
+    pub session_token: Option<FileSecret>,
     #[serde(default)]
     pub clear_s3_credentials: Option<bool>,
-    pub webdav_token: Option<String>,
+    pub webdav_token: Option<FileSecret>,
     #[serde(default)]
     pub clear_webdav_credentials: Option<bool>,
-    pub sftp_private_key: Option<String>,
-    pub sftp_private_key_passphrase: Option<String>,
+    pub sftp_private_key: Option<FileSecret>,
+    pub sftp_private_key_passphrase: Option<FileSecret>,
     #[serde(default)]
     pub clear_sftp_credentials: Option<bool>,
-    pub webhdfs_delegation_token: Option<String>,
+    pub webhdfs_delegation_token: Option<FileSecret>,
     #[serde(default)]
     pub clear_webhdfs_credentials: Option<bool>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileConnectionInput {
     pub id: Option<String>,
@@ -375,14 +428,33 @@ pub struct FileConnectionCapabilities {
 
 #[derive(Clone, Default)]
 pub(super) struct ResolvedFileSecrets {
-    pub(super) password: Option<String>,
-    pub(super) access_key_id: Option<String>,
-    pub(super) secret_access_key: Option<String>,
-    pub(super) session_token: Option<String>,
-    pub(super) webdav_token: Option<String>,
-    pub(super) sftp_private_key: Option<String>,
-    pub(super) sftp_private_key_passphrase: Option<String>,
-    pub(super) webhdfs_delegation_token: Option<String>,
+    pub(super) password: Option<FileSecret>,
+    pub(super) access_key_id: Option<FileSecret>,
+    pub(super) secret_access_key: Option<FileSecret>,
+    pub(super) session_token: Option<FileSecret>,
+    pub(super) webdav_token: Option<FileSecret>,
+    pub(super) sftp_private_key: Option<FileSecret>,
+    pub(super) sftp_private_key_passphrase: Option<FileSecret>,
+    pub(super) webhdfs_delegation_token: Option<FileSecret>,
+}
+
+impl ResolvedFileSecrets {
+    pub(super) fn redactor(&self) -> FileSecretRedactor {
+        FileSecretRedactor::from_secrets(
+            [
+                self.password.as_ref(),
+                self.access_key_id.as_ref(),
+                self.secret_access_key.as_ref(),
+                self.session_token.as_ref(),
+                self.webdav_token.as_ref(),
+                self.sftp_private_key.as_ref(),
+                self.sftp_private_key_passphrase.as_ref(),
+                self.webhdfs_delegation_token.as_ref(),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -462,265 +534,35 @@ pub async fn save_file_connection(
     let cancellation = lease.cancellation();
     let record = run_mutation_operation(&cancellation, "Save connection", async {
         let _mutation_guard = lease.entry.mutation_lock.lock().await;
+        let _persistence_guard = lease.entry.persistence_lock.lock().await;
+        #[cfg(test)]
+        wait_test_persistence_barrier("save", &id).await;
         cancellation.ensure_active()?;
         if let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) = &input.config {
             let resolved = resolve_input_secrets(state.inner().as_ref(), &input).await?;
             validate_webhdfs_config(config, true, resolved.webhdfs_delegation_token.as_deref())?;
         }
-        let record = match &input.config {
-            FileConnectionConfig::Ftp(_) => {
-                let password = input.secrets.as_ref().and_then(|secrets| secrets.password.clone());
-                let replace_secret = password.is_some()
-                    || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_password == Some(true));
-                state
-                    .storage
-                    .save_file_connection_with_secret_bundle(
-                        id.clone(),
-                        input.name.trim().to_string(),
-                        config_kind(&input.config).to_string(),
-                        config_json,
-                        password.into_iter().map(|value| ("password".to_string(), value)).collect(),
-                        vec![
-                            "password".to_string(),
-                            "access_key_id".to_string(),
-                            "secret_access_key".to_string(),
-                            "session_token".to_string(),
-                            "s3_scope".to_string(),
-                            "webdav_token".to_string(),
-                            "webdav_scope".to_string(),
-                            "sftp_private_key".to_string(),
-                            "sftp_private_key_passphrase".to_string(),
-                            "sftp_scope".to_string(),
-                            "webhdfs_delegation_token".to_string(),
-                            "webhdfs_scope".to_string(),
-                        ],
-                        "password_scope".to_string(),
-                        password_scope(&input.config)?,
-                        replace_secret,
-                        input.expected_revision,
-                    )
-                    .await?
+        let mut secret_update = file_secret_update_for_input(&mut input)?;
+        if let Some(current) = state.storage.load_file_connection(&id).await? {
+            let current_config = parse_storage_config(&current)?;
+            if file_secret_protocol(&current_config) != secret_update.protocol() && !secret_update.is_replace() {
+                secret_update = FileSecretUpdate::replace(FileSecretBundle::empty(
+                    secret_update.protocol(),
+                    &password_scope(&input.config)?,
+                ));
             }
-            FileConnectionConfig::Sftp(config) => {
-                let supplied = input.secrets.as_ref();
-                let clear = supplied.is_some_and(|secrets| secrets.clear_sftp_credentials == Some(true));
-                let replace_secrets = clear
-                    || config.authentication != SftpAuthentication::PrivateKey
-                    || supplied.is_some_and(|secrets| {
-                        secrets.sftp_private_key.is_some() || secrets.sftp_private_key_passphrase.is_some()
-                    });
-                let mut values = Vec::new();
-                if !clear && config.authentication == SftpAuthentication::PrivateKey {
-                    if let Some(value) = supplied.and_then(|secrets| secrets.sftp_private_key.clone()) {
-                        values.push(("sftp_private_key".to_string(), value));
-                    }
-                    if let Some(value) = supplied.and_then(|secrets| secrets.sftp_private_key_passphrase.clone()) {
-                        values.push(("sftp_private_key_passphrase".to_string(), value));
-                    }
-                }
-                state
-                    .storage
-                    .save_file_connection_with_secret_bundle(
-                        id.clone(),
-                        input.name.trim().to_string(),
-                        config_kind(&input.config).to_string(),
-                        config_json,
-                        values,
-                        vec![
-                            "password".to_string(),
-                            "password_scope".to_string(),
-                            "access_key_id".to_string(),
-                            "secret_access_key".to_string(),
-                            "session_token".to_string(),
-                            "s3_scope".to_string(),
-                            "webdav_token".to_string(),
-                            "webdav_scope".to_string(),
-                            "sftp_private_key".to_string(),
-                            "sftp_private_key_passphrase".to_string(),
-                            "webhdfs_delegation_token".to_string(),
-                            "webhdfs_scope".to_string(),
-                        ],
-                        "sftp_scope".to_string(),
-                        password_scope(&input.config)?,
-                        replace_secrets,
-                        input.expected_revision,
-                    )
-                    .await?
-            }
-            FileConnectionConfig::S3(config) => {
-                let supplied = input.secrets.as_ref();
-                let replace_secrets = supplied.is_some_and(|secrets| {
-                    secrets.clear_s3_credentials == Some(true)
-                        || secrets.access_key_id.is_some()
-                        || secrets.secret_access_key.is_some()
-                        || secrets.session_token.is_some()
-                });
-                let secrets =
-                    if config.anonymous || supplied.is_some_and(|secrets| secrets.clear_s3_credentials == Some(true)) {
-                        Vec::new()
-                    } else {
-                        let mut values = Vec::new();
-                        if let Some(value) = supplied.and_then(|secrets| secrets.access_key_id.clone()) {
-                            values.push(("access_key_id".to_string(), value));
-                        }
-                        if let Some(value) = supplied.and_then(|secrets| secrets.secret_access_key.clone()) {
-                            values.push(("secret_access_key".to_string(), value));
-                        }
-                        if let Some(value) = supplied.and_then(|secrets| secrets.session_token.clone()) {
-                            values.push(("session_token".to_string(), value));
-                        }
-                        values
-                    };
-                state
-                    .storage
-                    .save_file_connection_with_secret_bundle(
-                        id.clone(),
-                        input.name.trim().to_string(),
-                        config_kind(&input.config).to_string(),
-                        config_json,
-                        secrets,
-                        vec![
-                            "password".to_string(),
-                            "password_scope".to_string(),
-                            "access_key_id".to_string(),
-                            "secret_access_key".to_string(),
-                            "session_token".to_string(),
-                            "webdav_token".to_string(),
-                            "webdav_scope".to_string(),
-                            "sftp_private_key".to_string(),
-                            "sftp_private_key_passphrase".to_string(),
-                            "sftp_scope".to_string(),
-                            "webhdfs_delegation_token".to_string(),
-                            "webhdfs_scope".to_string(),
-                        ],
-                        "s3_scope".to_string(),
-                        password_scope(&input.config)?,
-                        replace_secrets || config.anonymous,
-                        input.expected_revision,
-                    )
-                    .await?
-            }
-            FileConnectionConfig::Webdav(config) => {
-                let supplied = input.secrets.as_ref();
-                let clear = supplied.is_some_and(|secrets| secrets.clear_webdav_credentials == Some(true));
-                let replace_secrets = clear
-                    || supplied.is_some_and(|secrets| secrets.password.is_some() || secrets.webdav_token.is_some())
-                    || config.authentication == WebdavAuthentication::None;
-                let mut values = Vec::new();
-                if !clear && config.authentication != WebdavAuthentication::None {
-                    if let Some(value) = supplied.and_then(|secrets| secrets.password.clone()) {
-                        values.push(("password".to_string(), value));
-                    }
-                    if let Some(value) = supplied.and_then(|secrets| secrets.webdav_token.clone()) {
-                        values.push(("webdav_token".to_string(), value));
-                    }
-                }
-                state
-                    .storage
-                    .save_file_connection_with_secret_bundle(
-                        id.clone(),
-                        input.name.trim().to_string(),
-                        config_kind(&input.config).to_string(),
-                        config_json,
-                        values,
-                        vec![
-                            "password".to_string(),
-                            "password_scope".to_string(),
-                            "access_key_id".to_string(),
-                            "secret_access_key".to_string(),
-                            "session_token".to_string(),
-                            "s3_scope".to_string(),
-                            "webdav_token".to_string(),
-                            "sftp_private_key".to_string(),
-                            "sftp_private_key_passphrase".to_string(),
-                            "sftp_scope".to_string(),
-                            "webhdfs_delegation_token".to_string(),
-                            "webhdfs_scope".to_string(),
-                        ],
-                        "webdav_scope".to_string(),
-                        password_scope(&input.config)?,
-                        replace_secrets,
-                        input.expected_revision,
-                    )
-                    .await?
-            }
-            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
-                let supplied = input.secrets.as_ref();
-                let clear = supplied.is_some_and(|secrets| secrets.clear_webhdfs_credentials == Some(true));
-                let replace_secrets = clear
-                    || config.authentication != WebhdfsAuthentication::Delegation
-                    || supplied.is_some_and(|secrets| secrets.webhdfs_delegation_token.is_some());
-                let values = if !clear && config.authentication == WebhdfsAuthentication::Delegation {
-                    supplied
-                        .and_then(|secrets| secrets.webhdfs_delegation_token.clone())
-                        .into_iter()
-                        .map(|value| ("webhdfs_delegation_token".to_string(), value))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                state
-                    .storage
-                    .save_file_connection_with_secret_bundle(
-                        id.clone(),
-                        input.name.trim().to_string(),
-                        config_kind(&input.config).to_string(),
-                        config_json,
-                        values,
-                        vec![
-                            "password".to_string(),
-                            "password_scope".to_string(),
-                            "access_key_id".to_string(),
-                            "secret_access_key".to_string(),
-                            "session_token".to_string(),
-                            "s3_scope".to_string(),
-                            "webdav_token".to_string(),
-                            "webdav_scope".to_string(),
-                            "sftp_private_key".to_string(),
-                            "sftp_private_key_passphrase".to_string(),
-                            "sftp_scope".to_string(),
-                            "webhdfs_delegation_token".to_string(),
-                            "webhdfs_scope".to_string(),
-                        ],
-                        "webhdfs_scope".to_string(),
-                        password_scope(&input.config)?,
-                        replace_secrets,
-                        input.expected_revision,
-                    )
-                    .await?
-            }
-            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
-                state
-                    .storage
-                    .save_file_connection_with_secret_bundle(
-                        id.clone(),
-                        input.name.trim().to_string(),
-                        config_kind(&input.config).to_string(),
-                        config_json,
-                        Vec::new(),
-                        vec![
-                            "password".to_string(),
-                            "password_scope".to_string(),
-                            "access_key_id".to_string(),
-                            "secret_access_key".to_string(),
-                            "session_token".to_string(),
-                            "s3_scope".to_string(),
-                            "webdav_token".to_string(),
-                            "webdav_scope".to_string(),
-                            "sftp_private_key".to_string(),
-                            "sftp_private_key_passphrase".to_string(),
-                            "sftp_scope".to_string(),
-                            "webhdfs_delegation_token".to_string(),
-                            "webhdfs_scope".to_string(),
-                        ],
-                        "password_scope".to_string(),
-                        password_scope(&input.config)?,
-                        true,
-                        input.expected_revision,
-                    )
-                    .await?
-            }
-        };
+        }
+        let record = state
+            .storage
+            .save_file_connection_with_secrets(
+                id.clone(),
+                input.name.trim().to_string(),
+                config_kind(&input.config).to_string(),
+                config_json,
+                secret_update,
+                input.expected_revision,
+            )
+            .await?;
         runtime.evict(&id);
         Ok(record)
     })
@@ -728,21 +570,290 @@ pub async fn save_file_connection(
     file_connection_from_storage(record)
 }
 
+fn file_secret_update_for_input(input: &mut FileConnectionInput) -> Result<FileSecretUpdate, String> {
+    let scope = password_scope(&input.config)?;
+    let (protocol, replace, values) = match &input.config {
+        FileConnectionConfig::Ftp(_) => {
+            let clear = input.secrets.as_ref().is_some_and(|secrets| secrets.clear_password == Some(true));
+            let replace = clear || input.secrets.as_ref().is_some_and(|secrets| secrets.password.is_some());
+            let values = if clear {
+                Vec::new()
+            } else {
+                input
+                    .secrets
+                    .as_mut()
+                    .and_then(|secrets| secrets.password.take())
+                    .into_iter()
+                    .map(|value| (FileSecretKey::Password, value))
+                    .collect()
+            };
+            (FileSecretProtocol::Ftp, replace, values)
+        }
+        FileConnectionConfig::Sftp(config) => {
+            let clear = input.secrets.as_ref().is_some_and(|secrets| secrets.clear_sftp_credentials == Some(true));
+            let replace = clear
+                || config.authentication != SftpAuthentication::PrivateKey
+                || input.secrets.as_ref().is_some_and(|secrets| {
+                    secrets.sftp_private_key.is_some() || secrets.sftp_private_key_passphrase.is_some()
+                });
+            let mut values = Vec::new();
+            if !clear && config.authentication == SftpAuthentication::PrivateKey {
+                if let Some(value) = input.secrets.as_mut().and_then(|secrets| secrets.sftp_private_key.take()) {
+                    values.push((FileSecretKey::SftpPrivateKey, value));
+                }
+                if let Some(value) =
+                    input.secrets.as_mut().and_then(|secrets| secrets.sftp_private_key_passphrase.take())
+                {
+                    values.push((FileSecretKey::SftpPrivateKeyPassphrase, value));
+                }
+            }
+            (FileSecretProtocol::Sftp, replace, values)
+        }
+        FileConnectionConfig::S3(config) => {
+            let clear = config.anonymous
+                || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_s3_credentials == Some(true));
+            let replace = clear
+                || input.secrets.as_ref().is_some_and(|secrets| {
+                    secrets.access_key_id.is_some()
+                        || secrets.secret_access_key.is_some()
+                        || secrets.session_token.is_some()
+                });
+            let mut values = Vec::new();
+            if !clear {
+                if let Some(value) = input.secrets.as_mut().and_then(|secrets| secrets.access_key_id.take()) {
+                    values.push((FileSecretKey::S3AccessKeyId, value));
+                }
+                if let Some(value) = input.secrets.as_mut().and_then(|secrets| secrets.secret_access_key.take()) {
+                    values.push((FileSecretKey::S3SecretAccessKey, value));
+                }
+                if let Some(value) = input.secrets.as_mut().and_then(|secrets| secrets.session_token.take()) {
+                    values.push((FileSecretKey::S3SessionToken, value));
+                }
+            }
+            (FileSecretProtocol::S3, replace, values)
+        }
+        FileConnectionConfig::Webdav(config) => {
+            let clear = config.authentication == WebdavAuthentication::None
+                || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_webdav_credentials == Some(true));
+            let replace = clear
+                || input
+                    .secrets
+                    .as_ref()
+                    .is_some_and(|secrets| secrets.password.is_some() || secrets.webdav_token.is_some());
+            let mut values = Vec::new();
+            if !clear {
+                if let Some(value) = input.secrets.as_mut().and_then(|secrets| secrets.password.take()) {
+                    values.push((FileSecretKey::Password, value));
+                }
+                if let Some(value) = input.secrets.as_mut().and_then(|secrets| secrets.webdav_token.take()) {
+                    values.push((FileSecretKey::WebdavToken, value));
+                }
+            }
+            (FileSecretProtocol::Webdav, replace, values)
+        }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+            let clear = config.authentication != WebhdfsAuthentication::Delegation
+                || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_webhdfs_credentials == Some(true));
+            let replace =
+                clear || input.secrets.as_ref().is_some_and(|secrets| secrets.webhdfs_delegation_token.is_some());
+            let values = if clear {
+                Vec::new()
+            } else {
+                input
+                    .secrets
+                    .as_mut()
+                    .and_then(|secrets| secrets.webhdfs_delegation_token.take())
+                    .into_iter()
+                    .map(|value| (FileSecretKey::WebhdfsDelegationToken, value))
+                    .collect()
+            };
+            (FileSecretProtocol::Webhdfs, replace, values)
+        }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
+            (FileSecretProtocol::HdfsNative, true, Vec::new())
+        }
+    };
+
+    if replace {
+        Ok(FileSecretUpdate::replace(FileSecretBundle::try_new(protocol, &scope, values)?))
+    } else {
+        Ok(FileSecretUpdate::preserve(protocol, &scope))
+    }
+}
+
+#[cfg(test)]
+pub(super) const TEST_FILE_SECRET_KEY: [u8; 32] = [0x5a; 32];
+
+#[cfg(test)]
+#[allow(async_fn_in_trait)]
+pub(super) trait FileSecretStorageTestExt {
+    #[allow(clippy::too_many_arguments)]
+    async fn save_file_connection_with_secret_bundle(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        config_json: String,
+        secrets: Vec<(String, String)>,
+        secret_keys: Vec<String>,
+        secret_scope_key: String,
+        secret_scope: String,
+        replace_secrets: bool,
+        expected_revision: Option<i64>,
+    ) -> Result<FileConnectionStorageRecord, String>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn save_file_connection(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        config_json: String,
+        secret: Option<String>,
+        secret_scope: String,
+        replace_secret: bool,
+        expected_revision: Option<i64>,
+    ) -> Result<FileConnectionStorageRecord, String>;
+
+    async fn load_file_connection_secret(&self, id: &str, key: &str) -> Result<Option<String>, String>;
+}
+
+#[cfg(test)]
+impl FileSecretStorageTestExt for dbx_core::storage::Storage {
+    async fn save_file_connection_with_secret_bundle(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        config_json: String,
+        secrets: Vec<(String, String)>,
+        secret_keys: Vec<String>,
+        _secret_scope_key: String,
+        secret_scope: String,
+        replace_secrets: bool,
+        expected_revision: Option<i64>,
+    ) -> Result<FileConnectionStorageRecord, String> {
+        if self.file_secrets_locked() {
+            self.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await?;
+        }
+        let config: FileConnectionConfig =
+            serde_json::from_str(&config_json).map_err(|_| "Test file connection config is invalid".to_string())?;
+        let protocol = file_secret_protocol(&config);
+        for key in &secret_keys {
+            if !is_legacy_file_secret_test_key(key) {
+                return Err("Unsupported file connection secret key".to_string());
+            }
+        }
+        let values = secrets
+            .into_iter()
+            .map(|(key, value)| Ok((FileSecretKey::from_storage(&key)?, FileSecret::new(value)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let protocol_changed = self
+            .load_file_connection(&id)
+            .await?
+            .and_then(|record| parse_storage_config(&record).ok())
+            .is_some_and(|current| file_secret_protocol(&current) != protocol);
+        let update = if replace_secrets || protocol_changed {
+            FileSecretUpdate::replace(FileSecretBundle::try_new(protocol, &secret_scope, values)?)
+        } else {
+            FileSecretUpdate::preserve(protocol, &secret_scope)
+        };
+        self.save_file_connection_with_secrets(id, name, kind, config_json, update, expected_revision).await
+    }
+
+    async fn save_file_connection(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        config_json: String,
+        secret: Option<String>,
+        secret_scope: String,
+        replace_secret: bool,
+        expected_revision: Option<i64>,
+    ) -> Result<FileConnectionStorageRecord, String> {
+        self.save_file_connection_with_secret_bundle(
+            id,
+            name,
+            kind,
+            config_json,
+            secret.into_iter().map(|value| ("password".to_string(), value)).collect(),
+            vec!["password".to_string()],
+            "password_scope".to_string(),
+            secret_scope,
+            replace_secret,
+            expected_revision,
+        )
+        .await
+    }
+
+    async fn load_file_connection_secret(&self, id: &str, key: &str) -> Result<Option<String>, String> {
+        if self.file_secrets_locked() {
+            self.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await?;
+        }
+        let Some(record) = self.load_file_connection(id).await? else {
+            return Ok(None);
+        };
+        let config = parse_storage_config(&record)?;
+        let bundle = self.load_file_connection_secrets(id, &password_scope(&config)?).await?;
+        if matches!(key, "password_scope" | "sftp_scope" | "s3_scope" | "webdav_scope" | "webhdfs_scope") {
+            return Ok((!bundle.is_empty()).then(|| "<encrypted-scope>".to_string()));
+        }
+        let key = FileSecretKey::from_storage(key)?;
+        Ok(bundle.get(key).map(|value| value.expose_secret().to_string()))
+    }
+}
+
+#[cfg(test)]
+fn is_legacy_file_secret_test_key(key: &str) -> bool {
+    matches!(
+        key,
+        "password"
+            | "password_scope"
+            | "access_key_id"
+            | "secret_access_key"
+            | "session_token"
+            | "s3_scope"
+            | "webdav_token"
+            | "webdav_scope"
+            | "sftp_private_key"
+            | "sftp_private_key_passphrase"
+            | "sftp_scope"
+            | "webhdfs_delegation_token"
+            | "webhdfs_scope"
+    )
+}
+
+const fn file_secret_protocol(config: &FileConnectionConfig) -> FileSecretProtocol {
+    match config {
+        FileConnectionConfig::Ftp(_) => FileSecretProtocol::Ftp,
+        FileConnectionConfig::Sftp(_) => FileSecretProtocol::Sftp,
+        FileConnectionConfig::S3(_) => FileSecretProtocol::S3,
+        FileConnectionConfig::Webdav(_) => FileSecretProtocol::Webdav,
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => FileSecretProtocol::Webhdfs,
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => FileSecretProtocol::HdfsNative,
+    }
+}
+
 #[tauri::command]
 pub async fn delete_file_connection(
     state: State<'_, std::sync::Arc<AppState>>,
     runtime: State<'_, FileManagerRuntime>,
+    transfers: State<'_, FileTransferRuntime>,
     connection_id: String,
 ) -> Result<(), String> {
     let deleting = runtime.start_delete(&connection_id)?;
     runtime.invalidate_list_sessions(&connection_id);
-    if let Err(error) = deleting.wait_for_idle().await {
-        deleting.restore_active();
-        return Err(error);
-    }
-    let result = state.storage.delete_file_connection(&connection_id).await;
+    let result = {
+        let _persistence_guard = deleting.entry.persistence_lock.lock().await;
+        #[cfg(test)]
+        wait_test_persistence_barrier("delete", &connection_id).await;
+        state.storage.delete_file_connection(&connection_id).await
+    };
     match result {
         Ok(true) => {
+            deleting.cancel_operations();
+            transfers.cancel_connection(&connection_id);
             runtime.evict(&connection_id);
             deleting.finish();
             Ok(())
@@ -764,6 +875,9 @@ pub async fn test_file_connection(
     runtime: State<'_, FileManagerRuntime>,
     mut input: FileConnectionInput,
 ) -> Result<FileConnectionTestResult, String> {
+    if state.storage.file_secrets_locked() {
+        return Err(dbx_core::file_secrets::FILE_SECRETS_LOCKED.to_string());
+    }
     let lease = match input.id.as_deref() {
         Some(id) => Some(runtime.begin_operation(id)?),
         None => None,
@@ -1015,7 +1129,7 @@ pub async fn delete_file_entry(
 }
 
 impl FileManagerRuntime {
-    fn begin_operation(&self, connection_id: &str) -> Result<OperationLease, String> {
+    pub(super) fn begin_operation(&self, connection_id: &str) -> Result<OperationLease, String> {
         let mut lifecycles = self.lifecycles.lock().unwrap_or_else(|error| error.into_inner());
         let entry = lifecycles
             .entry(connection_id.to_string())
@@ -1048,7 +1162,6 @@ impl FileManagerRuntime {
             return Err("File connection is being deleted".to_string());
         }
         state.lifecycle = ConnectionLifecycle::Deleting;
-        state.cancellation.cancel();
         drop(state);
         drop(lifecycles);
         Ok(DeleteLease { connection_id: connection_id.to_string(), entry, lifecycles: self.lifecycles.clone() })
@@ -1070,11 +1183,32 @@ impl FileManagerRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn prepare_file_operation(
         &self,
         state: &AppState,
         connection_id: &str,
         remote_path: &str,
+    ) -> Result<PreparedFileOperation, String> {
+        self.prepare_file_operation_inner(state, connection_id, remote_path, None).await
+    }
+
+    pub(super) async fn prepare_file_operation_at_revision(
+        &self,
+        state: &AppState,
+        connection_id: &str,
+        remote_path: &str,
+        expected_revision: i64,
+    ) -> Result<PreparedFileOperation, String> {
+        self.prepare_file_operation_inner(state, connection_id, remote_path, Some(expected_revision)).await
+    }
+
+    async fn prepare_file_operation_inner(
+        &self,
+        state: &AppState,
+        connection_id: &str,
+        remote_path: &str,
+        expected_revision: Option<i64>,
     ) -> Result<PreparedFileOperation, String> {
         let relative_path = validate_remote_relative_path(remote_path)?;
         let lease = self.begin_operation(connection_id)?;
@@ -1083,6 +1217,9 @@ impl FileManagerRuntime {
             .load_file_connection(connection_id)
             .await?
             .ok_or_else(|| "File connection not found".to_string())?;
+        if expected_revision.is_some_and(|expected| record.revision != expected) {
+            return Err("File connection changed while the transfer was queued".to_string());
+        }
         let revision = record.revision;
         let config = parse_storage_config(&record).inspect_err(|_| self.evict_revision(connection_id, revision))?;
         let secrets = load_file_connection_secrets(&state.storage, connection_id, &config).await?;
@@ -1289,6 +1426,23 @@ impl FileManagerRuntime {
     }
 
     #[cfg(test)]
+    fn is_deleting(&self, connection_id: &str) -> bool {
+        self.lifecycles.lock().unwrap_or_else(|error| error.into_inner()).get(connection_id).is_some_and(|entry| {
+            entry.state.lock().unwrap_or_else(|error| error.into_inner()).lifecycle == ConnectionLifecycle::Deleting
+        })
+    }
+
+    #[cfg(test)]
+    fn in_flight_count(&self, connection_id: &str) -> usize {
+        self.lifecycles
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(connection_id)
+            .map(|entry| entry.state.lock().unwrap_or_else(|error| error.into_inner()).in_flight)
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
     pub(super) fn operator_count(&self) -> usize {
         self.operators.read().unwrap_or_else(|error| error.into_inner()).len()
     }
@@ -1302,9 +1456,9 @@ impl Default for ConnectionRuntime {
                 in_flight: 0,
                 cancellation: Arc::new(CancellationSignal::default()),
             }),
-            idle: Notify::new(),
             list_lock: AsyncMutex::new(()),
             mutation_lock: Arc::new(AsyncMutex::new(())),
+            persistence_lock: AsyncMutex::new(()),
         }
     }
 }
@@ -2934,7 +3088,7 @@ impl CancellationSignal {
 }
 
 impl OperationLease {
-    fn cancellation(&self) -> Arc<CancellationSignal> {
+    pub(super) fn cancellation(&self) -> Arc<CancellationSignal> {
         self.cancellation.clone()
     }
 }
@@ -2950,9 +3104,6 @@ impl Drop for OperationLease {
             && state.lifecycle == ConnectionLifecycle::Active
             && lifecycles.get(&self.connection_id).is_some_and(|entry| Arc::ptr_eq(entry, &self.entry));
         drop(state);
-        if became_idle {
-            self.entry.idle.notify_waiters();
-        }
         if remove {
             lifecycles.remove(&self.connection_id);
         }
@@ -2960,31 +3111,22 @@ impl Drop for OperationLease {
 }
 
 impl DeleteLease {
-    async fn wait_for_idle(&self) -> Result<(), String> {
-        tokio::time::timeout(DELETE_WAIT_TIMEOUT, async {
-            loop {
-                let notified = self.entry.idle.notified();
-                if self.entry.state.lock().unwrap_or_else(|error| error.into_inner()).in_flight == 0 {
-                    return;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .map_err(|_| "Timed out waiting for file operations to stop; connection was not deleted".to_string())
-    }
-
     fn restore_active(&self) {
         let mut lifecycles = self.lifecycles.lock().unwrap_or_else(|error| error.into_inner());
         let mut state = self.entry.state.lock().unwrap_or_else(|error| error.into_inner());
         state.lifecycle = ConnectionLifecycle::Active;
-        state.cancellation = Arc::new(CancellationSignal::default());
+        // A failed delete has not cancelled this generation. Retaining it lets a
+        // later successful delete cancel leases admitted before the failure.
         let remove = state.in_flight == 0
             && lifecycles.get(&self.connection_id).is_some_and(|entry| Arc::ptr_eq(entry, &self.entry));
         drop(state);
         if remove {
             lifecycles.remove(&self.connection_id);
         }
+    }
+
+    fn cancel_operations(&self) {
+        self.entry.state.lock().unwrap_or_else(|error| error.into_inner()).cancellation.cancel();
     }
 
     fn finish(&self) {
@@ -3016,8 +3158,8 @@ async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) ->
             }) {
                 let secrets = input.secrets.as_ref().expect("checked");
                 return Ok(ResolvedFileSecrets {
-                    sftp_private_key: secrets.sftp_private_key.clone(),
-                    sftp_private_key_passphrase: secrets.sftp_private_key_passphrase.clone(),
+                    sftp_private_key: optional_file_secret(secrets.sftp_private_key.clone())?,
+                    sftp_private_key_passphrase: optional_file_secret(secrets.sftp_private_key_passphrase.clone())?,
                     ..ResolvedFileSecrets::default()
                 });
             }
@@ -3036,9 +3178,9 @@ async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) ->
             }) {
                 let secrets = input.secrets.as_ref().expect("checked");
                 return Ok(ResolvedFileSecrets {
-                    access_key_id: secrets.access_key_id.clone(),
-                    secret_access_key: secrets.secret_access_key.clone(),
-                    session_token: secrets.session_token.clone(),
+                    access_key_id: optional_file_secret(secrets.access_key_id.clone())?,
+                    secret_access_key: optional_file_secret(secrets.secret_access_key.clone())?,
+                    session_token: optional_file_secret(secrets.session_token.clone())?,
                     ..ResolvedFileSecrets::default()
                 });
             }
@@ -3056,8 +3198,8 @@ async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) ->
             {
                 let secrets = input.secrets.as_ref().expect("checked");
                 return Ok(ResolvedFileSecrets {
-                    password: secrets.password.clone(),
-                    webdav_token: secrets.webdav_token.clone(),
+                    password: optional_file_secret(secrets.password.clone())?,
+                    webdav_token: optional_file_secret(secrets.webdav_token.clone())?,
                     ..ResolvedFileSecrets::default()
                 });
             }
@@ -3095,70 +3237,41 @@ async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) ->
     load_file_connection_secrets(&state.storage, id, &input.config).await
 }
 
+fn optional_file_secret(value: Option<FileSecret>) -> Result<Option<FileSecret>, String> {
+    Ok(value)
+}
+
 async fn load_file_connection_secrets(
     storage: &dbx_core::storage::Storage,
     id: &str,
     config: &FileConnectionConfig,
 ) -> Result<ResolvedFileSecrets, String> {
+    let bundle = storage.load_file_connection_secrets(id, &password_scope(config)?).await?;
     match config {
         FileConnectionConfig::Ftp(_) => Ok(ResolvedFileSecrets {
-            password: storage.load_file_connection_password(id, &password_scope(config)?).await?,
+            password: bundle.get(FileSecretKey::Password).cloned(),
             ..ResolvedFileSecrets::default()
         }),
-        FileConnectionConfig::Sftp(_) => {
-            let stored_scope = storage.load_file_connection_secret(id, "sftp_scope").await?;
-            let sftp_private_key = storage.load_file_connection_secret(id, "sftp_private_key").await?;
-            let sftp_private_key_passphrase =
-                storage.load_file_connection_secret(id, "sftp_private_key_passphrase").await?;
-            if (sftp_private_key.is_some() || sftp_private_key_passphrase.is_some())
-                && stored_scope.as_deref() != Some(password_scope(config)?.as_str())
-            {
-                return Err(
-                    "Stored SFTP private-key credentials do not match this endpoint and identity; re-enter them"
-                        .to_string(),
-                );
-            }
-            Ok(ResolvedFileSecrets { sftp_private_key, sftp_private_key_passphrase, ..ResolvedFileSecrets::default() })
-        }
-        FileConnectionConfig::S3(_) => {
-            let stored_scope = storage.load_file_connection_secret(id, "s3_scope").await?;
-            let access_key_id = storage.load_file_connection_secret(id, "access_key_id").await?;
-            let secret_access_key = storage.load_file_connection_secret(id, "secret_access_key").await?;
-            let session_token = storage.load_file_connection_secret(id, "session_token").await?;
-            if (access_key_id.is_some() || secret_access_key.is_some() || session_token.is_some())
-                && stored_scope.as_deref() != Some(password_scope(config)?.as_str())
-            {
-                return Err("Stored S3 credentials do not match this endpoint and bucket; re-enter them".to_string());
-            }
-            Ok(ResolvedFileSecrets {
-                access_key_id,
-                secret_access_key,
-                session_token,
-                ..ResolvedFileSecrets::default()
-            })
-        }
-        FileConnectionConfig::Webdav(_) => {
-            let stored_scope = storage.load_file_connection_secret(id, "webdav_scope").await?;
-            let password = storage.load_file_connection_secret(id, "password").await?;
-            let webdav_token = storage.load_file_connection_secret(id, "webdav_token").await?;
-            if (password.is_some() || webdav_token.is_some())
-                && stored_scope.as_deref() != Some(password_scope(config)?.as_str())
-            {
-                return Err(
-                    "Stored WebDAV credentials do not match this endpoint and identity; re-enter them".to_string()
-                );
-            }
-            Ok(ResolvedFileSecrets { password, webdav_token, ..ResolvedFileSecrets::default() })
-        }
-        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => {
-            let stored_scope = storage.load_file_connection_secret(id, "webhdfs_scope").await?;
-            let webhdfs_delegation_token = storage.load_file_connection_secret(id, "webhdfs_delegation_token").await?;
-            if webhdfs_delegation_token.is_some() && stored_scope.as_deref() != Some(password_scope(config)?.as_str()) {
-                return Err("Stored WebHDFS delegation token does not match this endpoint and identity; re-enter it"
-                    .to_string());
-            }
-            Ok(ResolvedFileSecrets { webhdfs_delegation_token, ..ResolvedFileSecrets::default() })
-        }
+        FileConnectionConfig::Sftp(_) => Ok(ResolvedFileSecrets {
+            sftp_private_key: bundle.get(FileSecretKey::SftpPrivateKey).cloned(),
+            sftp_private_key_passphrase: bundle.get(FileSecretKey::SftpPrivateKeyPassphrase).cloned(),
+            ..ResolvedFileSecrets::default()
+        }),
+        FileConnectionConfig::S3(_) => Ok(ResolvedFileSecrets {
+            access_key_id: bundle.get(FileSecretKey::S3AccessKeyId).cloned(),
+            secret_access_key: bundle.get(FileSecretKey::S3SecretAccessKey).cloned(),
+            session_token: bundle.get(FileSecretKey::S3SessionToken).cloned(),
+            ..ResolvedFileSecrets::default()
+        }),
+        FileConnectionConfig::Webdav(_) => Ok(ResolvedFileSecrets {
+            password: bundle.get(FileSecretKey::Password).cloned(),
+            webdav_token: bundle.get(FileSecretKey::WebdavToken).cloned(),
+            ..ResolvedFileSecrets::default()
+        }),
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => Ok(ResolvedFileSecrets {
+            webhdfs_delegation_token: bundle.get(FileSecretKey::WebhdfsDelegationToken).cloned(),
+            ..ResolvedFileSecrets::default()
+        }),
         FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => Ok(ResolvedFileSecrets::default()),
     }
 }
@@ -4272,11 +4385,12 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
                 ResolvedFileSecrets::default()
             } else {
                 ResolvedFileSecrets {
-                    sftp_private_key: input.secrets.as_ref().and_then(|secrets| secrets.sftp_private_key.clone()),
-                    sftp_private_key_passphrase: input
-                        .secrets
-                        .as_ref()
-                        .and_then(|secrets| secrets.sftp_private_key_passphrase.clone()),
+                    sftp_private_key: optional_file_secret(
+                        input.secrets.as_ref().and_then(|secrets| secrets.sftp_private_key.clone()),
+                    )?,
+                    sftp_private_key_passphrase: optional_file_secret(
+                        input.secrets.as_ref().and_then(|secrets| secrets.sftp_private_key_passphrase.clone()),
+                    )?,
                     ..ResolvedFileSecrets::default()
                 }
             };
@@ -4436,7 +4550,10 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16), String> {
 
 #[cfg(test)]
 pub(super) fn build_operator(config: &FileConnectionConfig, password: Option<&str>) -> Result<Operator, String> {
-    let secrets = ResolvedFileSecrets { password: password.map(ToString::to_string), ..ResolvedFileSecrets::default() };
+    let secrets = ResolvedFileSecrets {
+        password: password.map(|value| FileSecret::new(value.to_string())).transpose()?,
+        ..ResolvedFileSecrets::default()
+    };
     build_operator_with_secrets(config, &secrets).map(|built| built.operator)
 }
 
@@ -4972,30 +5089,8 @@ fn redact_error(mut message: String, password: Option<&str>) -> String {
     message
 }
 
-fn redact_secrets(mut message: String, secrets: &ResolvedFileSecrets) -> String {
-    message = redact_temporary_key_paths(&message);
-    for secret in [
-        secrets.password.as_deref(),
-        secrets.access_key_id.as_deref(),
-        secrets.secret_access_key.as_deref(),
-        secrets.session_token.as_deref(),
-        secrets.webdav_token.as_deref(),
-        secrets.sftp_private_key.as_deref(),
-        secrets.sftp_private_key_passphrase.as_deref(),
-        secrets.webhdfs_delegation_token.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|value| !value.is_empty())
-    {
-        message = message.replace(secret, "[REDACTED]");
-        let percent_encoded =
-            percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC).to_string();
-        message = message.replace(&percent_encoded, "[REDACTED]");
-        let form_encoded = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>();
-        message = message.replace(&form_encoded, "[REDACTED]");
-    }
-    message
+fn redact_secrets(message: String, secrets: &ResolvedFileSecrets) -> String {
+    secrets.redactor().redact(message).as_str().to_string()
 }
 
 pub(super) fn passed_stage(stage: &'static str) -> ConnectionTestStage {
@@ -5020,6 +5115,10 @@ mod tests {
     use bytes::Bytes;
     use tauri::Manager;
     use tokio::io::AsyncWriteExt;
+
+    fn secret(value: impl Into<String>) -> FileSecret {
+        FileSecret::new(value.into()).unwrap()
+    }
 
     fn input(endpoint: &str, root: &str) -> FileConnectionInput {
         FileConnectionInput {
@@ -5049,9 +5148,9 @@ mod tests {
                 anonymous: false,
             }),
             secrets: Some(FileConnectionSecrets {
-                access_key_id: Some("dbx-access".to_string()),
-                secret_access_key: Some("s3cr3t/+ token".to_string()),
-                session_token: Some("session/+ value".to_string()),
+                access_key_id: Some(secret("dbx-access")),
+                secret_access_key: Some(secret("s3cr3t/+ token")),
+                session_token: Some(secret("session/+ value")),
                 ..FileConnectionSecrets::default()
             }),
         }
@@ -5077,12 +5176,11 @@ mod tests {
                     FileConnectionSecrets { clear_webdav_credentials: Some(true), ..FileConnectionSecrets::default() }
                 }
                 WebdavAuthentication::Basic => {
-                    FileConnectionSecrets { password: Some("password".to_string()), ..FileConnectionSecrets::default() }
+                    FileConnectionSecrets { password: Some(secret("password")), ..FileConnectionSecrets::default() }
                 }
-                WebdavAuthentication::Bearer => FileConnectionSecrets {
-                    webdav_token: Some("token".to_string()),
-                    ..FileConnectionSecrets::default()
-                },
+                WebdavAuthentication::Bearer => {
+                    FileConnectionSecrets { webdav_token: Some(secret("token")), ..FileConnectionSecrets::default() }
+                }
             }),
         }
     }
@@ -5119,7 +5217,7 @@ mod tests {
                     FileConnectionSecrets { clear_webhdfs_credentials: Some(true), ..FileConnectionSecrets::default() }
                 }
                 WebhdfsAuthentication::Delegation => FileConnectionSecrets {
-                    webhdfs_delegation_token: Some("delegation/+ token%&?".to_string()),
+                    webhdfs_delegation_token: Some(secret("delegation/+ token%&?")),
                     ..FileConnectionSecrets::default()
                 },
             }),
@@ -5172,10 +5270,8 @@ mod tests {
     #[test]
     fn file_connection_validation_rejects_cross_protocol_secrets() {
         let mut ftp = input("ftp://example.test:21", "/");
-        ftp.secrets = Some(FileConnectionSecrets {
-            access_key_id: Some("access".to_string()),
-            ..FileConnectionSecrets::default()
-        });
+        ftp.secrets =
+            Some(FileConnectionSecrets { access_key_id: Some(secret("access")), ..FileConnectionSecrets::default() });
         assert!(validate_input(&ftp).unwrap_err().contains("S3 credentials"));
 
         ftp.secrets =
@@ -5184,7 +5280,7 @@ mod tests {
 
         let mut s3 = s3_input();
         let secrets = s3.secrets.as_mut().unwrap();
-        secrets.password = Some("password".to_string());
+        secrets.password = Some(secret("password"));
         assert!(validate_input(&s3).unwrap_err().contains("FTP password"));
 
         let secrets = s3.secrets.as_mut().unwrap();
@@ -5196,7 +5292,7 @@ mod tests {
         webdav.secrets.as_mut().unwrap().clear_password = Some(false);
         assert!(validate_input(&webdav).unwrap_err().contains("FTP or S3"));
         webdav.secrets.as_mut().unwrap().clear_password = None;
-        webdav.secrets.as_mut().unwrap().webdav_token = Some("wrong-mode".to_string());
+        webdav.secrets.as_mut().unwrap().webdav_token = Some(secret("wrong-mode"));
         assert!(validate_input(&webdav).unwrap_err().contains("only accepts"));
 
         let mut bearer = webdav_input(WebdavAuthentication::Bearer);
@@ -5205,21 +5301,19 @@ mod tests {
         bearer.secrets.as_mut().unwrap().clear_webdav_credentials = Some(true);
         assert!(validate_input(&bearer).unwrap_err().contains("cannot be combined"));
 
-        let mut empty_basic = webdav_input(WebdavAuthentication::Basic);
-        empty_basic.id = Some("existing-basic".to_string());
-        empty_basic.secrets.as_mut().unwrap().password = Some(String::new());
-        assert!(validate_input(&empty_basic).unwrap_err().contains("cannot be empty"));
-
-        let mut empty_bearer = webdav_input(WebdavAuthentication::Bearer);
-        empty_bearer.id = Some("existing-bearer".to_string());
-        empty_bearer.secrets.as_mut().unwrap().webdav_token = Some(String::new());
-        assert!(validate_input(&empty_bearer).unwrap_err().contains("cannot be empty"));
+        assert!(serde_json::from_value::<FileConnectionSecrets>(serde_json::json!({"password": ""})).is_err());
+        assert!(serde_json::from_value::<FileConnectionSecrets>(serde_json::json!({"webdavToken": ""})).is_err());
     }
 
     #[tokio::test]
     async fn anonymous_s3_edit_does_not_reuse_stored_credentials() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
         let stored_config = s3_input().config;
         let record = storage
             .save_file_connection_with_secret_bundle(
@@ -5295,7 +5389,7 @@ mod tests {
     fn webhdfs_delegation_secret_redaction_covers_raw_and_encoded_values() {
         let token = "delegation/+ token%&?";
         let resolved =
-            ResolvedFileSecrets { webhdfs_delegation_token: Some(token.to_string()), ..ResolvedFileSecrets::default() };
+            ResolvedFileSecrets { webhdfs_delegation_token: Some(secret(token)), ..ResolvedFileSecrets::default() };
         let percent_encoded =
             percent_encoding::utf8_percent_encode(token, percent_encoding::NON_ALPHANUMERIC).to_string();
         let form_encoded = url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>();
@@ -5309,7 +5403,7 @@ mod tests {
     async fn webhdfs_fresh_rename_reconciliation_uses_webhdfs_errors_and_redacts_tokens() {
         let token = "delegation/+ token%&?";
         let secrets =
-            ResolvedFileSecrets { webhdfs_delegation_token: Some(token.to_string()), ..ResolvedFileSecrets::default() };
+            ResolvedFileSecrets { webhdfs_delegation_token: Some(secret(token)), ..ResolvedFileSecrets::default() };
         let error = opendal::Error::new(ErrorKind::Unexpected, "WebHDFS stat transport failed")
             .set_source(std::io::Error::other(format!("request contained {token}")));
         let classified = classify_webhdfs_fresh_stat_error(&error, &secrets);
@@ -5332,11 +5426,17 @@ mod tests {
     #[tokio::test]
     async fn webhdfs_delegation_secret_is_separate_scoped_rotatable_and_clearable() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
         let state = Arc::new(AppState::new(storage));
         let app = tauri::test::mock_builder()
             .manage(state.clone())
             .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
 
@@ -5404,18 +5504,22 @@ mod tests {
             unreachable!()
         };
         config.endpoint = "https://rotated-namenode.example.test:9871".to_string();
-        let scope_error = save_file_connection(
-            app.state::<Arc<AppState>>(),
-            app.state::<FileManagerRuntime>(),
-            changed_scope.clone(),
-        )
-        .await
-        .err()
-        .expect("changing the WebHDFS secret scope without re-entering the token must fail");
+        let scope_error =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), changed_scope)
+                .await
+                .err()
+                .expect("changing the WebHDFS secret scope without re-entering the token must fail");
         assert!(scope_error.contains("Re-enter or clear"));
 
+        let mut changed_scope = webhdfs_input(WebhdfsAuthentication::Delegation);
+        changed_scope.id = Some(created.id.clone());
+        changed_scope.expected_revision = Some(preserved.revision);
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) = &mut changed_scope.config else {
+            unreachable!()
+        };
+        config.endpoint = "https://rotated-namenode.example.test:9871".to_string();
         changed_scope.secrets = Some(FileConnectionSecrets {
-            webhdfs_delegation_token: Some("rotated-delegation-token".to_string()),
+            webhdfs_delegation_token: Some(secret("rotated-delegation-token")),
             ..FileConnectionSecrets::default()
         });
         let rotated =
@@ -5443,11 +5547,17 @@ mod tests {
     #[tokio::test]
     async fn webhdfs_simple_to_delegation_requires_a_token_before_save() {
         let directory = tempfile::tempdir().unwrap();
-        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
         let state = Arc::new(AppState::new(storage));
         let app = tauri::test::mock_builder()
             .manage(state.clone())
             .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
 
@@ -5464,17 +5574,19 @@ mod tests {
         delegation.id = Some(simple.id.clone());
         delegation.expected_revision = Some(simple.revision);
         delegation.secrets = None;
-        let error =
-            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), delegation.clone())
-                .await
-                .err()
-                .expect("changing simple authentication to delegation without a token must fail");
+        let error = save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), delegation)
+            .await
+            .err()
+            .expect("changing simple authentication to delegation without a token must fail");
         assert!(error.contains("credentials") || error.contains("delegation token"), "{error}");
         let unchanged = state.storage.load_file_connection(&simple.id).await.unwrap().unwrap();
         assert_eq!(unchanged.revision, simple.revision);
 
+        let mut delegation = webhdfs_input(WebhdfsAuthentication::Delegation);
+        delegation.id = Some(simple.id.clone());
+        delegation.expected_revision = Some(simple.revision);
         delegation.secrets = Some(FileConnectionSecrets {
-            webhdfs_delegation_token: Some("new-delegation-token".to_string()),
+            webhdfs_delegation_token: Some(secret("new-delegation-token")),
             ..FileConnectionSecrets::default()
         });
         let delegated =
@@ -5565,7 +5677,7 @@ mod tests {
     }
 
     fn ftp_resolved(password: &str) -> ResolvedFileSecrets {
-        ResolvedFileSecrets { password: Some(password.to_string()), ..ResolvedFileSecrets::default() }
+        ResolvedFileSecrets { password: Some(secret(password)), ..ResolvedFileSecrets::default() }
     }
 
     async fn direct_ftp_write(ftp: &mut AsyncFtpStream, path: &str, content: &[u8]) {
@@ -5599,9 +5711,9 @@ mod tests {
             anonymous: false,
         });
         let secrets = ResolvedFileSecrets {
-            access_key_id: Some(access_key_id.clone()),
-            secret_access_key: Some(secret_access_key.clone()),
-            session_token: session_token.clone(),
+            access_key_id: Some(secret(access_key_id.clone())),
+            secret_access_key: Some(secret(secret_access_key.clone())),
+            session_token: session_token.clone().map(secret),
             ..ResolvedFileSecrets::default()
         };
         let operator = build_operator_with_secrets(&config, &secrets).unwrap().operator;
@@ -5799,7 +5911,7 @@ mod tests {
 
             let mut password_input = input("ftp://example.test:21", "/");
             password_input.secrets = Some(FileConnectionSecrets {
-                password: Some(injected.to_string()),
+                password: Some(secret(injected)),
                 clear_password: None,
                 ..FileConnectionSecrets::default()
             });
@@ -5850,6 +5962,296 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_commits_before_cancelling_old_work_and_preserves_transfer_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let mut input = input("ftp://delete-order.example.test:21", "/");
+        input.secrets = Some(FileConnectionSecrets {
+            password: Some(secret("delete-order-secret")),
+            ..FileConnectionSecrets::default()
+        });
+        let saved =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), input).await.unwrap();
+        let ipc_json = serde_json::to_string(&saved).unwrap();
+        assert!(!ipc_json.contains("delete-order-secret"));
+        assert!(!format!("{:?}", secret("delete-order-secret")).contains("delete-order-secret"));
+        let old_operation = app.state::<FileManagerRuntime>().begin_operation(&saved.id).unwrap();
+        let old_cancellation = old_operation.cancellation();
+        state
+            .storage
+            .create_file_transfer(
+                "delete-history".to_string(),
+                saved.id.clone(),
+                "download".to_string(),
+                "remote.bin".to_string(),
+                "/tmp/local.bin".to_string(),
+                "directory".to_string(),
+                saved.revision,
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            delete_file_connection(
+                app.state::<Arc<AppState>>(),
+                app.state::<FileManagerRuntime>(),
+                app.state::<FileTransferRuntime>(),
+                saved.id.clone(),
+            ),
+        )
+        .await
+        .expect("delete must not wait for an old remote operation")
+        .unwrap();
+
+        assert!(old_cancellation.ensure_active().unwrap_err().contains("being deleted"));
+        assert!(state.storage.load_file_connection(&saved.id).await.unwrap().is_none());
+        assert!(state.storage.load_file_connection_secret(&saved.id, "password").await.unwrap().is_none());
+        let history = state.storage.get_file_transfer("delete-history").await.unwrap().unwrap();
+        assert_eq!(history.connection_id, saved.id);
+        assert_eq!(history.connection_revision, Some(saved.revision));
+        drop(old_operation);
+        assert_eq!(app.state::<FileManagerRuntime>().lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn delete_transaction_failure_restores_active_without_cancelling_or_evicting() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let mut input = input("ftp://delete-failure.example.test:21", "/");
+        input.secrets = Some(FileConnectionSecrets {
+            password: Some(secret("delete-failure-secret")),
+            ..FileConnectionSecrets::default()
+        });
+        let saved =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), input).await.unwrap();
+        let record = state.storage.load_file_connection(&saved.id).await.unwrap().unwrap();
+        let config = parse_storage_config(&record).unwrap();
+        app.state::<FileManagerRuntime>()
+            .operator_for(&record, &config, &ftp_resolved("delete-failure-secret"))
+            .unwrap();
+        assert_eq!(app.state::<FileManagerRuntime>().operator_count(), 1);
+        let old_operation = app.state::<FileManagerRuntime>().begin_operation(&saved.id).unwrap();
+        let old_cancellation = old_operation.cancellation();
+        state.storage.fail_next_file_connection_delete_for_test();
+
+        let error = delete_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            app.state::<FileTransferRuntime>(),
+            saved.id.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("Injected"));
+        old_cancellation.ensure_active().unwrap();
+        assert!(state.storage.load_file_connection(&saved.id).await.unwrap().is_some());
+        assert_eq!(
+            state.storage.load_file_connection_secret(&saved.id, "password").await.unwrap().as_deref(),
+            Some("delete-failure-secret")
+        );
+        assert_eq!(app.state::<FileManagerRuntime>().operator_count(), 1);
+        let post_failure = app.state::<FileManagerRuntime>().begin_operation(&saved.id).unwrap();
+        drop(post_failure);
+        drop(old_operation);
+        assert_eq!(app.state::<FileManagerRuntime>().lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn successful_delete_after_failed_delete_cancels_pre_failure_save_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let saved = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            input("ftp://delete-retry.example.test:21", "/"),
+        )
+        .await
+        .unwrap();
+
+        let runtime = app.state::<FileManagerRuntime>();
+        let blocker = runtime.begin_operation(&saved.id).unwrap();
+        let old_cancellation = blocker.cancellation();
+        let mutation_guard = blocker.entry.mutation_lock.lock().await;
+        let mut stale_save = input("ftp://delete-retry.example.test:21", "/resurrected");
+        stale_save.id = Some(saved.id.clone());
+        stale_save.expected_revision = None;
+        let save_handle = app.handle().clone();
+        let save_task = tokio::spawn(async move {
+            save_file_connection(
+                save_handle.state::<Arc<AppState>>(),
+                save_handle.state::<FileManagerRuntime>(),
+                stale_save,
+            )
+            .await
+        });
+        while runtime.in_flight_count(&saved.id) < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        state.storage.fail_next_file_connection_delete_for_test();
+        let first_error = delete_file_connection(
+            app.state::<Arc<AppState>>(),
+            runtime.clone(),
+            app.state::<FileTransferRuntime>(),
+            saved.id.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(first_error.contains("Injected"));
+        old_cancellation.ensure_active().unwrap();
+
+        delete_file_connection(
+            app.state::<Arc<AppState>>(),
+            runtime.clone(),
+            app.state::<FileTransferRuntime>(),
+            saved.id.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(old_cancellation.is_cancelled());
+
+        drop(mutation_guard);
+        let stale_error = save_task
+            .await
+            .unwrap()
+            .err()
+            .expect("the pre-failure save admission must not resurrect a successfully deleted connection");
+        assert!(stale_error.contains("being deleted"), "{stale_error}");
+        assert!(state.storage.load_file_connection(&saved.id).await.unwrap().is_none());
+        drop(blocker);
+        assert_eq!(runtime.lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn save_and_delete_are_linearized_in_both_lock_orders_without_resurrection() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+
+        let save_first = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            input("ftp://save-first.example.test:21", "/"),
+        )
+        .await
+        .unwrap();
+        let mut edit = input("ftp://save-first.example.test:21", "/edited");
+        edit.id = Some(save_first.id.clone());
+        edit.expected_revision = Some(save_first.revision);
+        let save_barrier = install_test_persistence_barrier("save", &save_first.id);
+        let save_handle = app.handle().clone();
+        let save_task = tokio::spawn(async move {
+            save_file_connection(save_handle.state::<Arc<AppState>>(), save_handle.state::<FileManagerRuntime>(), edit)
+                .await
+        });
+        save_barrier.entered.notified().await;
+        let delete_handle = app.handle().clone();
+        let save_first_id = save_first.id.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_file_connection(
+                delete_handle.state::<Arc<AppState>>(),
+                delete_handle.state::<FileManagerRuntime>(),
+                delete_handle.state::<FileTransferRuntime>(),
+                save_first_id,
+            )
+            .await
+        });
+        while !app.state::<FileManagerRuntime>().is_deleting(&save_first.id) {
+            tokio::task::yield_now().await;
+        }
+        save_barrier.release.notify_one();
+        assert_eq!(save_task.await.unwrap().unwrap().revision, save_first.revision + 1);
+        delete_task.await.unwrap().unwrap();
+        clear_test_persistence_barrier();
+        assert!(state.storage.load_file_connection(&save_first.id).await.unwrap().is_none());
+
+        let delete_first = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            input("ftp://delete-first.example.test:21", "/"),
+        )
+        .await
+        .unwrap();
+        let delete_barrier = install_test_persistence_barrier("delete", &delete_first.id);
+        let delete_handle = app.handle().clone();
+        let delete_first_id = delete_first.id.clone();
+        let delete_task = tokio::spawn(async move {
+            delete_file_connection(
+                delete_handle.state::<Arc<AppState>>(),
+                delete_handle.state::<FileManagerRuntime>(),
+                delete_handle.state::<FileTransferRuntime>(),
+                delete_first_id,
+            )
+            .await
+        });
+        delete_barrier.entered.notified().await;
+        let mut stale_save = input("ftp://delete-first.example.test:21", "/resurrected");
+        stale_save.id = Some(delete_first.id.clone());
+        stale_save.expected_revision = Some(delete_first.revision);
+        let error =
+            match save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), stale_save)
+                .await
+            {
+                Ok(_) => panic!("save must be rejected after delete marks the connection"),
+                Err(error) => error,
+            };
+        assert!(error.contains("being deleted"));
+        delete_barrier.release.notify_one();
+        delete_task.await.unwrap().unwrap();
+        clear_test_persistence_barrier();
+        assert!(state.storage.load_file_connection(&delete_first.id).await.unwrap().is_none());
+        assert_eq!(app.state::<FileManagerRuntime>().lifecycle_count(), 0);
+    }
+
+    #[tokio::test]
     async fn tracer_serializes_root_lists_per_connection() {
         let runtime = FileManagerRuntime::default();
         let first = runtime.begin_operation("ftp-1").unwrap();
@@ -5882,7 +6284,8 @@ mod tests {
     async fn queued_mutation_reloads_latest_revision_after_predecessor_retires_cache() {
         let runtime = Arc::new(FileManagerRuntime::default());
         let db_path = std::env::temp_dir().join(format!("dbx-queued-mutation-{}.db", Uuid::new_v4()));
-        let storage = dbx_core::storage::Storage::open(&db_path).await.unwrap();
+        let storage =
+            dbx_core::storage::Storage::open_with_file_secret_key(&db_path, TEST_FILE_SECRET_KEY).await.unwrap();
         let config = input("ftp://revision-1.example.test:21", "/").config;
         let record = storage
             .save_file_connection(
@@ -6035,7 +6438,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         let deleting = runtime.start_delete("ftp-1").unwrap();
-        tokio::time::timeout(Duration::from_secs(1), deleting.wait_for_idle()).await.unwrap().unwrap();
+        deleting.cancel_operations();
         assert!(first.await.unwrap().unwrap_err().contains("being deleted"));
         assert!(second.await.unwrap().unwrap_err().contains("being deleted"));
         deleting.finish();
@@ -6058,7 +6461,7 @@ mod tests {
             result
         });
         let deleting = runtime.start_delete("ftp-1").unwrap();
-        deleting.wait_for_idle().await.unwrap();
+        deleting.cancel_operations();
         assert!(hanging.await.unwrap().unwrap_err().contains("being deleted"));
         deleting.finish();
         assert_eq!(runtime.lifecycle_count(), 0);
@@ -6177,11 +6580,17 @@ mod tests {
             ),
         }));
         let directory = tempfile::tempdir().unwrap();
-        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
         let state = Arc::new(AppState::new(storage));
         let app = tauri::test::mock_builder()
             .manage(state.clone())
             .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
         let input = FileConnectionInput {
@@ -6203,10 +6612,19 @@ mod tests {
             .unwrap()
             .map(|path| path.to_string_lossy().into_owned());
 
-        let tested =
-            test_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), input.clone())
-                .await
-                .unwrap();
+        let tested = test_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            FileConnectionInput {
+                id: None,
+                expected_revision: None,
+                name: "HDFS Native service contract".to_string(),
+                config: config.clone(),
+                secrets: None,
+            },
+        )
+        .await
+        .unwrap();
         assert!(tested.success, "{:?}", tested.stages);
 
         let saved =
@@ -6435,9 +6853,14 @@ mod tests {
         }
         drop(prepared);
 
-        delete_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), saved.id)
-            .await
-            .unwrap();
+        delete_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            app.state::<FileTransferRuntime>(),
+            saved.id,
+        )
+        .await
+        .unwrap();
         assert!(state.storage.list_file_connections().await.unwrap().is_empty());
     }
 
@@ -6484,8 +6907,8 @@ mod tests {
                     authentication: SftpAuthentication::PrivateKey,
                 }),
                 ResolvedFileSecrets {
-                    sftp_private_key: Some(private_key.clone()),
-                    sftp_private_key_passphrase: Some(private_key_passphrase.clone()),
+                    sftp_private_key: Some(secret(private_key.clone())),
+                    sftp_private_key_passphrase: Some(secret(private_key_passphrase.clone())),
                     ..ResolvedFileSecrets::default()
                 },
             ),
@@ -6512,15 +6935,20 @@ mod tests {
             authentication: SftpAuthentication::PrivateKey,
         });
         let secrets = ResolvedFileSecrets {
-            sftp_private_key: Some(private_key.clone()),
-            sftp_private_key_passphrase: Some(private_key_passphrase.clone()),
+            sftp_private_key: Some(secret(private_key.clone())),
+            sftp_private_key_passphrase: Some(secret(private_key_passphrase.clone())),
             ..ResolvedFileSecrets::default()
         };
         let built = build_operator_with_secrets(&config, &secrets).unwrap();
         let operator = &built.operator;
 
         let contract_directory = tempfile::tempdir().unwrap();
-        let storage = dbx_core::storage::Storage::open(&contract_directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &contract_directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
         storage
             .save_file_connection_with_secret_bundle(
                 "sftp-service-contract".to_string(),
@@ -6757,8 +7185,8 @@ mod tests {
         assert!(classify_sftp_error(denied_error).starts_with("SftpPermission:"));
 
         let bad_secrets = ResolvedFileSecrets {
-            sftp_private_key: Some(private_key.clone()),
-            sftp_private_key_passphrase: Some("definitely-wrong".to_string()),
+            sftp_private_key: Some(secret(private_key.clone())),
+            sftp_private_key_passphrase: Some(secret("definitely-wrong")),
             ..ResolvedFileSecrets::default()
         };
         assert!(build_operator_with_secrets(&config, &bad_secrets).err().unwrap().starts_with("SftpAuthentication:"));
@@ -6805,8 +7233,8 @@ mod tests {
             authentication: SftpAuthentication::PrivateKey,
         });
         let disconnect_secrets = ResolvedFileSecrets {
-            sftp_private_key: Some(private_key),
-            sftp_private_key_passphrase: Some(private_key_passphrase),
+            sftp_private_key: Some(secret(private_key)),
+            sftp_private_key_passphrase: Some(secret(private_key_passphrase)),
             ..ResolvedFileSecrets::default()
         };
         let disconnect_operator = build_operator_with_secrets(&disconnect_config, &disconnect_secrets).unwrap();
@@ -6838,7 +7266,7 @@ mod tests {
             name: "FTP contract".to_string(),
             config: FileConnectionConfig::Ftp(FtpConnectionConfig { endpoint, root: "/ftp/dbx".to_string(), username }),
             secrets: Some(FileConnectionSecrets {
-                password: Some(password.clone()),
+                password: Some(secret(password.clone())),
                 clear_password: None,
                 ..FileConnectionSecrets::default()
             }),
@@ -6848,7 +7276,8 @@ mod tests {
         assert!(result.success, "stages: {}", serde_json::to_string(&result.stages).unwrap());
 
         let db_path = std::env::temp_dir().join(format!("dbx-ftp-contract-{}.db", Uuid::new_v4()));
-        let storage = dbx_core::storage::Storage::open(&db_path).await.unwrap();
+        let storage =
+            dbx_core::storage::Storage::open_with_file_secret_key(&db_path, TEST_FILE_SECRET_KEY).await.unwrap();
         let config_json = serde_json::to_string(&input.config).unwrap();
         let created = storage
             .save_file_connection(

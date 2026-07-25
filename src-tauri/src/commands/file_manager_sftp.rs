@@ -1024,8 +1024,10 @@ mod tests {
 
     #[test]
     fn auth_modes_reject_private_secrets_outside_private_key_mode() {
-        let secrets =
-            ResolvedFileSecrets { sftp_private_key: Some("secret".to_string()), ..ResolvedFileSecrets::default() };
+        let secrets = ResolvedFileSecrets {
+            sftp_private_key: Some(dbx_core::file_secrets::FileSecret::new("secret".to_string()).unwrap()),
+            ..ResolvedFileSecrets::default()
+        };
         assert!(validate_config(&config(SftpAuthentication::SshConfig), true, &secrets).is_err());
         assert!(validate_config(&config(SftpAuthentication::Agent), true, &secrets).is_err());
 

@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
 use rusqlite::{params, params_from_iter, types::Value, Connection, DatabaseName, OpenFlags, OptionalExtension, ToSql};
@@ -14,6 +16,10 @@ use crate::connection_secrets::{
     NACOS_AUTH_SECRET_PREFIX, NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
 };
 use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
+use crate::file_secrets::{
+    FileSecret, FileSecretBundle, FileSecretKey, FileSecretProtocol, FileSecretRootKey, FileSecretScopeDigest,
+    FileSecretUpdate, FileSecretVault, RedactedFileText, FILE_SECRETS_LOCKED, FILE_SECRET_ENVELOPE_VERSION,
+};
 use crate::history::{
     HistoryConnectionFilter, HistoryConnectionOption, HistoryCursor, HistoryDatabaseFilter, HistoryEntry,
     HistorySearchRequest, HistorySearchResult, MAX_HISTORY,
@@ -109,6 +115,32 @@ pub fn maybe_import_user_data_db(
 
 pub struct Storage {
     db: SqliteHandle,
+    file_secrets: Arc<RwLock<Option<FileSecretRuntime>>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    file_test_hooks: Arc<FileStorageTestHooks>,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Default)]
+struct FileStorageTestHooks {
+    fail_next_connection_delete: AtomicBool,
+    fail_next_file_secret_migration_in_transaction: AtomicBool,
+    stall_next_file_secret_migration_until_interrupted: AtomicBool,
+}
+
+#[derive(Clone)]
+struct FileSecretRuntime {
+    db_uuid: String,
+    vault: Arc<FileSecretVault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSecretBootstrap {
+    pub db_uuid: String,
+    pub key_id: String,
+    pub key_state: String,
+    pub migration_state: String,
+    pub may_create_key: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,10 +354,22 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS file_connection_secrets (
         connection_id TEXT NOT NULL,
+        protocol TEXT NOT NULL,
         key TEXT NOT NULL,
-        secret TEXT NOT NULL,
+        scope_digest BLOB NOT NULL,
+        nonce BLOB NOT NULL,
+        ciphertext BLOB NOT NULL,
+        envelope_version INTEGER NOT NULL,
         PRIMARY KEY (connection_id, key),
         FOREIGN KEY (connection_id) REFERENCES file_connections(id) ON DELETE CASCADE
+    )",
+    "CREATE TABLE IF NOT EXISTS file_secret_metadata (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        db_uuid TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        key_state TEXT NOT NULL,
+        envelope_version INTEGER NOT NULL,
+        migration_state TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS file_transfers (
         id TEXT PRIMARY KEY,
@@ -482,9 +526,92 @@ impl Storage {
     pub async fn open(db_path: &Path) -> Result<Self, String> {
         let db_path = db_path.to_string_lossy().to_string();
         let db = connect_path_create_if_missing(&db_path).await?;
-        let storage = Self { db };
+        let storage = Self {
+            db,
+            file_secrets: Arc::new(RwLock::new(None)),
+            #[cfg(any(test, feature = "test-utils"))]
+            file_test_hooks: Arc::new(FileStorageTestHooks::default()),
+        };
         storage.init_schema().await?;
+        storage.ensure_file_secret_metadata().await?;
         Ok(storage)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn open_with_file_secret_key(db_path: &Path, root_key: [u8; 32]) -> Result<Self, String> {
+        let storage = Self::open(db_path).await?;
+        storage.unlock_file_secrets(FileSecretRootKey::new(root_key)).await?;
+        Ok(storage)
+    }
+
+    pub async fn file_secret_bootstrap(&self) -> Result<FileSecretBootstrap, String> {
+        self.with_conn(|conn| {
+            let (db_uuid, key_id, key_state, migration_state) = conn
+                .query_row(
+                    "SELECT db_uuid, key_id, key_state, migration_state FROM file_secret_metadata WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            if key_id.is_empty() || !matches!(key_state.as_str(), "uninitialized" | "provisioned") {
+                return Err("File secret key metadata is invalid".to_string());
+            }
+            let may_create_key = key_state == "uninitialized"
+                && matches!(migration_state.as_str(), "new" | "legacy")
+                && !file_secret_envelopes_exist(conn)?;
+            Ok(FileSecretBootstrap { db_uuid, key_id, key_state, migration_state, may_create_key })
+        })
+        .await
+    }
+
+    pub fn file_secrets_locked(&self) -> bool {
+        self.file_secrets.read().unwrap_or_else(|error| error.into_inner()).is_none()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_next_file_connection_delete_for_test(&self) {
+        self.file_test_hooks.fail_next_connection_delete.store(true, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_next_file_secret_migration_in_transaction_for_test(&self) {
+        self.file_test_hooks.fail_next_file_secret_migration_in_transaction.store(true, Ordering::Release);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn stall_next_file_secret_migration_until_interrupted_for_test(&self) {
+        self.file_test_hooks.stall_next_file_secret_migration_until_interrupted.store(true, Ordering::Release);
+    }
+
+    pub async fn unlock_file_secrets(&self, root_key: FileSecretRootKey) -> Result<(), String> {
+        self.unlock_file_secrets_inner(root_key, None).await
+    }
+
+    pub async fn unlock_file_secrets_with_timeout(
+        &self,
+        root_key: FileSecretRootKey,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.unlock_file_secrets_inner(root_key, Some(timeout)).await
+    }
+
+    async fn unlock_file_secrets_inner(
+        &self,
+        root_key: FileSecretRootKey,
+        timeout: Option<Duration>,
+    ) -> Result<(), String> {
+        let bootstrap = self.file_secret_bootstrap().await?;
+        let runtime = FileSecretRuntime { db_uuid: bootstrap.db_uuid, vault: Arc::new(FileSecretVault::new(root_key)) };
+        self.migrate_and_verify_file_secrets(runtime.clone(), timeout).await?;
+        *self.file_secrets.write().unwrap_or_else(|error| error.into_inner()) = Some(runtime);
+        Ok(())
     }
 
     async fn init_schema(&self) -> Result<(), String> {
@@ -501,6 +628,147 @@ impl Storage {
         })
     }
 
+    async fn ensure_file_secret_metadata(&self) -> Result<(), String> {
+        self.with_conn(|conn| {
+            ensure_file_secret_metadata_columns(conn)?;
+            let exists = conn
+                .query_row("SELECT EXISTS(SELECT 1 FROM file_secret_metadata WHERE id = 1)", [], |row| {
+                    row.get::<_, bool>(0)
+                })
+                .map_err(|error| error.to_string())?;
+            if !exists {
+                let state = if file_secret_table_has_column(conn, "secret")? { "legacy" } else { "new" };
+                let db_uuid = Uuid::new_v4().to_string();
+                conn.execute(
+                    "INSERT INTO file_secret_metadata
+                     (id, db_uuid, key_id, key_state, envelope_version, migration_state)
+                     VALUES (1, ?1, ?2, 'uninitialized', ?3, ?4)",
+                    params![&db_uuid, format!("{db_uuid}:v1"), FILE_SECRET_ENVELOPE_VERSION, state],
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                let (db_uuid, migration_state) = conn
+                    .query_row("SELECT db_uuid, migration_state FROM file_secret_metadata WHERE id = 1", [], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|error| error.to_string())?;
+                let key_state = if matches!(migration_state.as_str(), "ready" | "encrypted_pending_cleanup")
+                    || file_secret_envelopes_exist(conn)?
+                {
+                    "provisioned"
+                } else {
+                    "uninitialized"
+                };
+                conn.execute(
+                    "UPDATE file_secret_metadata
+                     SET key_id = CASE WHEN key_id = '' THEN ?1 ELSE key_id END,
+                         key_state = CASE WHEN key_state = '' THEN ?2 ELSE key_state END
+                     WHERE id = 1",
+                    params![format!("{db_uuid}:v1"), key_state],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    fn file_secret_runtime(&self) -> Result<FileSecretRuntime, String> {
+        self.file_secrets
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| FILE_SECRETS_LOCKED.to_string())
+    }
+
+    async fn migrate_and_verify_file_secrets(
+        &self,
+        runtime: FileSecretRuntime,
+        timeout: Option<Duration>,
+    ) -> Result<(), String> {
+        #[cfg(any(test, feature = "test-utils"))]
+        let fail_in_transaction =
+            self.file_test_hooks.fail_next_file_secret_migration_in_transaction.swap(false, Ordering::AcqRel);
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let fail_in_transaction = false;
+        #[cfg(any(test, feature = "test-utils"))]
+        let stall_until_interrupted =
+            self.file_test_hooks.stall_next_file_secret_migration_until_interrupted.swap(false, Ordering::AcqRel);
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let stall_until_interrupted = false;
+        let db = self.db.clone();
+        let interrupt = db.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_cancelled = cancelled.clone();
+        let mut task = tokio::task::spawn_blocking(move || {
+            db.with_connection(move |conn| {
+                if task_cancelled.load(Ordering::Acquire) {
+                    return Err("File secret migration timed out; file secrets remain locked".to_string());
+                }
+                if stall_until_interrupted {
+                    conn.query_row(
+                        "WITH RECURSIVE counter(value) AS (
+                             SELECT 0
+                             UNION ALL
+                             SELECT value + 1 FROM counter WHERE value < 1000000000
+                         )
+                         SELECT sum(value) FROM counter",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|_| "File secret migration interrupted".to_string())?;
+                }
+                conn.pragma_update(None, "secure_delete", "ON")
+                    .map_err(|_| "File secret migration failed".to_string())?;
+                let legacy = file_secret_table_has_column(conn, "secret")?;
+                let state = conn
+                    .query_row("SELECT migration_state FROM file_secret_metadata WHERE id = 1", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|_| "File secret migration failed".to_string())?;
+
+                if legacy {
+                    migrate_legacy_file_secrets(conn, &runtime, fail_in_transaction)?;
+                }
+
+                if legacy || matches!(state.as_str(), "encrypted_pending_cleanup" | "cleanup_in_progress") {
+                    conn.execute(
+                        "UPDATE file_secret_metadata SET migration_state = 'cleanup_in_progress' WHERE id = 1",
+                        [],
+                    )
+                    .map_err(|_| "File secret migration cleanup failed".to_string())?;
+                    require_complete_wal_checkpoint(conn)?;
+                    conn.execute_batch("VACUUM;").map_err(|_| "File secret migration cleanup failed".to_string())?;
+                    require_complete_wal_checkpoint(conn)?;
+                }
+
+                verify_file_secret_envelopes(conn, &runtime)?;
+                conn.execute(
+                    "UPDATE file_secret_metadata
+                 SET envelope_version = ?1, migration_state = 'ready', key_state = 'provisioned'
+                 WHERE id = 1",
+                    [FILE_SECRET_ENVELOPE_VERSION],
+                )
+                .map_err(|_| "File secret migration failed".to_string())?;
+                Ok(())
+            })
+        });
+        match timeout {
+            None => task.await.map_err(|error| error.to_string())?,
+            Some(timeout) => {
+                tokio::select! {
+                    result = &mut task => result.map_err(|error| error.to_string())?,
+                    _ = tokio::time::sleep(timeout) => {
+                        cancelled.store(true, Ordering::Release);
+                        interrupt.interrupt();
+                        let _ = task.await;
+                        Err("File secret migration timed out; file secrets remain locked".to_string())
+                    }
+                }
+            }
+        }
+    }
+
     async fn with_conn<T, F>(&self, f: F) -> Result<T, String>
     where
         T: Send + 'static,
@@ -513,89 +781,40 @@ impl Storage {
 
 impl Storage {
     #[allow(clippy::too_many_arguments)]
-    pub async fn save_file_connection_with_secret_bundle(
+    pub async fn save_file_connection_with_secrets(
         &self,
         id: String,
         name: String,
         kind: String,
         config_json: String,
-        secrets: Vec<(String, String)>,
-        secret_keys: Vec<String>,
-        secret_scope_key: String,
-        secret_scope: String,
-        replace_secrets: bool,
+        secret_update: FileSecretUpdate,
         expected_revision: Option<i64>,
     ) -> Result<FileConnectionStorageRecord, String> {
-        const ALLOWED_SECRET_KEYS: &[&str] = &[
-            "password",
-            "password_scope",
-            "access_key_id",
-            "secret_access_key",
-            "session_token",
-            "s3_scope",
-            "webdav_token",
-            "webdav_scope",
-            "sftp_private_key",
-            "sftp_private_key_passphrase",
-            "sftp_scope",
-            "webhdfs_delegation_token",
-            "webhdfs_scope",
-        ];
-        if secret_keys.is_empty()
-            || !secret_keys.iter().all(|key| ALLOWED_SECRET_KEYS.contains(&key.as_str()))
-            || !ALLOWED_SECRET_KEYS.contains(&secret_scope_key.as_str())
-            || secrets.iter().any(|(key, _)| !secret_keys.contains(key))
-        {
-            return Err("Unsupported file connection secret key".to_string());
+        let runtime = self.file_secret_runtime()?;
+        let requested_protocol = file_secret_protocol_from_storage_config(&kind, &config_json)?;
+        if secret_update.protocol() != requested_protocol {
+            return Err("File secret protocol does not match the stored connection configuration".to_string());
         }
-        if secrets.iter().any(|(_, secret)| secret.is_empty()) {
-            return Err("File connection secrets cannot be empty; use the explicit clear operation".to_string());
-        }
-
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().to_rfc3339();
             let tx = conn.transaction().map_err(|error| error.to_string())?;
             let current = tx
-                .query_row("SELECT revision, kind FROM file_connections WHERE id = ?1", [&id], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                .query_row("SELECT revision, kind, config_json FROM file_connections WHERE id = ?1", [&id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
                 })
                 .optional()
                 .map_err(|error| error.to_string())?;
-            let current_revision = current.as_ref().map(|(revision, _)| *revision);
-            let protocol_changed = current.as_ref().is_some_and(|(_, current_kind)| current_kind != &kind);
-            let replace_secrets = replace_secrets || protocol_changed;
+            let current_revision = current.as_ref().map(|(revision, _, _)| *revision);
 
-            if current_revision.is_some() && !replace_secrets {
-                let placeholders = std::iter::repeat_n("?", secret_keys.len()).collect::<Vec<_>>().join(",");
-                let sql = format!(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM file_connection_secrets
-                        WHERE connection_id = ? AND key IN ({placeholders})
-                    )"
-                );
-                let mut values = Vec::with_capacity(secret_keys.len() + 1);
-                values.push(rusqlite::types::Value::Text(id.clone()));
-                values.extend(secret_keys.iter().cloned().map(rusqlite::types::Value::Text));
-                let has_secret = tx
-                    .query_row(&sql, rusqlite::params_from_iter(values), |row| row.get::<_, bool>(0))
-                    .map_err(|error| error.to_string())?;
-                if has_secret {
-                    let stored_scope = tx
-                        .query_row(
-                            "SELECT secret FROM file_connection_secrets
-                             WHERE connection_id = ?1 AND key = ?2",
-                            params![&id, &secret_scope_key],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .map_err(|error| error.to_string())?;
-                    if stored_scope.as_deref() != Some(secret_scope.as_str()) {
-                        return Err(
-                            "Re-enter or clear the credentials after changing the connection endpoint or identity"
-                                .to_string(),
-                        );
-                    }
+            if let Some((_, current_kind, current_config_json)) = &current {
+                let current_protocol = file_secret_protocol_from_storage_config(current_kind, current_config_json)?;
+                if current_protocol != requested_protocol && !secret_update.is_replace() {
+                    return Err(
+                        "Changing the file connection protocol requires explicitly clearing or replacing credentials"
+                            .to_string(),
+                    );
                 }
+                validate_preserved_file_secret_scope(&tx, &id, &secret_update)?;
             }
 
             match (current_revision, expected_revision) {
@@ -624,138 +843,31 @@ impl Storage {
                 }
             }
 
-            if replace_secrets {
-                let mut keys_to_delete = secret_keys.clone();
-                keys_to_delete.push(secret_scope_key.clone());
-                let placeholders = std::iter::repeat_n("?", keys_to_delete.len()).collect::<Vec<_>>().join(",");
-                let sql =
-                    format!("DELETE FROM file_connection_secrets WHERE connection_id = ? AND key IN ({placeholders})");
-                let mut values = Vec::with_capacity(keys_to_delete.len() + 1);
-                values.push(rusqlite::types::Value::Text(id.clone()));
-                values.extend(keys_to_delete.into_iter().map(rusqlite::types::Value::Text));
-                tx.execute(&sql, rusqlite::params_from_iter(values)).map_err(|error| error.to_string())?;
-
-                let mut wrote_secret = false;
-                for (key, secret) in secrets {
-                    if secret.is_empty() {
-                        continue;
-                    }
-                    tx.execute(
-                        "INSERT INTO file_connection_secrets (connection_id, key, secret)
-                         VALUES (?1, ?2, ?3)",
-                        params![&id, key, secret],
-                    )
+            if let FileSecretUpdate::Replace(bundle) = secret_update {
+                tx.execute("DELETE FROM file_connection_secrets WHERE connection_id = ?1", [&id])
                     .map_err(|error| error.to_string())?;
-                    wrote_secret = true;
-                }
-                if wrote_secret {
+                for (key, value) in bundle.values() {
+                    let encrypted = runtime.vault.encrypt(
+                        &runtime.db_uuid,
+                        &id,
+                        bundle.protocol(),
+                        key,
+                        bundle.scope_digest(),
+                        value,
+                    )?;
                     tx.execute(
-                        "INSERT INTO file_connection_secrets (connection_id, key, secret)
-                         VALUES (?1, ?2, ?3)",
-                        params![&id, secret_scope_key, secret_scope],
-                    )
-                    .map_err(|error| error.to_string())?;
-                }
-            }
-
-            let record = query_file_connection_record(&tx, &id)?;
-            tx.commit().map_err(|error| error.to_string())?;
-            Ok(record)
-        })
-        .await
-    }
-
-    pub async fn save_file_connection(
-        &self,
-        id: String,
-        name: String,
-        kind: String,
-        config_json: String,
-        secret: Option<String>,
-        secret_scope: String,
-        replace_secret: bool,
-        expected_revision: Option<i64>,
-    ) -> Result<FileConnectionStorageRecord, String> {
-        self.with_conn(move |conn| {
-            let now = chrono::Utc::now().to_rfc3339();
-            let tx = conn.transaction().map_err(|error| error.to_string())?;
-            let current_revision = tx
-                .query_row("SELECT revision FROM file_connections WHERE id = ?1", [&id], |row| row.get::<_, i64>(0))
-                .optional()
-                .map_err(|error| error.to_string())?;
-            match (current_revision, expected_revision) {
-                (Some(current), Some(expected)) if current == expected => {
-                    tx.execute(
-                        "UPDATE file_connections
-                         SET name = ?2, kind = ?3, config_json = ?4, revision = revision + 1, updated_at = ?5
-                         WHERE id = ?1",
-                        params![id, name, kind, config_json, now],
-                    )
-                    .map_err(|error| error.to_string())?;
-                }
-                (Some(current), Some(expected)) => {
-                    return Err(format!("File connection revision conflict: expected {expected}, current {current}"));
-                }
-                (Some(_), None) => return Err("File connection revision is required for updates".to_string()),
-                (None, Some(_)) => return Err("File connection not found".to_string()),
-                (None, None) => {
-                    tx.execute(
-                        "INSERT INTO file_connections
-                         (id, name, kind, config_json, revision, created_at, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
-                        params![id, name, kind, config_json, now],
-                    )
-                    .map_err(|error| error.to_string())?;
-                }
-            }
-
-            if current_revision.is_some() && !replace_secret {
-                let has_password = tx
-                    .query_row(
-                        "SELECT EXISTS(
-                            SELECT 1 FROM file_connection_secrets
-                            WHERE connection_id = ?1 AND key = 'password'
-                        )",
-                        [&id],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .map_err(|error| error.to_string())?;
-                if has_password {
-                    let stored_scope = tx
-                        .query_row(
-                            "SELECT secret FROM file_connection_secrets
-                             WHERE connection_id = ?1 AND key = 'password_scope'",
-                            [&id],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .map_err(|error| error.to_string())?;
-                    if stored_scope.as_deref() != Some(secret_scope.as_str()) {
-                        return Err(
-                            "Re-enter or clear the password after changing the FTP endpoint or username".to_string()
-                        );
-                    }
-                }
-            }
-
-            if replace_secret {
-                tx.execute(
-                    "DELETE FROM file_connection_secrets
-                     WHERE connection_id = ?1 AND key IN ('password', 'password_scope')",
-                    [&id],
-                )
-                .map_err(|error| error.to_string())?;
-                if let Some(secret) = secret.filter(|value| !value.is_empty()) {
-                    tx.execute(
-                        "INSERT INTO file_connection_secrets (connection_id, key, secret)
-                         VALUES (?1, 'password', ?2)",
-                        params![&id, secret],
-                    )
-                    .map_err(|error| error.to_string())?;
-                    tx.execute(
-                        "INSERT INTO file_connection_secrets (connection_id, key, secret)
-                         VALUES (?1, 'password_scope', ?2)",
-                        params![&id, secret_scope],
+                        "INSERT INTO file_connection_secrets
+                         (connection_id, protocol, key, scope_digest, nonce, ciphertext, envelope_version)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            &id,
+                            bundle.protocol().as_str(),
+                            key.as_str(),
+                            bundle.scope_digest().as_bytes().as_slice(),
+                            encrypted.nonce.as_slice(),
+                            encrypted.ciphertext,
+                            FILE_SECRET_ENVELOPE_VERSION,
+                        ],
                     )
                     .map_err(|error| error.to_string())?;
                 }
@@ -809,58 +921,73 @@ impl Storage {
         .await
     }
 
-    pub async fn load_file_connection_secret(&self, id: &str, key: &str) -> Result<Option<String>, String> {
+    pub async fn load_file_connection_secrets(&self, id: &str, scope: &str) -> Result<FileSecretBundle, String> {
+        let runtime = self.file_secret_runtime()?;
         let id = id.to_string();
-        let key = key.to_string();
+        let expected_scope = FileSecretScopeDigest::from_scope(scope);
         self.with_conn(move |conn| {
-            conn.query_row(
-                "SELECT secret FROM file_connection_secrets WHERE connection_id = ?1 AND key = ?2",
-                params![id, key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())
-        })
-        .await
-    }
-
-    pub async fn load_file_connection_password(
-        &self,
-        id: &str,
-        expected_scope: &str,
-    ) -> Result<Option<String>, String> {
-        let id = id.to_string();
-        let expected_scope = expected_scope.to_string();
-        self.with_conn(move |conn| {
-            let password = conn
-                .query_row(
-                    "SELECT secret FROM file_connection_secrets WHERE connection_id = ?1 AND key = 'password'",
-                    [&id],
-                    |row| row.get::<_, String>(0),
-                )
+            let (kind, config_json) = conn
+                .query_row("SELECT kind, config_json FROM file_connections WHERE id = ?1", [&id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
                 .optional()
-                .map_err(|error| error.to_string())?;
-            let Some(password) = password else {
-                return Ok(None);
-            };
-            let scope = conn
-                .query_row(
-                    "SELECT secret FROM file_connection_secrets
-                     WHERE connection_id = ?1 AND key = 'password_scope'",
-                    [&id],
-                    |row| row.get::<_, String>(0),
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "File connection not found".to_string())?;
+            let protocol = file_secret_protocol_from_storage_config(&kind, &config_json)?;
+            let mut statement = conn
+                .prepare(
+                    "SELECT protocol, key, scope_digest, nonce, ciphertext, envelope_version
+                     FROM file_connection_secrets
+                     WHERE connection_id = ?1
+                     ORDER BY key",
                 )
-                .optional()
                 .map_err(|error| error.to_string())?;
-            if scope.as_deref() != Some(expected_scope.as_str()) {
-                return Err("Stored FTP password does not match the endpoint and username; re-enter it".to_string());
+            let rows = statement
+                .query_map([&id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            let mut values = Vec::new();
+            for row in rows {
+                let (stored_protocol, key, scope_digest, nonce, ciphertext, version) =
+                    row.map_err(|error| error.to_string())?;
+                if version != FILE_SECRET_ENVELOPE_VERSION
+                    || FileSecretProtocol::from_storage(&stored_protocol)? != protocol
+                {
+                    return Err("Stored file secret bundle is invalid".to_string());
+                }
+                let scope_digest = FileSecretScopeDigest::from_bytes(&scope_digest)?;
+                if scope_digest != expected_scope {
+                    return Err(
+                        "Stored credential scope does not match this connection endpoint or identity; re-enter them"
+                            .to_string(),
+                    );
+                }
+                let key = FileSecretKey::from_storage(&key)?;
+                if !protocol.allows(key) {
+                    return Err("Stored file secret bundle is invalid".to_string());
+                }
+                let value =
+                    runtime.vault.decrypt(&runtime.db_uuid, &id, protocol, key, scope_digest, &nonce, &ciphertext)?;
+                values.push((key, value));
             }
-            Ok(Some(password))
+            FileSecretBundle::from_decrypted(protocol, expected_scope, values)
         })
         .await
     }
 
     pub async fn delete_file_connection(&self, id: &str) -> Result<bool, String> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if self.file_test_hooks.fail_next_connection_delete.swap(false, Ordering::AcqRel) {
+            return Err("Injected file connection delete failure".to_string());
+        }
         let id = id.to_string();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|error| error.to_string())?;
@@ -882,17 +1009,34 @@ impl Storage {
         remote_path: String,
         local_path: String,
         local_directory_identity: String,
+        connection_revision: i64,
     ) -> Result<FileTransferStorageRecord, String> {
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().to_rfc3339();
-            conn.execute(
-                "INSERT INTO file_transfers (
+            let changed = conn
+                .execute(
+                    "INSERT INTO file_transfers (
                     id, connection_id, direction, remote_path, local_path,
-                    local_directory_identity, status, bytes_transferred, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', 0, ?7, ?7)",
-                params![id, connection_id, direction, remote_path, local_path, local_directory_identity, now],
-            )
-            .map_err(|error| error.to_string())?;
+                    local_directory_identity, connection_revision, status, bytes_transferred, created_at, updated_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 0, ?8, ?8
+                 FROM file_connections
+                 WHERE id = ?2 AND revision = ?7",
+                    params![
+                        id,
+                        connection_id,
+                        direction,
+                        remote_path,
+                        local_path,
+                        local_directory_identity,
+                        connection_revision,
+                        now
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("File connection changed or was deleted before the transfer started".to_string());
+            }
             query_file_transfer_record(conn, &id)
         })
         .await
@@ -911,26 +1055,33 @@ impl Storage {
     ) -> Result<FileTransferStorageRecord, String> {
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().to_rfc3339();
-            conn.execute(
-                "INSERT INTO file_transfers (
+            let changed = conn
+                .execute(
+                    "INSERT INTO file_transfers (
                     id, connection_id, direction, remote_path, local_path,
                     local_directory_identity, temp_identity, connection_revision,
                     status, bytes_transferred, total_bytes,
                     created_at, updated_at
-                 ) VALUES (?1, ?2, 'upload', ?3, ?4, ?5, ?6, ?7, 'queued', 0, ?8, ?9, ?9)",
-                params![
-                    id,
-                    connection_id,
-                    remote_path,
-                    local_path,
-                    local_directory_identity,
-                    source_fingerprint,
-                    connection_revision,
-                    total_bytes,
-                    now
-                ],
-            )
-            .map_err(|error| error.to_string())?;
+                 )
+                 SELECT ?1, ?2, 'upload', ?3, ?4, ?5, ?6, ?7, 'queued', 0, ?8, ?9, ?9
+                 FROM file_connections
+                 WHERE id = ?2 AND revision = ?7",
+                    params![
+                        id,
+                        connection_id,
+                        remote_path,
+                        local_path,
+                        local_directory_identity,
+                        source_fingerprint,
+                        connection_revision,
+                        total_bytes,
+                        now
+                    ],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("File connection changed or was deleted before the transfer started".to_string());
+            }
             query_file_transfer_record(conn, &id)
         })
         .await
@@ -947,14 +1098,21 @@ impl Storage {
     ) -> Result<FileTransferStorageRecord, String> {
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().to_rfc3339();
-            conn.execute(
-                "INSERT INTO file_transfers (
+            let changed = conn
+                .execute(
+                    "INSERT INTO file_transfers (
                     id, connection_id, direction, remote_path, local_path,
                     connection_revision, operation_phase, status, bytes_transferred, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', 'queued', 0, ?7, ?7)",
-                params![id, connection_id, operation, source_path, destination_path, connection_revision, now],
-            )
-            .map_err(|error| error.to_string())?;
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'queued', 'queued', 0, ?7, ?7
+                 FROM file_connections
+                 WHERE id = ?2 AND revision = ?6",
+                    params![id, connection_id, operation, source_path, destination_path, connection_revision, now],
+                )
+                .map_err(|error| error.to_string())?;
+            if changed != 1 {
+                return Err("File connection changed or was deleted before the transfer started".to_string());
+            }
             query_file_transfer_record(conn, &id)
         })
         .await
@@ -1009,10 +1167,11 @@ impl Storage {
         total_bytes: Option<i64>,
         temp_path: Option<String>,
         temp_identity: Option<String>,
-        error: Option<String>,
+        error: Option<RedactedFileText>,
         terminal: bool,
     ) -> Result<FileTransferStorageRecord, String> {
         let id = id.to_string();
+        let error = error.map(RedactedFileText::into_inner);
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().to_rfc3339();
             let completed_at = terminal.then_some(now.clone());
@@ -1072,12 +1231,13 @@ impl Storage {
         status: String,
         bytes_transferred: i64,
         total_bytes: Option<i64>,
-        error: Option<String>,
+        error: Option<RedactedFileText>,
         partial_destination: Option<String>,
         abort_outcome: Option<String>,
         publish_outcome: Option<String>,
     ) -> Result<FileTransferStorageRecord, String> {
         let id = id.to_string();
+        let error = error.map(RedactedFileText::into_inner);
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
@@ -1112,7 +1272,7 @@ impl Storage {
         status: String,
         bytes_transferred: i64,
         total_bytes: Option<i64>,
-        error: Option<String>,
+        error: Option<RedactedFileText>,
         partial_destination: Option<String>,
         operation_outcome: String,
         operation_phase: String,
@@ -1120,6 +1280,7 @@ impl Storage {
         destination_fingerprint: Option<String>,
     ) -> Result<FileTransferStorageRecord, String> {
         let id = id.to_string();
+        let error = error.map(RedactedFileText::into_inner);
         self.with_conn(move |conn| {
             let now = chrono::Utc::now().to_rfc3339();
             conn.execute(
@@ -1284,6 +1445,142 @@ impl Storage {
     }
 }
 
+#[cfg(test)]
+impl Storage {
+    #[allow(clippy::too_many_arguments)]
+    async fn save_file_connection_with_secret_bundle(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        config_json: String,
+        secrets: Vec<(String, String)>,
+        secret_keys: Vec<String>,
+        _secret_scope_key: String,
+        secret_scope: String,
+        replace_secrets: bool,
+        expected_revision: Option<i64>,
+    ) -> Result<FileConnectionStorageRecord, String> {
+        const LEGACY_KEYS: &[&str] = &[
+            "password",
+            "password_scope",
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "s3_scope",
+            "webdav_token",
+            "webdav_scope",
+            "sftp_private_key",
+            "sftp_private_key_passphrase",
+            "sftp_scope",
+            "webhdfs_delegation_token",
+            "webhdfs_scope",
+        ];
+        if secret_keys.is_empty() || secret_keys.iter().any(|key| !LEGACY_KEYS.contains(&key.as_str())) {
+            return Err("Unsupported file connection secret key".to_string());
+        }
+        let protocol = file_secret_protocol_from_storage_config(&kind, &config_json)?;
+        let mut values = Vec::with_capacity(secrets.len());
+        for (key, value) in secrets {
+            let key = FileSecretKey::from_storage(&key)?;
+            values.push((key, FileSecret::new(value)?));
+        }
+        let protocol_changed = self.load_file_connection(&id).await?.is_some_and(|current| current.kind != kind);
+        let update = if replace_secrets || protocol_changed {
+            FileSecretUpdate::replace(FileSecretBundle::try_new(protocol, &secret_scope, values)?)
+        } else {
+            FileSecretUpdate::preserve(protocol, &secret_scope)
+        };
+        self.save_file_connection_with_secrets(id, name, kind, config_json, update, expected_revision).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn save_file_connection(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        config_json: String,
+        secret: Option<String>,
+        secret_scope: String,
+        replace_secret: bool,
+        expected_revision: Option<i64>,
+    ) -> Result<FileConnectionStorageRecord, String> {
+        let values = secret.into_iter().map(|value| ("password".to_string(), value)).collect();
+        self.save_file_connection_with_secret_bundle(
+            id,
+            name,
+            kind,
+            config_json,
+            values,
+            vec!["password".to_string()],
+            "password_scope".to_string(),
+            secret_scope,
+            replace_secret,
+            expected_revision,
+        )
+        .await
+    }
+
+    async fn load_file_connection_secret(&self, id: &str, key: &str) -> Result<Option<String>, String> {
+        let runtime = self.file_secret_runtime()?;
+        let id = id.to_string();
+        let key = key.to_string();
+        self.with_conn(move |conn| {
+            if matches!(key.as_str(), "password_scope" | "sftp_scope" | "s3_scope" | "webdav_scope" | "webhdfs_scope") {
+                let exists = conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM file_connection_secrets WHERE connection_id = ?1)",
+                        [&id],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                return Ok(exists.then(|| "<encrypted-scope>".to_string()));
+            }
+            let row = conn
+                .query_row(
+                    "SELECT protocol, scope_digest, nonce, ciphertext, envelope_version
+                     FROM file_connection_secrets
+                     WHERE connection_id = ?1 AND key = ?2",
+                    params![&id, &key],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Vec<u8>>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some((protocol, scope, nonce, ciphertext, version)) = row else {
+                return Ok(None);
+            };
+            if version != FILE_SECRET_ENVELOPE_VERSION {
+                return Err("Stored file secrets are unavailable".to_string());
+            }
+            let protocol = FileSecretProtocol::from_storage(&protocol)?;
+            let key = FileSecretKey::from_storage(&key)?;
+            let scope = FileSecretScopeDigest::from_bytes(&scope)?;
+            runtime
+                .vault
+                .decrypt(&runtime.db_uuid, &id, protocol, key, scope, &nonce, &ciphertext)
+                .map(|value| Some(value.expose_secret().to_string()))
+        })
+        .await
+    }
+
+    async fn load_file_connection_password(&self, id: &str, expected_scope: &str) -> Result<Option<String>, String> {
+        Ok(self
+            .load_file_connection_secrets(id, expected_scope)
+            .await?
+            .get(FileSecretKey::Password)
+            .map(|value| value.expose_secret().to_string()))
+    }
+}
+
 const FILE_TRANSFER_SELECT: &str = "SELECT
     id, connection_id, direction, remote_path, local_path, local_directory_identity,
     temp_path, temp_identity, connection_revision, partial_destination,
@@ -1352,6 +1649,318 @@ fn query_file_connection_record(conn: &Connection, id: &str) -> Result<FileConne
         map_file_connection_row,
     )
     .map_err(|error| error.to_string())
+}
+
+fn file_secret_table_has_column(conn: &Connection, column: &str) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('file_connection_secrets')")
+        .map_err(|error| error.to_string())?;
+    let mut rows = statement.query([]).map_err(|error| error.to_string())?;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        if row.get::<_, String>(0).map_err(|error| error.to_string())? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_file_secret_metadata_columns(conn: &Connection) -> Result<(), String> {
+    let mut columns = HashSet::new();
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('file_secret_metadata')")
+        .map_err(|error| error.to_string())?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?;
+    for row in rows {
+        columns.insert(row.map_err(|error| error.to_string())?);
+    }
+    drop(statement);
+    if !columns.contains("key_id") {
+        conn.execute("ALTER TABLE file_secret_metadata ADD COLUMN key_id TEXT NOT NULL DEFAULT ''", [])
+            .map_err(|error| error.to_string())?;
+    }
+    if !columns.contains("key_state") {
+        conn.execute("ALTER TABLE file_secret_metadata ADD COLUMN key_state TEXT NOT NULL DEFAULT ''", [])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn file_secret_envelopes_exist(conn: &Connection) -> Result<bool, String> {
+    if file_secret_table_has_column(conn, "secret")? {
+        return Ok(false);
+    }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM file_connection_secrets)", [], |row| row.get::<_, bool>(0))
+        .map_err(|error| error.to_string())
+}
+
+fn require_complete_wal_checkpoint(conn: &Connection) -> Result<(), String> {
+    let (busy, log_frames, checkpointed_frames) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+        })
+        .map_err(|_| "File secret migration cleanup failed".to_string())?;
+    if busy != 0 || log_frames != checkpointed_frames {
+        return Err("File secret migration cleanup is blocked; file secrets remain locked".to_string());
+    }
+    Ok(())
+}
+
+fn validate_preserved_file_secret_scope(
+    tx: &rusqlite::Transaction<'_>,
+    connection_id: &str,
+    update: &FileSecretUpdate,
+) -> Result<(), String> {
+    let FileSecretUpdate::Preserve { protocol, scope_digest } = update else {
+        return Ok(());
+    };
+    let stored = tx
+        .query_row(
+            "SELECT protocol, scope_digest
+             FROM file_connection_secrets
+             WHERE connection_id = ?1
+             LIMIT 1",
+            [connection_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((stored_protocol, stored_scope)) = stored else {
+        return Ok(());
+    };
+    if FileSecretProtocol::from_storage(&stored_protocol)? != *protocol
+        || FileSecretScopeDigest::from_bytes(&stored_scope)? != *scope_digest
+    {
+        return Err("Re-enter or clear the credentials after changing the connection endpoint or identity".to_string());
+    }
+    Ok(())
+}
+
+struct LegacyFileSecretGroup {
+    protocol: FileSecretProtocol,
+    scope: Option<FileSecret>,
+    values: Vec<(FileSecretKey, FileSecret)>,
+}
+
+fn migrate_legacy_file_secrets(
+    conn: &mut Connection,
+    runtime: &FileSecretRuntime,
+    fail_in_transaction: bool,
+) -> Result<(), String> {
+    let mut groups: HashMap<String, LegacyFileSecretGroup> = HashMap::new();
+    {
+        let mut statement = conn
+            .prepare(
+                "SELECT s.connection_id, s.key, s.secret, f.kind, f.config_json
+                 FROM file_connection_secrets s
+                 JOIN file_connections f ON f.id = s.connection_id
+                 ORDER BY s.connection_id, s.key",
+            )
+            .map_err(|_| "File secret migration failed".to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, FileSecret>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|_| "File secret migration failed".to_string())?;
+        for row in rows {
+            let (connection_id, key, secret, kind, config_json) =
+                row.map_err(|_| "File secret migration failed".to_string())?;
+            let protocol = file_secret_protocol_from_storage_config(&kind, &config_json)
+                .map_err(|_| "File secret migration failed".to_string())?;
+            let group = groups.entry(connection_id).or_insert_with(|| LegacyFileSecretGroup {
+                protocol,
+                scope: None,
+                values: Vec::new(),
+            });
+            if group.protocol != protocol {
+                return Err("File secret migration failed".to_string());
+            }
+            if key == legacy_scope_key(protocol) {
+                if group.scope.replace(secret).is_some() {
+                    return Err("File secret migration failed".to_string());
+                }
+                continue;
+            }
+            let key = FileSecretKey::from_storage(&key).map_err(|_| "File secret migration failed".to_string())?;
+            if !protocol.allows(key) || secret.is_empty() {
+                return Err("File secret migration failed".to_string());
+            }
+            group.values.push((key, secret));
+        }
+    }
+
+    let tx = conn.transaction().map_err(|_| "File secret migration failed".to_string())?;
+    tx.execute_batch(
+        "CREATE TABLE file_connection_secrets_encrypted (
+            connection_id TEXT NOT NULL,
+            protocol TEXT NOT NULL,
+            key TEXT NOT NULL,
+            scope_digest BLOB NOT NULL,
+            nonce BLOB NOT NULL,
+            ciphertext BLOB NOT NULL,
+            envelope_version INTEGER NOT NULL,
+            PRIMARY KEY (connection_id, key),
+            FOREIGN KEY (connection_id) REFERENCES file_connections(id) ON DELETE CASCADE
+        );",
+    )
+    .map_err(|_| "File secret migration failed".to_string())?;
+
+    for (connection_id, group) in groups {
+        if group.values.is_empty() {
+            continue;
+        }
+        let scope = group.scope.ok_or_else(|| "File secret migration failed".to_string())?;
+        let bundle = FileSecretBundle::try_new(group.protocol, scope.expose_secret(), group.values)
+            .map_err(|_| "File secret migration failed".to_string())?;
+        redact_legacy_file_transfer_errors(&tx, &connection_id, &bundle)?;
+        for (key, value) in bundle.values() {
+            let encrypted = runtime
+                .vault
+                .encrypt(&runtime.db_uuid, &connection_id, bundle.protocol(), key, bundle.scope_digest(), value)
+                .map_err(|_| "File secret migration failed".to_string())?;
+            tx.execute(
+                "INSERT INTO file_connection_secrets_encrypted
+                 (connection_id, protocol, key, scope_digest, nonce, ciphertext, envelope_version)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    &connection_id,
+                    bundle.protocol().as_str(),
+                    key.as_str(),
+                    bundle.scope_digest().as_bytes().as_slice(),
+                    encrypted.nonce.as_slice(),
+                    encrypted.ciphertext,
+                    FILE_SECRET_ENVELOPE_VERSION,
+                ],
+            )
+            .map_err(|_| "File secret migration failed".to_string())?;
+        }
+    }
+
+    if fail_in_transaction {
+        return Err("File secret migration failed".to_string());
+    }
+
+    verify_file_secret_envelopes_in_table(&tx, runtime, "file_connection_secrets_encrypted")?;
+    tx.execute("DROP TABLE file_connection_secrets", []).map_err(|_| "File secret migration failed".to_string())?;
+    tx.execute("ALTER TABLE file_connection_secrets_encrypted RENAME TO file_connection_secrets", [])
+        .map_err(|_| "File secret migration failed".to_string())?;
+    tx.execute(
+        "UPDATE file_secret_metadata
+         SET envelope_version = ?1,
+             migration_state = 'encrypted_pending_cleanup',
+             key_state = 'provisioned'
+         WHERE id = 1",
+        [FILE_SECRET_ENVELOPE_VERSION],
+    )
+    .map_err(|_| "File secret migration failed".to_string())?;
+    tx.commit().map_err(|_| "File secret migration failed".to_string())
+}
+
+fn redact_legacy_file_transfer_errors(
+    tx: &rusqlite::Transaction<'_>,
+    connection_id: &str,
+    bundle: &FileSecretBundle,
+) -> Result<(), String> {
+    let redactor = bundle.redactor();
+    let mut statement = tx
+        .prepare("SELECT id, error FROM file_transfers WHERE connection_id = ?1 AND error IS NOT NULL")
+        .map_err(|_| "File secret migration failed".to_string())?;
+    let rows = statement
+        .query_map([connection_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|_| "File secret migration failed".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "File secret migration failed".to_string())?;
+    drop(statement);
+    for (id, error) in rows {
+        let redacted = redactor.redact(error);
+        tx.execute("UPDATE file_transfers SET error = ?2 WHERE id = ?1", params![id, redacted.as_str()])
+            .map_err(|_| "File secret migration failed".to_string())?;
+    }
+    Ok(())
+}
+
+fn file_secret_protocol_from_storage_config(kind: &str, config_json: &str) -> Result<FileSecretProtocol, String> {
+    match kind {
+        "ftp" => Ok(FileSecretProtocol::Ftp),
+        "sftp" => Ok(FileSecretProtocol::Sftp),
+        "s3" => Ok(FileSecretProtocol::S3),
+        "webdav" => Ok(FileSecretProtocol::Webdav),
+        "hdfs" => {
+            let config: serde_json::Value = serde_json::from_str(config_json)
+                .map_err(|_| "Stored file connection configuration is invalid".to_string())?;
+            match config.get("implementation").and_then(serde_json::Value::as_str) {
+                Some("webhdfs") => Ok(FileSecretProtocol::Webhdfs),
+                Some("native") => Ok(FileSecretProtocol::HdfsNative),
+                _ => Err("Stored HDFS file connection implementation is invalid".to_string()),
+            }
+        }
+        _ => Err("Stored file connection protocol is invalid".to_string()),
+    }
+}
+
+const fn legacy_scope_key(protocol: FileSecretProtocol) -> &'static str {
+    match protocol {
+        FileSecretProtocol::Ftp => "password_scope",
+        FileSecretProtocol::Sftp => "sftp_scope",
+        FileSecretProtocol::S3 => "s3_scope",
+        FileSecretProtocol::Webdav => "webdav_scope",
+        FileSecretProtocol::Webhdfs => "webhdfs_scope",
+        FileSecretProtocol::HdfsNative => "hdfs_native_scope",
+    }
+}
+
+fn verify_file_secret_envelopes(conn: &Connection, runtime: &FileSecretRuntime) -> Result<(), String> {
+    verify_file_secret_envelopes_in_table(conn, runtime, "file_connection_secrets")
+}
+
+fn verify_file_secret_envelopes_in_table(
+    conn: &Connection,
+    runtime: &FileSecretRuntime,
+    table: &str,
+) -> Result<(), String> {
+    let sql = format!(
+        "SELECT connection_id, protocol, key, scope_digest, nonce, ciphertext, envelope_version
+         FROM {table}"
+    );
+    let mut statement = conn.prepare(&sql).map_err(|_| "Stored file secrets are unavailable".to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|_| "Stored file secrets are unavailable".to_string())?;
+    for row in rows {
+        let (connection_id, protocol, key, scope_digest, nonce, ciphertext, version) =
+            row.map_err(|_| "Stored file secrets are unavailable".to_string())?;
+        if version != FILE_SECRET_ENVELOPE_VERSION {
+            return Err("Stored file secrets are unavailable".to_string());
+        }
+        let protocol = FileSecretProtocol::from_storage(&protocol)
+            .map_err(|_| "Stored file secrets are unavailable".to_string())?;
+        let key = FileSecretKey::from_storage(&key).map_err(|_| "Stored file secrets are unavailable".to_string())?;
+        if !protocol.allows(key) {
+            return Err("Stored file secrets are unavailable".to_string());
+        }
+        let scope_digest = FileSecretScopeDigest::from_bytes(&scope_digest)
+            .map_err(|_| "Stored file secrets are unavailable".to_string())?;
+        runtime
+            .vault
+            .decrypt(&runtime.db_uuid, &connection_id, protocol, key, scope_digest, &nonce, &ciphertext)
+            .map_err(|_| "Stored file secrets are unavailable".to_string())?;
+    }
+    Ok(())
 }
 
 fn inspect_sqlite_db_file(path: &Path) -> Result<SqliteDbFileState, String> {
@@ -4400,20 +5009,27 @@ fn map_from_sql_err(err: serde_json::Error) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings, McpGlobalPolicy,
-        McpGlobalPolicyState, Storage, MCP_GLOBAL_POLICY_KEY,
+        file_secret_table_has_column, maybe_import_user_data_db, DataDbImportResult, DesktopIconTheme, DesktopSettings,
+        McpGlobalPolicy, McpGlobalPolicyState, Storage, MCP_GLOBAL_POLICY_KEY,
     };
     use crate::connection_secrets::NACOS_RNACOS_CONSOLE_PASSWORD_KEY;
     use crate::connection_secrets::{
         MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
+    };
+    use crate::file_secrets::{
+        FileSecret, FileSecretBundle, FileSecretKey, FileSecretProtocol, FileSecretRootKey, FileSecretUpdate,
+        RedactedFileText, FILE_SECRETS_LOCKED,
     };
     use crate::history::{HistoryConnectionFilter, HistoryDatabaseFilter, HistoryEntry, HistorySearchRequest};
     use crate::models::connection::{
         ConnectionConfig, DatabaseConnectionInfo, DatabaseType, SshTunnelConfig, TransportLayerConfig,
     };
     use crate::saved_sql::SavedSqlFile;
-    use rusqlite::Connection;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use rusqlite::{params, Connection};
+    use std::path::Path;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    const TEST_FILE_SECRET_KEY: [u8; 32] = [0x5a; 32];
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -6201,10 +6817,542 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
+    fn create_legacy_file_secret_database(path: &Path, secret_key: &str, secret_value: &str) {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE file_connections (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE file_connection_secrets (
+                    connection_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    secret TEXT NOT NULL,
+                    PRIMARY KEY (connection_id, key),
+                    FOREIGN KEY (connection_id) REFERENCES file_connections(id) ON DELETE CASCADE
+                 );
+                 INSERT INTO file_connections
+                    (id, name, kind, config_json, revision, created_at, updated_at)
+                 VALUES
+                    ('ftp-legacy', 'Legacy FTP', 'ftp',
+                     '{\"endpoint\":\"ftp://legacy.example.test:21\",\"root\":\"/\",\"username\":\"dbx\"}',
+                     1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO file_connection_secrets (connection_id, key, secret)
+                 VALUES ('ftp-legacy', ?1, ?2)",
+                params![secret_key, secret_value],
+            )
+            .unwrap();
+        if secret_key == "password" {
+            connection
+                .execute(
+                    "INSERT INTO file_connection_secrets (connection_id, key, secret)
+                     VALUES ('ftp-legacy', 'password_scope', ?1)",
+                    ["ftp\nlegacy.example.test\n21\ndbx"],
+                )
+                .unwrap();
+        }
+    }
+
+    fn assert_sqlite_files_do_not_contain(path: &Path, canary: &str) {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let candidate = std::path::PathBuf::from(format!("{}{suffix}", path.display()));
+            let Ok(bytes) = std::fs::read(&candidate) else {
+                continue;
+            };
+            assert!(
+                !bytes.windows(canary.len()).any(|window| window == canary.as_bytes()),
+                "{} still contains plaintext file-secret material",
+                candidate.display()
+            );
+        }
+    }
+
+    fn assert_sqlite_files_contain(path: &Path, canary: &str) {
+        let found = ["", "-wal", "-shm", "-journal"].into_iter().any(|suffix| {
+            std::fs::read(format!("{}{suffix}", path.display()))
+                .ok()
+                .is_some_and(|bytes| bytes.windows(canary.len()).any(|window| window == canary.as_bytes()))
+        });
+        assert!(found, "expected SQLite files to retain rollback canary");
+    }
+
+    #[tokio::test]
+    async fn file_secret_storage_is_locked_without_an_explicit_key_but_list_and_delete_remain_available() {
+        let db = temp_db_path("file-secrets-locked");
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
+        let bundle = FileSecretBundle::try_new(
+            FileSecretProtocol::Ftp,
+            "ftp\nlocked.example.test\n21\ndbx",
+            vec![(FileSecretKey::Password, FileSecret::new("locked-canary".to_string()).unwrap())],
+        )
+        .unwrap();
+        storage
+            .save_file_connection_with_secrets(
+                "ftp-locked".to_string(),
+                "FTP locked".to_string(),
+                "ftp".to_string(),
+                r#"{"endpoint":"ftp://locked.example.test:21","root":"/","username":"dbx"}"#.to_string(),
+                FileSecretUpdate::replace(bundle),
+                None,
+            )
+            .await
+            .unwrap();
+        drop(storage);
+
+        let locked = Storage::open(&db).await.unwrap();
+        assert!(locked.file_secrets_locked());
+        assert_eq!(locked.list_file_connections().await.unwrap().len(), 1);
+        let locked_error =
+            match locked.load_file_connection_secrets("ftp-locked", "ftp\nlocked.example.test\n21\ndbx").await {
+                Ok(_) => panic!("locked storage must reject file secret reads"),
+                Err(error) => error,
+            };
+        assert_eq!(locked_error, FILE_SECRETS_LOCKED);
+        assert!(locked.delete_file_connection("ftp-locked").await.unwrap());
+        assert!(locked.list_file_connections().await.unwrap().is_empty());
+        drop(locked);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_file_secrets_migrate_to_verified_envelopes_and_plaintext_is_scrubbed() {
+        const CANARY: &str = "legacy-plaintext-canary-7f8912";
+        let db = temp_db_path("file-secrets-migration");
+        create_legacy_file_secret_database(&db, "password", CANARY);
+
+        let locked = Storage::open(&db).await.unwrap();
+        assert!(locked.file_secrets_locked());
+        assert!(locked.file_secret_bootstrap().await.unwrap().may_create_key);
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO file_transfers
+                 (id, connection_id, direction, remote_path, local_path, status, bytes_transferred, error, created_at, updated_at)
+                 VALUES ('legacy-error', 'ftp-legacy', 'download', 'remote.bin', '/tmp/local.bin',
+                         'failed', 0, ?1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                [format!("request failed with password {CANARY}")],
+            )
+            .unwrap();
+        locked.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await.unwrap();
+        let bundle =
+            locked.load_file_connection_secrets("ftp-legacy", "ftp\nlegacy.example.test\n21\ndbx").await.unwrap();
+        assert_eq!(bundle.get(FileSecretKey::Password).map(FileSecret::expose_secret), Some(CANARY));
+        let transfer_error = locked.get_file_transfer("legacy-error").await.unwrap().unwrap().error.unwrap();
+        assert!(!transfer_error.contains(CANARY));
+        assert!(transfer_error.contains("[REDACTED]"));
+        locked
+            .with_conn(|conn| {
+                assert!(!file_secret_table_has_column(conn, "secret")?);
+                let state = conn
+                    .query_row("SELECT migration_state FROM file_secret_metadata WHERE id = 1", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(state, "ready");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(locked);
+
+        let bytes = std::fs::read(&db).unwrap();
+        assert!(!bytes.windows(CANARY.len()).any(|window| window == CANARY.as_bytes()));
+        assert_sqlite_files_do_not_contain(&db, CANARY);
+        let bootstrap = Storage::open(&db).await.unwrap().file_secret_bootstrap().await.unwrap();
+        assert!(!bootstrap.may_create_key);
+        assert!(Storage::open_with_file_secret_key(&db, [0x24; 32]).await.is_err());
+        let reopened = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
+        assert_eq!(
+            reopened
+                .load_file_connection_secrets("ftp-legacy", "ftp\nlegacy.example.test\n21\ndbx")
+                .await
+                .unwrap()
+                .get(FileSecretKey::Password)
+                .map(FileSecret::expose_secret),
+            Some(CANARY)
+        );
+        drop(reopened);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn blocked_wal_cleanup_stays_locked_and_resumes_after_reader_releases() {
+        const CANARY: &str = "legacy-blocked-wal-canary-b80451";
+        let db = temp_db_path("file-secrets-blocked-wal-cleanup");
+        create_legacy_file_secret_database(&db, "password", CANARY);
+        let journal = Connection::open(&db).unwrap();
+        journal.pragma_update(None, "journal_mode", "WAL").unwrap();
+        drop(journal);
+
+        let storage = Storage::open(&db).await.unwrap();
+        let reader = Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            reader.query_row("SELECT COUNT(*) FROM file_connection_secrets", [], |row| row.get::<_, i64>(0)).unwrap(),
+            2
+        );
+
+        let error = storage.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await.unwrap_err();
+        assert!(error.contains("cleanup is blocked"), "{error}");
+        assert!(storage.file_secrets_locked());
+        let pending = storage.file_secret_bootstrap().await.unwrap();
+        assert_eq!(pending.key_state, "provisioned");
+        assert_eq!(pending.migration_state, "cleanup_in_progress");
+        assert!(!pending.may_create_key);
+        assert_eq!(
+            Connection::open(&db)
+                .unwrap()
+                .query_row("SELECT migration_state FROM file_secret_metadata WHERE id = 1", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap(),
+            "cleanup_in_progress"
+        );
+
+        reader.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        storage.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await.unwrap();
+        assert!(!storage.file_secrets_locked());
+        let ready = storage.file_secret_bootstrap().await.unwrap();
+        assert_eq!(ready.migration_state, "ready");
+        assert_eq!(ready.key_state, "provisioned");
+        drop(storage);
+
+        assert_sqlite_files_do_not_contain(&db, CANARY);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_file_secret_rolls_back_without_partial_envelope_schema() {
+        let db = temp_db_path("file-secrets-migration-rollback");
+        create_legacy_file_secret_database(&db, "arbitrary_secret", "rollback-canary");
+        assert!(Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.is_err());
+
+        let connection = Connection::open(&db).unwrap();
+        let legacy_value = connection
+            .query_row(
+                "SELECT secret FROM file_connection_secrets
+                 WHERE connection_id = 'ftp-legacy' AND key = 'arbitrary_secret'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_value, "rollback-canary");
+        assert!(!connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'file_connection_secrets_encrypted'
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        drop(connection);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_file_secret_migration_rolls_back_an_in_transaction_failure_completely() {
+        const CANARY: &str = "legacy-transaction-rollback-canary-5a4fd1";
+        let db = temp_db_path("file-secrets-migration-transaction-rollback");
+        create_legacy_file_secret_database(&db, "password", CANARY);
+        let storage = Storage::open(&db).await.unwrap();
+        storage
+            .with_conn(|connection| {
+                connection
+                    .execute(
+                        "INSERT INTO file_transfers
+                         (id, connection_id, direction, remote_path, local_path, status, error, created_at, updated_at)
+                         VALUES ('rollback-error', 'ftp-legacy', 'download', 'remote.bin', '/tmp/local.bin',
+                                 'failed', ?1, '2026-01-01', '2026-01-01')",
+                        [format!("credential={CANARY}")],
+                    )
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+            .await
+            .unwrap();
+        storage.fail_next_file_secret_migration_in_transaction_for_test();
+
+        let error = storage.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await.unwrap_err();
+        assert_eq!(error, "File secret migration failed");
+        assert!(storage.file_secrets_locked());
+
+        storage
+            .with_conn(|connection| {
+                assert!(file_secret_table_has_column(connection, "secret")?);
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT secret FROM file_connection_secrets
+                             WHERE connection_id = 'ftp-legacy' AND key = 'password'",
+                            [],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .map_err(|error| error.to_string())?,
+                    CANARY
+                );
+                assert_eq!(
+                    connection
+                        .query_row(
+                            "SELECT key_state, migration_state FROM file_secret_metadata WHERE id = 1",
+                            [],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        )
+                        .map_err(|error| error.to_string())?,
+                    ("uninitialized".to_string(), "legacy".to_string())
+                );
+                assert!(!connection
+                    .query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM sqlite_master
+                            WHERE type = 'table' AND name = 'file_connection_secrets_encrypted'
+                         )",
+                        [],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(|error| error.to_string())?);
+                assert_eq!(
+                    connection
+                        .query_row("SELECT error FROM file_transfers WHERE id = 'rollback-error'", [], |row| {
+                            row.get::<_, String>(0)
+                        })
+                        .map_err(|error| error.to_string())?,
+                    format!("credential={CANARY}")
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_sqlite_files_contain(&db, CANARY);
+
+        storage.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await.unwrap();
+        assert!(!storage.file_secrets_locked());
+        assert_sqlite_files_do_not_contain(&db, CANARY);
+        drop(storage);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn file_secret_bootstrap_uses_metadata_instead_of_connection_count() {
+        let db = temp_db_path("file-secret-bootstrap-metadata");
+        let storage = Storage::open(&db).await.unwrap();
+        let initial = storage.file_secret_bootstrap().await.unwrap();
+        assert_eq!(initial.key_state, "uninitialized");
+        assert_eq!(initial.migration_state, "new");
+        assert!(initial.may_create_key);
+
+        storage.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await.unwrap();
+        let ready = storage.file_secret_bootstrap().await.unwrap();
+        assert_eq!(ready.key_state, "provisioned");
+        assert_eq!(ready.migration_state, "ready");
+        assert!(!ready.may_create_key);
+        assert!(storage.list_file_connections().await.unwrap().is_empty());
+        drop(storage);
+
+        let reopened = Storage::open(&db).await.unwrap();
+        let empty_ready = reopened.file_secret_bootstrap().await.unwrap();
+        assert_eq!(empty_ready.key_id, ready.key_id);
+        assert_eq!(empty_ready.key_state, "provisioned");
+        assert_eq!(empty_ready.migration_state, "ready");
+        assert!(!empty_ready.may_create_key);
+        drop(reopened);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn file_secret_unlock_timeout_interrupts_and_drains_the_sqlite_worker() {
+        let db = temp_db_path("file-secret-unlock-timeout-drains-worker");
+        let storage = Storage::open(&db).await.unwrap();
+        storage.stall_next_file_secret_migration_until_interrupted_for_test();
+
+        let started = std::time::Instant::now();
+        let error = storage
+            .unlock_file_secrets_with_timeout(FileSecretRootKey::new(TEST_FILE_SECRET_KEY), Duration::from_millis(25))
+            .await
+            .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(storage.file_secrets_locked());
+
+        let bootstrap = tokio::time::timeout(Duration::from_secs(1), storage.file_secret_bootstrap())
+            .await
+            .expect("the timed-out worker must release the SQLite mutex")
+            .unwrap();
+        assert_eq!(bootstrap.key_state, "uninitialized");
+        assert_eq!(bootstrap.migration_state, "new");
+
+        storage.unlock_file_secrets(FileSecretRootKey::new(TEST_FILE_SECRET_KEY)).await.unwrap();
+        assert!(!storage.file_secrets_locked());
+        drop(storage);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn protocol_switch_requires_explicit_replace_and_is_transactional() {
+        let db = temp_db_path("file-secret-protocol-switch");
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
+        let ftp_scope = "ftp\nlocalhost\n21\ndemo";
+        let created = storage
+            .save_file_connection_with_secrets(
+                "switch-1".into(),
+                "FTP".into(),
+                "ftp".into(),
+                r#"{"endpoint":"ftp://localhost:21","root":"/","username":"demo"}"#.into(),
+                FileSecretUpdate::replace(
+                    FileSecretBundle::try_new(
+                        FileSecretProtocol::Ftp,
+                        ftp_scope,
+                        vec![(FileSecretKey::Password, FileSecret::new("ftp-secret".into()).unwrap())],
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let preserve_error = storage
+            .save_file_connection_with_secrets(
+                created.id.clone(),
+                "S3".into(),
+                "s3".into(),
+                r#"{"endpoint":"https://s3.example.test","bucket":"bucket"}"#.into(),
+                FileSecretUpdate::preserve(FileSecretProtocol::S3, "s3\nendpoint\nbucket"),
+                Some(created.revision),
+            )
+            .await
+            .unwrap_err();
+        assert!(preserve_error.contains("explicitly clearing or replacing"));
+        let unchanged = storage.load_file_connection(&created.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.kind, "ftp");
+        assert_eq!(unchanged.revision, created.revision);
+        assert_eq!(
+            storage
+                .load_file_connection_secrets(&created.id, ftp_scope)
+                .await
+                .unwrap()
+                .get(FileSecretKey::Password)
+                .map(FileSecret::expose_secret),
+            Some("ftp-secret")
+        );
+
+        let replaced = storage
+            .save_file_connection_with_secrets(
+                created.id.clone(),
+                "S3".into(),
+                "s3".into(),
+                r#"{"endpoint":"https://s3.example.test","bucket":"bucket"}"#.into(),
+                FileSecretUpdate::replace(FileSecretBundle::empty(FileSecretProtocol::S3, "s3\nendpoint\nbucket")),
+                Some(created.revision),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.kind, "s3");
+        assert_eq!(replaced.revision, created.revision + 1);
+        assert!(!replaced.has_secret);
+        assert!(storage.load_file_connection_secrets(&created.id, "s3\nendpoint\nbucket").await.unwrap().is_empty());
+        drop(storage);
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn transfer_creation_is_conditioned_on_connection_revision_and_existence() {
+        let db = temp_db_path("file-transfer-conditional-insert");
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
+        let connection = storage
+            .save_file_connection(
+                "ftp-conditional".into(),
+                "FTP".into(),
+                "ftp".into(),
+                r#"{"endpoint":"ftp://localhost:21","root":"/","username":"demo"}"#.into(),
+                None,
+                "ftp\nlocalhost\n21\ndemo".into(),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let stale_revision = connection.revision + 1;
+
+        assert!(storage
+            .create_file_transfer(
+                "stale-download".into(),
+                connection.id.clone(),
+                "download".into(),
+                "remote.bin".into(),
+                "/tmp/local.bin".into(),
+                "directory".into(),
+                stale_revision,
+            )
+            .await
+            .unwrap_err()
+            .contains("changed or was deleted"));
+        assert!(storage
+            .create_file_upload_transfer(
+                "stale-upload".into(),
+                connection.id.clone(),
+                "remote.bin".into(),
+                "/tmp/local.bin".into(),
+                "directory".into(),
+                "fingerprint".into(),
+                1,
+                stale_revision,
+            )
+            .await
+            .unwrap_err()
+            .contains("changed or was deleted"));
+        for operation in ["copy", "rename"] {
+            assert!(storage
+                .create_file_remote_transfer(
+                    format!("stale-{operation}"),
+                    connection.id.clone(),
+                    operation.into(),
+                    "source.bin".into(),
+                    "destination.bin".into(),
+                    stale_revision,
+                )
+                .await
+                .unwrap_err()
+                .contains("changed or was deleted"));
+        }
+        assert!(storage.list_file_transfers(Some(&connection.id), 100).await.unwrap().is_empty());
+
+        assert!(storage.delete_file_connection(&connection.id).await.unwrap());
+        assert!(storage
+            .create_file_transfer(
+                "deleted-download".into(),
+                connection.id.clone(),
+                "download".into(),
+                "remote.bin".into(),
+                "/tmp/local.bin".into(),
+                "directory".into(),
+                connection.revision,
+            )
+            .await
+            .unwrap_err()
+            .contains("changed or was deleted"));
+        assert!(storage.list_file_transfers(Some(&connection.id), 100).await.unwrap().is_empty());
+        drop(storage);
+        std::fs::remove_file(&db).ok();
+    }
+
     #[tokio::test]
     async fn file_connection_crud_separates_secret_and_increments_revision() {
         let db = temp_db_path("file-connection-crud");
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
 
         let created = storage
             .save_file_connection(
@@ -6343,7 +7491,7 @@ mod tests {
     #[tokio::test]
     async fn s3_secret_bundle_is_allowlisted_atomic_and_cleared_on_protocol_change() {
         let db = temp_db_path("s3-file-connection-secrets");
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
         let created = storage
             .save_file_connection_with_secret_bundle(
                 "s3-1".into(),
@@ -6424,7 +7572,7 @@ mod tests {
     #[tokio::test]
     async fn webdav_secret_bundle_is_separate_scoped_and_reported() {
         let db = temp_db_path("webdav-file-connection-secrets");
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
         let config = r#"{"type":"webdav","endpoint":"https://dav.example.test/service","root":"/tenant/","authentication":"bearer","username":""}"#;
         let created = storage
             .save_file_connection_with_secret_bundle(
@@ -6494,7 +7642,7 @@ mod tests {
     #[tokio::test]
     async fn sftp_secret_bundle_round_trips_preserves_replaces_and_clears_without_config_leakage() {
         let db = temp_db_path("sftp-file-connection-secrets");
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
         let config = r#"{"type":"sftp","endpoint":"ssh://sftp.example.test:22","root":"/srv/dbx","username":"dbx","authentication":"private_key"}"#;
         let secret_keys = vec!["sftp_private_key".to_string(), "sftp_private_key_passphrase".to_string()];
         let scope = "sftp\nssh://sftp.example.test:22\n/srv/dbx\ndbx\nPrivateKey";
@@ -6638,7 +7786,20 @@ mod tests {
             .unwrap();
         drop(legacy);
 
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
+        storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP".into(),
+                "ftp".into(),
+                "{}".into(),
+                None,
+                "ftp-scope".into(),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         let created = storage
             .create_file_transfer(
                 "migrated-transfer".into(),
@@ -6647,12 +7808,13 @@ mod tests {
                 "remote/file.bin".into(),
                 "/tmp/file.bin".into(),
                 "directory-identity".into(),
+                1,
             )
             .await
             .unwrap();
         assert_eq!(created.local_directory_identity, "directory-identity");
         assert_eq!(created.temp_identity, None);
-        assert_eq!(created.connection_revision, None);
+        assert_eq!(created.connection_revision, Some(1));
         assert_eq!(created.partial_destination, None);
         assert_eq!(created.abort_outcome, None);
         assert_eq!(created.publish_outcome, None);
@@ -6662,7 +7824,20 @@ mod tests {
     #[tokio::test]
     async fn file_transfer_terminal_state_is_queryable_and_cannot_be_regressed_by_late_progress() {
         let db = temp_db_path("file-transfer-terminal");
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
+        storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP".into(),
+                "ftp".into(),
+                "{}".into(),
+                None,
+                "ftp-scope".into(),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         let created = storage
             .create_file_transfer(
                 "transfer-1".into(),
@@ -6671,6 +7846,7 @@ mod tests {
                 "remote/file.bin".into(),
                 "/tmp/file.bin".into(),
                 "dir-identity".into(),
+                1,
             )
             .await
             .unwrap();
@@ -6719,7 +7895,7 @@ mod tests {
                 Some(8),
                 None,
                 None,
-                Some("Download cancelled".into()),
+                Some(RedactedFileText::from_static("Download cancelled")),
                 true,
             )
             .await
@@ -6734,7 +7910,7 @@ mod tests {
     #[tokio::test]
     async fn upload_create_and_terminal_outcome_are_each_atomic() {
         let db = temp_db_path("file-upload-atomic");
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
         storage
             .save_file_connection(
                 "ftp-1".into(),
@@ -6783,7 +7959,7 @@ mod tests {
                 "partial".into(),
                 8,
                 Some(12),
-                Some("cleanup failed".into()),
+                Some(RedactedFileText::from_static("cleanup failed")),
                 Some("remote/.dbx-upload-upload-1-random.part".into()),
                 Some("unsupported".into()),
                 Some("partial_source".into()),
@@ -6846,7 +8022,7 @@ mod tests {
     #[tokio::test]
     async fn remote_transfer_phases_and_rename_retry_are_durable() {
         let db = temp_db_path("remote-transfer-phases");
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
         storage
             .save_file_connection(
                 "ftp-1".into(),
@@ -6912,7 +8088,7 @@ mod tests {
                 "partial".into(),
                 8,
                 Some(8),
-                Some("source delete failed".into()),
+                Some(RedactedFileText::from_static("source delete failed")),
                 Some("destination.bin".into()),
                 "copied_source_delete_failed".into(),
                 "delete_uncertain".into(),
@@ -6938,7 +8114,20 @@ mod tests {
     #[tokio::test]
     async fn interrupted_file_transfers_are_failed_for_crash_recovery() {
         let db = temp_db_path("file-transfer-recovery");
-        let storage = Storage::open(&db).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&db, TEST_FILE_SECRET_KEY).await.unwrap();
+        storage
+            .save_file_connection(
+                "ftp-1".into(),
+                "FTP".into(),
+                "ftp".into(),
+                "{}".into(),
+                None,
+                "ftp-scope".into(),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
         storage
             .create_file_transfer(
                 "transfer-1".into(),
@@ -6947,6 +8136,7 @@ mod tests {
                 "remote/file.bin".into(),
                 "/tmp/file.bin".into(),
                 "dir-identity".into(),
+                1,
             )
             .await
             .unwrap();

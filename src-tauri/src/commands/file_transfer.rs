@@ -17,6 +17,7 @@ use cap_fs_ext::{
 };
 use cap_std::fs::{Dir, OpenOptions};
 use dbx_core::connection::AppState;
+use dbx_core::file_secrets::{FileSecretRedactor, RedactedFileText};
 use dbx_core::storage::FileTransferStorageRecord;
 use futures::io::AsyncRead as FuturesAsyncRead;
 use futures::io::AsyncReadExt as FuturesAsyncReadExt;
@@ -86,6 +87,46 @@ static TEST_REMOTE_COPY_AFTER_CHUNK_BARRIER: std::sync::OnceLock<Mutex<Option<Te
 #[cfg(test)]
 static TEST_REMOTE_RENAME_AFTER_PUBLISH_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
     std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_TRANSFER_BEFORE_INSERT_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_test_transfer_before_insert_barrier() -> TestRemoteReaderBarrier {
+    let barrier = TestRemoteReaderBarrier {
+        opened: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let mut slot = TEST_TRANSFER_BEFORE_INSERT_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(slot.is_none(), "only one transfer insert barrier may be installed");
+    *slot = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+fn clear_test_transfer_before_insert_barrier() {
+    *TEST_TRANSFER_BEFORE_INSERT_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = None;
+}
+
+#[cfg(test)]
+async fn wait_test_transfer_before_insert_barrier() {
+    let barrier = TEST_TRANSFER_BEFORE_INSERT_BARRIER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if let Some(barrier) = barrier {
+        barrier.opened.notify_one();
+        barrier.release.notified().await;
+    }
+}
 
 #[cfg(test)]
 static TEST_SFTP_RENAME_BEFORE_DISPATCH_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
@@ -459,6 +500,21 @@ impl FileTransferRuntime {
             .map(|transfer| transfer.cancellation.clone())
     }
 
+    pub(super) fn cancel_connection(&self, connection_id: &str) -> usize {
+        let cancellations = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter(|transfer| transfer.connection_id == connection_id)
+            .map(|transfer| transfer.cancellation.clone())
+            .collect::<Vec<_>>();
+        for cancellation in &cancellations {
+            cancellation.cancel();
+        }
+        cancellations.len()
+    }
+
     fn unregister(&self, transfer_id: &str) {
         let connection_id = self
             .active
@@ -545,11 +601,16 @@ async fn start_download_inner<R: Runtime>(
         .try_fs_scope()
         .ok_or_else(|| "File-system authorization is unavailable; choose the destination again".to_string())?;
     validate_local_authorization(&fs_scope, &local.path)?;
-    if state.storage.load_file_connection(&input.connection_id).await?.is_none() {
-        return Err("File connection not found".to_string());
-    }
+    let _admission = file_manager.begin_operation(&input.connection_id)?;
+    let connection = state
+        .storage
+        .load_file_connection(&input.connection_id)
+        .await?
+        .ok_or_else(|| "File connection not found".to_string())?;
 
     let transfer_id = Uuid::new_v4().to_string();
+    let cancellation = CancellationToken::new();
+    runtime.register(transfer_id.clone(), input.connection_id.clone(), cancellation.clone());
     let record = state
         .storage
         .create_file_transfer(
@@ -559,10 +620,16 @@ async fn start_download_inner<R: Runtime>(
             remote_path,
             local.path.to_string_lossy().into_owned(),
             local.directory_identity,
+            connection.revision,
         )
-        .await?;
-    let cancellation = CancellationToken::new();
-    runtime.register(transfer_id.clone(), input.connection_id.clone(), cancellation.clone());
+        .await;
+    let record = match record {
+        Ok(record) => record,
+        Err(error) => {
+            runtime.unregister(&transfer_id);
+            return Err(error);
+        }
+    };
     emit_transfer(&app, &record);
     let worker_id = transfer_id.clone();
     let connection_id = input.connection_id;
@@ -600,6 +667,7 @@ async fn start_upload_inner<R: Runtime>(
         .try_fs_scope()
         .ok_or_else(|| "File-system authorization is unavailable; choose the source file again".to_string())?;
     validate_local_upload_authorization(&fs_scope, &local_path)?;
+    let _admission = file_manager.begin_operation(&input.connection_id)?;
     let connection = state
         .storage
         .load_file_connection(&input.connection_id)
@@ -676,6 +744,7 @@ async fn start_remote_transfer_inner<R: Runtime>(
     if source_path == destination_path {
         return Err("Source and destination paths must be different".to_string());
     }
+    let _admission = file_manager.begin_operation(&input.connection_id)?;
     let connection = state
         .storage
         .load_file_connection(&input.connection_id)
@@ -689,6 +758,8 @@ async fn start_remote_transfer_inner<R: Runtime>(
     let transfer_id = Uuid::new_v4().to_string();
     let cancellation = CancellationToken::new();
     runtime.register(transfer_id.clone(), input.connection_id.clone(), cancellation.clone());
+    #[cfg(test)]
+    wait_test_transfer_before_insert_barrier().await;
     let queued = match state
         .storage
         .create_file_remote_transfer(
@@ -944,7 +1015,14 @@ async fn run_download_worker<R: Runtime>(
         };
         let prepared = tokio::select! {
             _ = cancellation.cancelled() => return Err(cancelled_failure()),
-            prepared = file_manager.prepare_file_operation(&state, &connection_id, &remote_path) => {
+            prepared = file_manager.prepare_file_operation_at_revision(
+                &state,
+                &connection_id,
+                &remote_path,
+                initial.connection_revision.ok_or_else(|| {
+                    local_failure("Download has no durable file connection revision")
+                })?
+            ) => {
                 prepared.map_err(remote_failure)?
             }
         };
@@ -3516,7 +3594,7 @@ async fn finalize_upload_result<R: Runtime>(
             status.to_string(),
             bytes_transferred,
             total_bytes,
-            error,
+            optional_persisted_file_error(error),
             partial_destination,
             abort_outcome,
             publish_outcome,
@@ -3579,7 +3657,7 @@ async fn finalize_remote_transfer_result<R: Runtime>(
             status.to_string(),
             bytes_transferred,
             total_bytes,
-            error,
+            optional_persisted_file_error(error),
             partial_destination,
             operation_outcome.to_string(),
             operation_phase.to_string(),
@@ -3733,7 +3811,16 @@ async fn finalize_download_result<R: Runtime>(
     };
     match state
         .storage
-        .update_file_transfer(transfer_id, status.to_string(), bytes_transferred, total_bytes, None, None, error, true)
+        .update_file_transfer(
+            transfer_id,
+            status.to_string(),
+            bytes_transferred,
+            total_bytes,
+            None,
+            None,
+            optional_persisted_file_error(error),
+            true,
+        )
         .await
     {
         Ok(record) => emit_transfer(app, &record),
@@ -4968,7 +5055,7 @@ async fn recover_interrupted_transfer(
                 status.to_string(),
                 transfer.bytes_transferred,
                 transfer.total_bytes,
-                Some(error),
+                Some(persisted_file_error(error)),
                 partial_destination,
                 abort_outcome,
                 publish_outcome,
@@ -5058,7 +5145,7 @@ async fn recover_interrupted_transfer(
                     status.to_string(),
                     transfer.bytes_transferred,
                     transfer.total_bytes,
-                    error,
+                    optional_persisted_file_error(error),
                     (status == "partial").then(|| transfer.local_path.clone()),
                     outcome.to_string(),
                     terminal_phase.to_string(),
@@ -5107,7 +5194,7 @@ async fn recover_interrupted_transfer(
                 status.to_string(),
                 transfer.bytes_transferred,
                 transfer.total_bytes,
-                Some(error),
+                Some(persisted_file_error(error)),
                 partial_destination,
                 outcome.to_string(),
                 phase.to_string(),
@@ -5128,7 +5215,7 @@ async fn recover_interrupted_transfer(
                     transfer.total_bytes,
                     None,
                     None,
-                    Some("Publishing transfer has no durable temporary-file identity".to_string()),
+                    Some(RedactedFileText::from_static("Publishing transfer has no durable temporary-file identity")),
                     true,
                 )
                 .await?;
@@ -5145,7 +5232,9 @@ async fn recover_interrupted_transfer(
                 transfer.total_bytes,
                 Some(temp_path.to_string()),
                 transfer.temp_identity.clone(),
-                Some("Interrupted transfer has an invalid temporary-file path; no file was removed".to_string()),
+                Some(RedactedFileText::from_static(
+                    "Interrupted transfer has an invalid temporary-file path; no file was removed",
+                )),
                 true,
             )
             .await?;
@@ -5219,7 +5308,7 @@ async fn recover_interrupted_transfer(
                     transfer.total_bytes,
                     None,
                     None,
-                    Some("The application exited before publishing the download".to_string()),
+                    Some(RedactedFileText::from_static("The application exited before publishing the download")),
                     true,
                 )
                 .await?;
@@ -5235,7 +5324,7 @@ async fn recover_interrupted_transfer(
                     transfer.total_bytes,
                     Some(persisted_temp_path),
                     transfer.temp_identity.clone(),
-                    Some(format!("Interrupted transfer reconciliation failed safely: {error}")),
+                    Some(persisted_file_error(format!("Interrupted transfer reconciliation failed safely: {error}"))),
                     true,
                 )
                 .await?;
@@ -5347,8 +5436,17 @@ fn sanitize_error(message: &str) -> String {
     sanitized
 }
 
+fn persisted_file_error(message: String) -> RedactedFileText {
+    FileSecretRedactor::default().redact(message)
+}
+
+fn optional_persisted_file_error(message: Option<String>) -> Option<RedactedFileText> {
+    message.map(persisted_file_error)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::file_manager::{delete_file_connection, FileSecretStorageTestExt, TEST_FILE_SECRET_KEY};
     use super::*;
     use dbx_core::storage::Storage;
     use std::collections::BTreeSet;
@@ -5356,12 +5454,146 @@ mod tests {
     use std::process::Command;
     use std::task::{Context, Poll};
 
+    async fn ensure_test_connection(storage: &Storage, id: &str) -> i64 {
+        if let Some(record) = storage.load_file_connection(id).await.unwrap() {
+            return record.revision;
+        }
+        use super::super::file_manager::{password_scope, FtpConnectionConfig};
+        let config = FileConnectionConfig::Ftp(FtpConnectionConfig {
+            endpoint: "ftp://127.0.0.1:21".to_string(),
+            root: "/".to_string(),
+            username: "dbx".to_string(),
+        });
+        let scope = password_scope(&config).unwrap();
+        storage
+            .save_file_connection(
+                id.to_string(),
+                "Transfer test".to_string(),
+                "ftp".to_string(),
+                serde_json::to_string(&config).unwrap(),
+                None,
+                scope,
+                false,
+                None,
+            )
+            .await
+            .unwrap()
+            .revision
+    }
+
     struct FailedReader;
 
     impl FuturesAsyncRead for FailedReader {
         fn poll_read(self: Pin<&mut Self>, _context: &mut Context<'_>, _buffer: &mut [u8]) -> Poll<io::Result<usize>> {
             Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "injected disconnect")))
         }
+    }
+
+    #[test]
+    fn cancel_connection_cancels_queued_and_running_transfers_only_for_target_connection() {
+        let runtime = FileTransferRuntime::default();
+        let queued = CancellationToken::new();
+        let running = CancellationToken::new();
+        let other = CancellationToken::new();
+        runtime.register("queued".into(), "ftp-1".into(), queued.clone());
+        runtime.register_upload("running".into(), "ftp-1".into(), running.clone()).unwrap();
+        runtime.register("other".into(), "ftp-2".into(), other.clone());
+
+        assert_eq!(runtime.cancel_connection("ftp-1"), 2);
+        assert!(queued.is_cancelled());
+        assert!(running.is_cancelled());
+        assert!(!other.is_cancelled());
+        assert_eq!(runtime.cancel_connection("missing"), 0);
+        assert!(!other.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn transfer_start_and_delete_are_linearized_on_both_sides_of_conditional_insert() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
+        ensure_test_connection(&storage, "delete-before-insert").await;
+        ensure_test_connection(&storage, "insert-before-delete").await;
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+
+        let before_insert = install_test_transfer_before_insert_barrier();
+        let start_handle = app.handle().clone();
+        let start_task = tokio::spawn(async move {
+            let state = start_handle.state::<Arc<AppState>>();
+            let runtime = start_handle.state::<FileTransferRuntime>();
+            start_remote_transfer_inner(
+                start_handle.clone(),
+                state.inner(),
+                runtime.inner(),
+                StartRemoteTransferInput {
+                    connection_id: "delete-before-insert".to_string(),
+                    source_path: "source.bin".to_string(),
+                    destination_path: "destination.bin".to_string(),
+                    policy: RemoteMutationPolicy::Replace { confirmed: true },
+                },
+                "copy",
+            )
+            .await
+        });
+        before_insert.opened.notified().await;
+        delete_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            app.state::<FileTransferRuntime>(),
+            "delete-before-insert".to_string(),
+        )
+        .await
+        .unwrap();
+        before_insert.release.notify_one();
+        let error = start_task.await.unwrap().unwrap_err();
+        assert!(error.contains("changed or was deleted"), "{error}");
+        clear_test_transfer_before_insert_barrier();
+        assert!(state.storage.list_file_transfers(Some("delete-before-insert"), 100).await.unwrap().is_empty());
+
+        let inserted = start_remote_transfer_inner(
+            app.handle().clone(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            StartRemoteTransferInput {
+                connection_id: "insert-before-delete".to_string(),
+                source_path: "source.bin".to_string(),
+                destination_path: "destination.bin".to_string(),
+                policy: RemoteMutationPolicy::Replace { confirmed: true },
+            },
+            "rename",
+        )
+        .await
+        .unwrap();
+        assert!(state.storage.get_file_transfer(&inserted.transfer_id).await.unwrap().is_some());
+        delete_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            app.state::<FileTransferRuntime>(),
+            "insert-before-delete".to_string(),
+        )
+        .await
+        .unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let record = state.storage.get_file_transfer(&inserted.transfer_id).await.unwrap().unwrap();
+                if record.completed_at.is_some() {
+                    break record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("inserted transfer must reach a durable terminal state after delete cancellation");
+        assert!(matches!(terminal.status.as_str(), "cancelled" | "failed" | "partial"));
+        assert_eq!(terminal.connection_revision, Some(1));
+        assert!(app.state::<FileTransferRuntime>().cancellation(&inserted.transfer_id).is_none());
     }
 
     struct StalledReader;
@@ -5494,7 +5726,9 @@ mod tests {
         use super::super::file_manager_webhdfs::{WebhdfsAuthentication, WebhdfsConnectionConfig, WebhdfsWriteOptions};
 
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         let state = Arc::new(AppState::new(storage));
         let app = tauri::test::mock_builder()
             .manage(state.clone())
@@ -5904,7 +6138,8 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
-        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let storage =
+            Storage::open_with_file_secret_key(&parent.join("dbx.sqlite"), TEST_FILE_SECRET_KEY).await.unwrap();
         let config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: "ftp://127.0.0.1:9".to_string(),
             root: "/".to_string(),
@@ -6241,8 +6476,10 @@ mod tests {
     async fn upload_crash_recovery_reports_only_an_owned_remote_partial() {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
-        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let storage =
+            Storage::open_with_file_secret_key(&parent.join("dbx.sqlite"), TEST_FILE_SECRET_KEY).await.unwrap();
         let state = AppState::new(storage);
+        let connection_revision = ensure_test_connection(&state.storage, "connection-1").await;
         state
             .storage
             .create_file_transfer(
@@ -6252,6 +6489,7 @@ mod tests {
                 "reports/final.csv".into(),
                 parent.join("source.csv").to_string_lossy().into_owned(),
                 canonical_directory_identity(&parent),
+                connection_revision,
             )
             .await
             .unwrap();
@@ -6291,8 +6529,11 @@ mod tests {
     async fn crash_before_temp_create_does_not_remove_an_unrelated_file() {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         let state = AppState::new(storage);
+        let connection_revision = ensure_test_connection(&state.storage, "connection-1").await;
         let target = parent.join("report.csv");
         let owned = parent.join(".dbx-download-transfer-1-random.part");
         let unrelated = parent.join("unrelated.part");
@@ -6306,6 +6547,7 @@ mod tests {
                 "report.csv".into(),
                 target.to_string_lossy().into_owned(),
                 canonical_directory_identity(&parent),
+                connection_revision,
             )
             .await
             .unwrap();
@@ -6338,8 +6580,10 @@ mod tests {
     async fn crash_after_temp_create_before_identity_persist_preserves_unproven_file() {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
-        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let storage =
+            Storage::open_with_file_secret_key(&parent.join("dbx.sqlite"), TEST_FILE_SECRET_KEY).await.unwrap();
         let state = AppState::new(storage);
+        let connection_revision = ensure_test_connection(&state.storage, "connection-1").await;
         let target = parent.join("report.csv");
         let owned = parent.join(".dbx-download-transfer-create-window-random.part");
         tokio::fs::write(&owned, b"partial").await.unwrap();
@@ -6352,6 +6596,7 @@ mod tests {
                 "report.csv".into(),
                 target.to_string_lossy().into_owned(),
                 canonical_directory_identity(&parent),
+                connection_revision,
             )
             .await
             .unwrap();
@@ -6392,8 +6637,10 @@ mod tests {
         temp.sync_all().unwrap();
         drop(temp);
 
-        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let storage =
+            Storage::open_with_file_secret_key(&parent.join("dbx.sqlite"), TEST_FILE_SECRET_KEY).await.unwrap();
         let state = AppState::new(storage);
+        let connection_revision = ensure_test_connection(&state.storage, "connection-1").await;
         state
             .storage
             .create_file_transfer(
@@ -6403,6 +6650,7 @@ mod tests {
                 "report.csv".into(),
                 target.to_string_lossy().into_owned(),
                 identity,
+                connection_revision,
             )
             .await
             .unwrap();
@@ -6445,8 +6693,10 @@ mod tests {
         temp.sync_all().unwrap();
         drop(temp);
 
-        let storage = Storage::open(&parent.join("dbx.sqlite")).await.unwrap();
+        let storage =
+            Storage::open_with_file_secret_key(&parent.join("dbx.sqlite"), TEST_FILE_SECRET_KEY).await.unwrap();
         let state = AppState::new(storage);
+        let connection_revision = ensure_test_connection(&state.storage, "connection-1").await;
         state
             .storage
             .create_file_transfer(
@@ -6456,6 +6706,7 @@ mod tests {
                 "report.csv".into(),
                 target.to_string_lossy().into_owned(),
                 directory_identity,
+                connection_revision,
             )
             .await
             .unwrap();
@@ -6513,8 +6764,10 @@ mod tests {
         let error = AnchoredDestination::open(&target, &temp_path, &expected_identity).err().unwrap();
         assert!(error.contains("safely") || error.contains("changed"), "{error}");
 
-        let storage = Storage::open(&root.path().join("dbx.sqlite")).await.unwrap();
+        let storage =
+            Storage::open_with_file_secret_key(&root.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY).await.unwrap();
         let state = AppState::new(storage);
+        let connection_revision = ensure_test_connection(&state.storage, "connection-1").await;
         state
             .storage
             .create_file_transfer(
@@ -6524,6 +6777,7 @@ mod tests {
                 "report.csv".into(),
                 target.to_string_lossy().into_owned(),
                 expected_identity,
+                connection_revision,
             )
             .await
             .unwrap();
@@ -6551,7 +6805,10 @@ mod tests {
     async fn persisted_queued_cancel_intent_wins_before_worker_start() {
         let directory = tempfile::tempdir().unwrap();
         let parent = directory.path().canonicalize().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
+        let connection_revision = ensure_test_connection(&storage, "connection-1").await;
         storage
             .create_file_transfer(
                 "queued-cancel".into(),
@@ -6560,6 +6817,7 @@ mod tests {
                 "report.csv".into(),
                 parent.join("report.csv").to_string_lossy().into_owned(),
                 canonical_directory_identity(&parent),
+                connection_revision,
             )
             .await
             .unwrap();
@@ -6621,7 +6879,9 @@ mod tests {
         use super::super::file_manager::{password_scope, FileConnectionConfig, FtpConnectionConfig};
 
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         let config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: "ftp://127.0.0.1:9".to_string(),
             root: "/".to_string(),
@@ -6759,7 +7019,10 @@ mod tests {
         temp.write_all(&vec![1_u8; 1_024]).unwrap();
         temp.sync_all().unwrap();
         drop(temp);
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
+        let connection_revision = ensure_test_connection(&storage, "connection-1").await;
         storage
             .create_file_transfer(
                 "disk-full".into(),
@@ -6768,6 +7031,7 @@ mod tests {
                 "remote.bin".into(),
                 target.to_string_lossy().into_owned(),
                 directory_identity,
+                connection_revision,
             )
             .await
             .unwrap();
@@ -6958,6 +7222,7 @@ mod tests {
     {
         let state = app.state::<Arc<AppState>>();
         let parent = local_path.parent().unwrap();
+        let connection_revision = ensure_test_connection(&state.storage, connection_id).await;
         state
             .storage
             .create_file_transfer(
@@ -6967,6 +7232,7 @@ mod tests {
                 remote_path.to_string(),
                 local_path.to_string_lossy().into_owned(),
                 canonical_directory_identity(parent),
+                connection_revision,
             )
             .await
             .unwrap();
@@ -7082,7 +7348,9 @@ mod tests {
             FileConnectionConfig::Ftp(FtpConnectionConfig { endpoint, root: "/ftp/dbx".to_string(), username });
         let operator = build_operator(&config, Some(&password)).unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         let scope = password_scope(&config).unwrap();
         storage
             .save_file_connection(
@@ -7148,7 +7416,9 @@ mod tests {
         let operator = build_operator(&endpoint, &root);
         let bucket_operator = build_operator(&direct_endpoint, "/");
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         let mut persisted_secrets =
             vec![("access_key_id".to_string(), access_key_id), ("secret_access_key".to_string(), secret_access_key)];
         if let Some(session_token) = session_token {
@@ -7237,7 +7507,9 @@ mod tests {
             write_options: WebhdfsWriteOptions::default(),
         };
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         let state = Arc::new(AppState::new(storage));
         let app = tauri::test::mock_builder()
             .plugin(tauri_plugin_fs::init())
@@ -7545,7 +7817,9 @@ mod tests {
         });
         let operator = build_operator(&config, Some(&password)).unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         storage
             .save_file_connection_with_secret_bundle(
                 "webdav-contract".into(),
@@ -7591,7 +7865,9 @@ mod tests {
             authentication: SftpAuthentication::PrivateKey,
         });
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         storage
             .save_file_connection_with_secret_bundle(
                 "sftp-contract".into(),
@@ -7642,7 +7918,9 @@ mod tests {
             }),
         }));
         let directory = tempfile::tempdir().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         storage
             .save_file_connection_with_secret_bundle(
                 "hdfs-native-contract".into(),
@@ -10169,7 +10447,7 @@ mod tests {
                 "partial".into(),
                 i64::try_from(b"current-retry-version".len()).unwrap(),
                 Some(i64::try_from(b"current-retry-version".len()).unwrap()),
-                Some("injected source delete failure".into()),
+                Some(RedactedFileText::from_static("injected source delete failure")),
                 Some(retry_destination.clone()),
                 "copied_source_delete_failed".into(),
                 "delete_uncertain".into(),
@@ -11203,7 +11481,9 @@ mod tests {
         let container = std::env::var("DBX_TEST_FTP_CONTAINER").expect("DBX_TEST_FTP_CONTAINER is required");
         let directory = tempfile::tempdir().unwrap();
         let download_directory = directory.path().canonicalize().unwrap();
-        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = Storage::open_with_file_secret_key(&directory.path().join("dbx.sqlite"), TEST_FILE_SECRET_KEY)
+            .await
+            .unwrap();
         let config =
             FileConnectionConfig::Ftp(FtpConnectionConfig { endpoint, root: "/ftp/dbx".to_string(), username });
         let scope = password_scope(&config).unwrap();

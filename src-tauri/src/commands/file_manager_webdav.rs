@@ -800,21 +800,8 @@ async fn connect_any(addresses: &[SocketAddr]) -> Result<(), String> {
     Err(last_error)
 }
 
-fn redact(mut message: String, secrets: &ResolvedFileSecrets) -> String {
-    for secret in [secrets.password.as_deref(), secrets.webdav_token.as_deref()]
-        .into_iter()
-        .flatten()
-        .filter(|value| !value.is_empty())
-    {
-        message = message.replace(secret, "[REDACTED]");
-        message = message.replace(
-            &percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC).to_string(),
-            "[REDACTED]",
-        );
-        message =
-            message.replace(&url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>(), "[REDACTED]");
-    }
-    message
+fn redact(message: String, secrets: &ResolvedFileSecrets) -> String {
+    secrets.redactor().redact(message).as_str().to_string()
 }
 
 fn passed_stage(stage: &'static str) -> ConnectionTestStage {
@@ -850,7 +837,10 @@ mod tests {
     }
 
     fn basic_secrets(password: String) -> ResolvedFileSecrets {
-        ResolvedFileSecrets { password: Some(password), ..ResolvedFileSecrets::default() }
+        ResolvedFileSecrets {
+            password: Some(dbx_core::file_secrets::FileSecret::new(password).unwrap()),
+            ..ResolvedFileSecrets::default()
+        }
     }
 
     #[test]
@@ -1026,7 +1016,7 @@ mod tests {
             ..config.clone()
         };
         let bearer_secrets = ResolvedFileSecrets {
-            webdav_token: Some("dbx-bearer-token".to_string()),
+            webdav_token: Some(dbx_core::file_secrets::FileSecret::new("dbx-bearer-token".to_string()).unwrap()),
             ..ResolvedFileSecrets::default()
         };
         put_file(

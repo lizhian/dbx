@@ -22,6 +22,8 @@ use tokio::sync::mpsc;
 use url::Host;
 use uuid::Uuid;
 
+use dbx_core::file_secrets::FileSecret;
+
 use super::file_manager::{
     ConnectionTestStage, FileConnectionCapabilities, FileConnectionTestResult, ResolvedFileSecrets,
 };
@@ -111,7 +113,7 @@ struct RequestPolicy {
     name_node_origin: String,
     allowed_data_node_origins: BTreeSet<String>,
     user_name: Option<String>,
-    delegation: Option<String>,
+    delegation: Option<FileSecret>,
     allow_tls_downgrade: bool,
     endpoint_is_https: bool,
 }
@@ -223,7 +225,7 @@ pub(super) struct WebhdfsDirectAdapter {
     client: Client,
     policy: RequestPolicy,
     user_name: Option<String>,
-    delegation: Option<String>,
+    delegation: Option<FileSecret>,
 }
 
 #[derive(Debug)]
@@ -385,7 +387,7 @@ pub(super) fn build_operator(
         builder = builder.user_name(user_name);
     }
     if let Some(delegation) = &delegation {
-        builder = builder.delegation(delegation);
+        builder = builder.delegation(delegation.expose_secret());
     }
     let client =
         HttpClient::with(ValidatingHttpFetch { client: build_opendal_http_client(config, policy.clone())?, policy });
@@ -577,7 +579,7 @@ impl WebhdfsDirectAdapter {
             relative_path,
             operation,
             self.user_name.as_deref(),
-            self.delegation.as_deref(),
+            self.delegation.as_ref().map(FileSecret::expose_secret),
         )
     }
 
@@ -797,7 +799,7 @@ where
 fn build_http_context(
     config: &WebhdfsConnectionConfig,
     secrets: &ResolvedFileSecrets,
-) -> Result<(Client, RequestPolicy, Option<String>, Option<String>), String> {
+) -> Result<(Client, RequestPolicy, Option<String>, Option<FileSecret>), String> {
     let (policy, user_name, delegation) = build_policy_context(config, secrets)?;
     let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -829,7 +831,7 @@ fn build_http_context(
 fn build_policy_context(
     config: &WebhdfsConnectionConfig,
     secrets: &ResolvedFileSecrets,
-) -> Result<(RequestPolicy, Option<String>, Option<String>), String> {
+) -> Result<(RequestPolicy, Option<String>, Option<FileSecret>), String> {
     validate_resolved_credentials(config, secrets)?;
     let endpoint = endpoint_url(&config.endpoint)?;
     let user_name =
@@ -941,7 +943,7 @@ impl RequestPolicy {
             }
             (None, Some(expected))
                 if delegation_values.len() == 1
-                    && delegation_values.first().is_some_and(|value| value.as_str() == expected)
+                    && delegation_values.first().is_some_and(|value| value.as_str() == expected.expose_secret())
                     && user_values.is_empty() =>
             {
                 Ok(())
@@ -1293,7 +1295,7 @@ mod tests {
             name_node_origin: "https://namenode.test:9871".to_string(),
             allowed_data_node_origins: BTreeSet::from(["https://datanode.test:9865".to_string()]),
             user_name: None,
-            delegation: Some("secret".to_string()),
+            delegation: Some(FileSecret::new("secret".to_string()).unwrap()),
             allow_tls_downgrade: false,
             endpoint_is_https: true,
         }
@@ -1687,10 +1689,22 @@ mod tests {
                 ..FileConnectionSecrets::default()
             }),
         };
-        let tested =
-            test_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), input.clone())
-                .await
-                .unwrap();
+        let tested = test_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            FileConnectionInput {
+                id: None,
+                expected_revision: None,
+                name: "WebHDFS service contract".to_string(),
+                config: FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config.clone())),
+                secrets: Some(FileConnectionSecrets {
+                    clear_webhdfs_credentials: Some(true),
+                    ..FileConnectionSecrets::default()
+                }),
+            },
+        )
+        .await
+        .unwrap();
         assert!(tested.success, "{:?}", tested.stages);
         let saved =
             save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), input).await.unwrap();
