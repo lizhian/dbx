@@ -512,6 +512,143 @@ impl Storage {
 }
 
 impl Storage {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_file_connection_with_secret_bundle(
+        &self,
+        id: String,
+        name: String,
+        kind: String,
+        config_json: String,
+        secrets: Vec<(String, String)>,
+        secret_keys: Vec<String>,
+        secret_scope_key: String,
+        secret_scope: String,
+        replace_secrets: bool,
+        expected_revision: Option<i64>,
+    ) -> Result<FileConnectionStorageRecord, String> {
+        const ALLOWED_SECRET_KEYS: &[&str] =
+            &["password", "password_scope", "access_key_id", "secret_access_key", "session_token", "s3_scope"];
+        if secret_keys.is_empty()
+            || !secret_keys.iter().all(|key| ALLOWED_SECRET_KEYS.contains(&key.as_str()))
+            || !ALLOWED_SECRET_KEYS.contains(&secret_scope_key.as_str())
+            || secrets.iter().any(|(key, _)| !secret_keys.contains(key))
+        {
+            return Err("Unsupported file connection secret key".to_string());
+        }
+
+        self.with_conn(move |conn| {
+            let now = chrono::Utc::now().to_rfc3339();
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let current = tx
+                .query_row("SELECT revision, kind FROM file_connections WHERE id = ?1", [&id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let current_revision = current.as_ref().map(|(revision, _)| *revision);
+            let protocol_changed = current.as_ref().is_some_and(|(_, current_kind)| current_kind != &kind);
+            let replace_secrets = replace_secrets || protocol_changed;
+
+            if current_revision.is_some() && !replace_secrets {
+                let placeholders = std::iter::repeat_n("?", secret_keys.len()).collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM file_connection_secrets
+                        WHERE connection_id = ? AND key IN ({placeholders})
+                    )"
+                );
+                let mut values = Vec::with_capacity(secret_keys.len() + 1);
+                values.push(rusqlite::types::Value::Text(id.clone()));
+                values.extend(secret_keys.iter().cloned().map(rusqlite::types::Value::Text));
+                let has_secret = tx
+                    .query_row(&sql, rusqlite::params_from_iter(values), |row| row.get::<_, bool>(0))
+                    .map_err(|error| error.to_string())?;
+                if has_secret {
+                    let stored_scope = tx
+                        .query_row(
+                            "SELECT secret FROM file_connection_secrets
+                             WHERE connection_id = ?1 AND key = ?2",
+                            params![&id, &secret_scope_key],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|error| error.to_string())?;
+                    if stored_scope.as_deref() != Some(secret_scope.as_str()) {
+                        return Err(
+                            "Re-enter or clear the credentials after changing the connection endpoint or identity"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+
+            match (current_revision, expected_revision) {
+                (Some(current), Some(expected)) if current == expected => {
+                    tx.execute(
+                        "UPDATE file_connections
+                         SET name = ?2, kind = ?3, config_json = ?4, revision = revision + 1, updated_at = ?5
+                         WHERE id = ?1",
+                        params![id, name, kind, config_json, now],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                (Some(current), Some(expected)) => {
+                    return Err(format!("File connection revision conflict: expected {expected}, current {current}"));
+                }
+                (Some(_), None) => return Err("File connection revision is required for updates".to_string()),
+                (None, Some(_)) => return Err("File connection not found".to_string()),
+                (None, None) => {
+                    tx.execute(
+                        "INSERT INTO file_connections
+                         (id, name, kind, config_json, revision, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
+                        params![id, name, kind, config_json, now],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+
+            if replace_secrets {
+                let mut keys_to_delete = secret_keys.clone();
+                keys_to_delete.push(secret_scope_key.clone());
+                let placeholders = std::iter::repeat_n("?", keys_to_delete.len()).collect::<Vec<_>>().join(",");
+                let sql =
+                    format!("DELETE FROM file_connection_secrets WHERE connection_id = ? AND key IN ({placeholders})");
+                let mut values = Vec::with_capacity(keys_to_delete.len() + 1);
+                values.push(rusqlite::types::Value::Text(id.clone()));
+                values.extend(keys_to_delete.into_iter().map(rusqlite::types::Value::Text));
+                tx.execute(&sql, rusqlite::params_from_iter(values)).map_err(|error| error.to_string())?;
+
+                let mut wrote_secret = false;
+                for (key, secret) in secrets {
+                    if secret.is_empty() {
+                        continue;
+                    }
+                    tx.execute(
+                        "INSERT INTO file_connection_secrets (connection_id, key, secret)
+                         VALUES (?1, ?2, ?3)",
+                        params![&id, key, secret],
+                    )
+                    .map_err(|error| error.to_string())?;
+                    wrote_secret = true;
+                }
+                if wrote_secret {
+                    tx.execute(
+                        "INSERT INTO file_connection_secrets (connection_id, key, secret)
+                         VALUES (?1, ?2, ?3)",
+                        params![&id, secret_scope_key, secret_scope],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+
+            let record = query_file_connection_record(&tx, &id)?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(record)
+        })
+        .await
+    }
+
     pub async fn save_file_connection(
         &self,
         id: String,
@@ -622,7 +759,8 @@ impl Storage {
                     "SELECT f.id, f.name, f.kind, f.config_json, f.revision, f.created_at, f.updated_at,
                             EXISTS(
                                 SELECT 1 FROM file_connection_secrets s
-                                WHERE s.connection_id = f.id AND s.key = 'password'
+                                WHERE s.connection_id = f.id
+                                  AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token')
                             )
                      FROM file_connections f
                      ORDER BY lower(f.name), f.id",
@@ -641,7 +779,8 @@ impl Storage {
                 "SELECT f.id, f.name, f.kind, f.config_json, f.revision, f.created_at, f.updated_at,
                         EXISTS(
                             SELECT 1 FROM file_connection_secrets s
-                            WHERE s.connection_id = f.id AND s.key = 'password'
+                            WHERE s.connection_id = f.id
+                              AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token')
                         )
                  FROM file_connections f
                  WHERE f.id = ?1",
@@ -1188,7 +1327,8 @@ fn query_file_connection_record(conn: &Connection, id: &str) -> Result<FileConne
         "SELECT f.id, f.name, f.kind, f.config_json, f.revision, f.created_at, f.updated_at,
                 EXISTS(
                     SELECT 1 FROM file_connection_secrets s
-                    WHERE s.connection_id = f.id AND s.key = 'password'
+                    WHERE s.connection_id = f.id
+                      AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token')
                 )
          FROM file_connections f
          WHERE f.id = ?1",
@@ -6181,6 +6321,87 @@ mod tests {
         assert!(storage.load_file_connection("ftp-1").await.unwrap().is_none());
         assert!(storage.load_file_connection_secret("ftp-1", "password").await.unwrap().is_none());
 
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn s3_secret_bundle_is_allowlisted_atomic_and_cleared_on_protocol_change() {
+        let db = temp_db_path("s3-file-connection-secrets");
+        let storage = Storage::open(&db).await.unwrap();
+        let created = storage
+            .save_file_connection_with_secret_bundle(
+                "s3-1".into(),
+                "S3".into(),
+                "s3".into(),
+                r#"{"type":"s3","endpoint":"http://localhost:9000","region":"us-east-1","bucket":"dbx","root":"/"}"#
+                    .into(),
+                vec![
+                    ("access_key_id".into(), "access-value".into()),
+                    ("secret_access_key".into(), "secret-value".into()),
+                    ("session_token".into(), "token-value".into()),
+                ],
+                vec!["access_key_id".into(), "secret_access_key".into(), "session_token".into()],
+                "s3_scope".into(),
+                "s3\nlocalhost\n9000\nus-east-1\ndbx".into(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.revision, 1);
+        assert!(created.has_secret);
+        for value in ["access-value", "secret-value", "token-value"] {
+            assert!(!created.config_json.contains(value));
+        }
+        assert_eq!(
+            storage.load_file_connection_secret("s3-1", "session_token").await.unwrap().as_deref(),
+            Some("token-value")
+        );
+
+        let switched = storage
+            .save_file_connection_with_secret_bundle(
+                "s3-1".into(),
+                "FTP".into(),
+                "ftp".into(),
+                r#"{"type":"ftp","endpoint":"ftp://localhost:21","root":"/","username":""}"#.into(),
+                Vec::new(),
+                vec![
+                    "password".into(),
+                    "access_key_id".into(),
+                    "secret_access_key".into(),
+                    "session_token".into(),
+                    "s3_scope".into(),
+                ],
+                "password_scope".into(),
+                "ftp\nlocalhost\n21\n".into(),
+                false,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(switched.revision, 2);
+        assert!(!switched.has_secret);
+        for key in ["access_key_id", "secret_access_key", "session_token", "s3_scope"] {
+            assert!(storage.load_file_connection_secret("s3-1", key).await.unwrap().is_none());
+        }
+
+        let rejected = storage
+            .save_file_connection_with_secret_bundle(
+                "bad".into(),
+                "Bad".into(),
+                "s3".into(),
+                "{}".into(),
+                vec![("arbitrary".into(), "must-not-persist".into())],
+                vec!["arbitrary".into()],
+                "s3_scope".into(),
+                "scope".into(),
+                true,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(rejected.contains("Unsupported"));
+        assert!(storage.load_file_connection("bad").await.unwrap().is_none());
         std::fs::remove_file(&db).ok();
     }
 

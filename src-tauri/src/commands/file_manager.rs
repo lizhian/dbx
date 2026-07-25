@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 #[cfg(test)]
@@ -8,17 +8,26 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use super::file_manager_paths::{reject_ftp_command_injection, reject_recursive_delete, RemotePath};
+pub use super::file_manager_s3::S3ConnectionConfig;
+use super::file_manager_s3::{
+    build_operator as build_s3_operator, capabilities as s3_capabilities, delete_current as delete_s3_current,
+    delete_entry as delete_s3_backend_entry, endpoint_host_port as endpoint_host_port_for_s3,
+    file_size_if_exists as s3_file_size_if_exists, normalize_root as normalize_s3_root,
+    stat_directory_or_virtual as stat_s3_directory_or_virtual, test_connection as test_s3_connection,
+    validate_config as validate_s3_config, write_object_exact as write_s3_object_exact,
+};
 use dbx_core::connection::AppState;
 use dbx_core::storage::{FileConnectionStorageRecord, FileTransferStorageRecord};
 use futures::StreamExt;
 use opendal::services::Ftp;
-use opendal::{ErrorKind, Metadata, Operator};
+use opendal::{Buffer, ErrorKind, Metadata, Operator};
 use serde::{Deserialize, Serialize};
 use suppaftp::tokio::AsyncFtpStream;
 use suppaftp::{FtpError, Status};
 use tauri::State;
 use tokio::net::lookup_host;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -34,6 +43,9 @@ const FTP_SESSION_ATTEMPTS: usize = 3;
 const FTP_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 #[cfg(test)]
 static FTP_SESSION_ESTABLISHMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_S3_PUBLISH_AFTER_COMMIT_RESPONSE_LOSS: std::sync::OnceLock<Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
 
 #[derive(Default)]
 pub struct FileManagerRuntime {
@@ -96,6 +108,7 @@ pub(super) struct PreparedFileOperation {
     pub revision: i64,
     pub remote_path: String,
     pub cancellation: Arc<CancellationSignal>,
+    secrets: ResolvedFileSecrets,
     _lease: OperationLease,
 }
 
@@ -107,6 +120,7 @@ pub(super) struct PreparedFileMutation<'a> {
     pub config_json: String,
     config: FileConnectionConfig,
     password: Option<String>,
+    secrets: ResolvedFileSecrets,
     mutation_lock: Arc<AsyncMutex<()>>,
     connection_id: String,
     runtime: &'a FileManagerRuntime,
@@ -131,11 +145,22 @@ pub(super) struct UploadPublishResolution {
 pub(super) struct RemoteFileFingerprint {
     pub size: u64,
     pub modified: String,
+    pub etag: Option<String>,
+    pub version: Option<String>,
 }
 
 impl RemoteFileFingerprint {
     pub(super) fn encode(&self) -> String {
-        format!("size:{};modified:{}", self.size, self.modified)
+        let mut encoded = format!("size:{};modified:{}", self.size, self.modified);
+        if let Some(etag) = &self.etag {
+            encoded.push_str(";etag:");
+            encoded.push_str(etag);
+        }
+        if let Some(version) = &self.version {
+            encoded.push_str(";version:");
+            encoded.push_str(version);
+        }
+        encoded
     }
 }
 
@@ -174,13 +199,14 @@ impl UploadPolicy {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FileConnectionConfig {
     Ftp(FtpConnectionConfig),
+    S3(S3ConnectionConfig),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FtpConnectionConfig {
     pub endpoint: String,
     pub root: String,
@@ -188,12 +214,17 @@ pub struct FtpConnectionConfig {
     pub username: String,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileConnectionSecrets {
     pub password: Option<String>,
     #[serde(default)]
-    pub clear_password: bool,
+    pub clear_password: Option<bool>,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+    pub session_token: Option<String>,
+    #[serde(default)]
+    pub clear_s3_credentials: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -216,6 +247,32 @@ pub struct FileConnection {
     pub created_at: String,
     pub updated_at: String,
     pub has_password: bool,
+    pub has_credentials: bool,
+    pub capabilities: FileConnectionCapabilities,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileConnectionCapabilities {
+    pub read: bool,
+    pub write: bool,
+    pub stat: bool,
+    pub list: bool,
+    pub create_directory: bool,
+    pub delete: bool,
+    pub copy: bool,
+    pub rename: bool,
+    pub server_side_copy: bool,
+    pub atomic_rename: bool,
+    pub atomic_no_clobber: bool,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ResolvedFileSecrets {
+    pub(super) password: Option<String>,
+    pub(super) access_key_id: Option<String>,
+    pub(super) secret_access_key: Option<String>,
+    pub(super) session_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -292,26 +349,84 @@ pub async fn save_file_connection(
     let lease = runtime.begin_operation(&id)?;
 
     let config_json = serde_json::to_string(&input.config).map_err(|error| error.to_string())?;
-    let password = input.secrets.as_ref().and_then(|secrets| secrets.password.clone());
-    let replace_secret = password.is_some() || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_password);
-    let password_scope = password_scope(&input.config)?;
     let cancellation = lease.cancellation();
     let record = run_mutation_operation(&cancellation, "Save connection", async {
         let _mutation_guard = lease.entry.mutation_lock.lock().await;
         cancellation.ensure_active()?;
-        let record = state
-            .storage
-            .save_file_connection(
-                id.clone(),
-                input.name.trim().to_string(),
-                config_kind(&input.config).to_string(),
-                config_json,
-                password,
-                password_scope,
-                replace_secret,
-                input.expected_revision,
-            )
-            .await?;
+        let record = match &input.config {
+            FileConnectionConfig::Ftp(_) => {
+                let password = input.secrets.as_ref().and_then(|secrets| secrets.password.clone());
+                let replace_secret = password.is_some()
+                    || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_password == Some(true));
+                state
+                    .storage
+                    .save_file_connection_with_secret_bundle(
+                        id.clone(),
+                        input.name.trim().to_string(),
+                        config_kind(&input.config).to_string(),
+                        config_json,
+                        password.into_iter().map(|value| ("password".to_string(), value)).collect(),
+                        vec![
+                            "password".to_string(),
+                            "access_key_id".to_string(),
+                            "secret_access_key".to_string(),
+                            "session_token".to_string(),
+                            "s3_scope".to_string(),
+                        ],
+                        "password_scope".to_string(),
+                        password_scope(&input.config)?,
+                        replace_secret,
+                        input.expected_revision,
+                    )
+                    .await?
+            }
+            FileConnectionConfig::S3(config) => {
+                let supplied = input.secrets.as_ref();
+                let replace_secrets = supplied.is_some_and(|secrets| {
+                    secrets.clear_s3_credentials == Some(true)
+                        || secrets.access_key_id.is_some()
+                        || secrets.secret_access_key.is_some()
+                        || secrets.session_token.is_some()
+                });
+                let secrets =
+                    if config.anonymous || supplied.is_some_and(|secrets| secrets.clear_s3_credentials == Some(true)) {
+                        Vec::new()
+                    } else {
+                        let mut values = Vec::new();
+                        if let Some(value) = supplied.and_then(|secrets| secrets.access_key_id.clone()) {
+                            values.push(("access_key_id".to_string(), value));
+                        }
+                        if let Some(value) = supplied.and_then(|secrets| secrets.secret_access_key.clone()) {
+                            values.push(("secret_access_key".to_string(), value));
+                        }
+                        if let Some(value) = supplied.and_then(|secrets| secrets.session_token.clone()) {
+                            values.push(("session_token".to_string(), value));
+                        }
+                        values
+                    };
+                state
+                    .storage
+                    .save_file_connection_with_secret_bundle(
+                        id.clone(),
+                        input.name.trim().to_string(),
+                        config_kind(&input.config).to_string(),
+                        config_json,
+                        secrets,
+                        vec![
+                            "password".to_string(),
+                            "password_scope".to_string(),
+                            "access_key_id".to_string(),
+                            "secret_access_key".to_string(),
+                            "session_token".to_string(),
+                        ],
+                        "s3_scope".to_string(),
+                        password_scope(&input.config)?,
+                        replace_secrets || config.anonymous,
+                        input.expected_revision,
+                    )
+                    .await?
+            }
+        };
         runtime.evict(&id);
         Ok(record)
     })
@@ -360,19 +475,19 @@ pub async fn test_file_connection(
         None => None,
     };
     if validate_input(&input).is_err() {
-        return Ok(test_ftp_connection(&input, None).await);
+        return Ok(test_connection_for_input(&input, ResolvedFileSecrets::default()).await);
     }
     normalize_input(&mut input)?;
-    let password = resolve_input_password(&state, &input).await?;
+    let secrets = resolve_input_secrets(&state, &input).await?;
     match lease {
         Some(lease) => {
             let cancellation = lease.cancellation();
             tokio::select! {
-                result = test_ftp_connection(&input, password.as_deref()) => Ok(result),
+                result = test_connection_for_input(&input, secrets) => Ok(result),
                 _ = cancellation.cancelled() => Err("File connection is being deleted".to_string()),
             }
         }
-        None => Ok(test_ftp_connection(&input, password.as_deref()).await),
+        None => Ok(test_connection_for_input(&input, secrets).await),
     }
 }
 
@@ -405,24 +520,37 @@ pub async fn list_file_entries(
     let cancellation = lease.cancellation();
     run_list_operation(&runtime, &connection_id, revision, &cancellation, LIST_TIMEOUT, async {
         let _list_guard = lease.entry.list_lock.lock().await;
-        let scope = password_scope(&config)?;
-        let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
-        let operator = runtime.operator_for(&record, &config, password.as_deref())?;
-        if path.is_empty() {
-            verify_ftp_root_read_only(&config, password.as_deref()).await?;
+        let secrets = load_file_connection_secrets(&state.storage, &connection_id, &config).await?;
+        let operator = runtime.operator_for(&record, &config, &secrets)?;
+        if path.is_empty() && matches!(config, FileConnectionConfig::Ftp(_)) {
+            let password = secrets.password.as_deref();
+            verify_ftp_root_read_only(&config, password).await?;
         }
         let list_path = configured_directory_path(&config, &path);
         let lister = operator
             .lister_with(&list_path)
             .limit(options.page_size)
             .await
-            .map_err(|error| redact_error(error.to_string(), password.as_deref()))?;
-        let error_password = password.clone();
+            .map_err(|error| redact_secrets(error.to_string(), &secrets))?;
+        let error_secrets = secrets.clone();
         let configured_root = configured_root_list_path(&config);
-        let stream = lister.map(move |result| {
-            result
-                .map_err(|error| redact_error(error.to_string(), error_password.as_deref()))
-                .and_then(|entry| file_entry_from_opendal(&configured_root, entry))
+        let object_store = matches!(config, FileConnectionConfig::S3(_));
+        let seen_entries = Arc::new(Mutex::new(HashSet::<(String, String)>::new()));
+        let stream = lister.filter_map(move |result| {
+            let seen_entries = seen_entries.clone();
+            if result.as_ref().is_ok_and(|entry| entry.path() == configured_root) {
+                return futures::future::ready(None);
+            }
+            let result = result
+                .map_err(|error| redact_secrets(error.to_string(), &error_secrets))
+                .and_then(|entry| file_entry_from_opendal(&configured_root, entry, object_store));
+            futures::future::ready(match result {
+                Ok(entry) => {
+                    let key = (entry.kind.clone(), entry.path.clone());
+                    seen_entries.lock().unwrap_or_else(|error| error.into_inner()).insert(key).then_some(Ok(entry))
+                }
+                Err(error) => Some(Err(error)),
+            })
         });
         runtime.list_sessions.open(binding, generation, stream).await
     })
@@ -488,10 +616,11 @@ pub async fn stat_file_entry(
     let config = parse_storage_config(&record)?;
     let cancellation = lease.cancellation();
     run_list_operation(&runtime, &connection_id, revision, &cancellation, LIST_TIMEOUT, async {
-        let scope = password_scope(&config)?;
-        let password = state.storage.load_file_connection_password(&connection_id, &scope).await?;
-        let operator = runtime.operator_for(&record, &config, password.as_deref())?;
-        let metadata = stat_remote_metadata(&operator, &config, &path, password.as_deref()).await?;
+        let secrets = load_file_connection_secrets(&state.storage, &connection_id, &config).await?;
+        let operator = runtime.operator_for(&record, &config, &secrets)?;
+        let metadata = stat_remote_metadata(&operator, &config, &path, secrets.password.as_deref())
+            .await
+            .map_err(|error| redact_secrets(error, &secrets))?;
         Ok(file_stat_from_metadata(&path, &metadata))
     })
     .await
@@ -515,8 +644,8 @@ pub async fn create_file_directory(
             &lease.entry.mutation_lock,
             &connection_id,
             &cancellation,
-            move |config, password| async move {
-                create_ftp_directory_exact(&config, &path, password.as_deref()).await?;
+            move |config, secrets| async move {
+                create_directory_entry(&config, &path, &secrets).await?;
                 Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
             },
         )
@@ -532,6 +661,7 @@ pub async fn delete_file_entry(
     connection_id: String,
     path: String,
     recursive: Option<bool>,
+    expected_kind: Option<String>,
 ) -> Result<FileMutationResult, String> {
     reject_recursive_delete(recursive.unwrap_or(false))?;
     let path = RemotePath::parse(&path)?;
@@ -545,7 +675,9 @@ pub async fn delete_file_entry(
             &lease.entry.mutation_lock,
             &connection_id,
             &cancellation,
-            move |config, password| async move { delete_entry(&config, &path, password.as_deref()).await },
+            move |config, secrets| async move {
+                delete_entry(&config, &path, expected_kind.as_deref(), &secrets).await
+            },
         )
         .await
     })
@@ -623,11 +755,17 @@ impl FileManagerRuntime {
             .ok_or_else(|| "File connection not found".to_string())?;
         let revision = record.revision;
         let config = parse_storage_config(&record).inspect_err(|_| self.evict_revision(connection_id, revision))?;
-        let scope = password_scope(&config)?;
-        let password = state.storage.load_file_connection_password(connection_id, &scope).await?;
-        let operator = self.operator_for(&record, &config, password.as_deref())?;
+        let secrets = load_file_connection_secrets(&state.storage, connection_id, &config).await?;
+        let operator = self.operator_for(&record, &config, &secrets)?;
         let remote_path = configured_entry_path(&config, &relative_path, false);
-        Ok(PreparedFileOperation { operator, revision, remote_path, cancellation: lease.cancellation(), _lease: lease })
+        Ok(PreparedFileOperation {
+            operator,
+            revision,
+            remote_path,
+            cancellation: lease.cancellation(),
+            secrets,
+            _lease: lease,
+        })
     }
 
     pub(super) async fn prepare_file_mutation_operation<'a>(
@@ -655,10 +793,10 @@ impl FileManagerRuntime {
         }
         let revision = record.revision;
         let config = parse_storage_config(&record).inspect_err(|_| self.evict_revision(connection_id, revision))?;
-        let scope = password_scope(&config)?;
-        let password = state.storage.load_file_connection_password(connection_id, &scope).await?;
+        let secrets = load_file_connection_secrets(&state.storage, connection_id, &config).await?;
+        let password = secrets.password.clone();
         self.evict_revision(connection_id, revision);
-        let operator = build_operator(&config, password.as_deref())?;
+        let operator = build_operator_with_secrets(&config, &secrets)?;
         let remote_path = configured_entry_path(&config, &relative_path, false);
         Ok(PreparedFileMutation {
             operator,
@@ -668,6 +806,7 @@ impl FileManagerRuntime {
             config_json: record.config_json,
             config,
             password,
+            secrets,
             mutation_lock,
             connection_id: connection_id.to_string(),
             runtime: self,
@@ -710,24 +849,36 @@ impl FileManagerRuntime {
             return Err("File connection revision changed after the interrupted upload".to_string());
         }
         let config = parse_storage_config(&current)?;
-        let scope = password_scope(&config)?;
-        let password = state.storage.load_file_connection_password(&transfer.connection_id, &scope).await?;
-        reconcile_ftp_upload_publish(
-            &config,
-            &partial,
-            &target,
-            expected_size,
-            password.as_deref(),
-            "The application exited while upload publish was in progress".to_string(),
-        )
-        .await
+        let secrets = load_file_connection_secrets(&state.storage, &transfer.connection_id, &config).await?;
+        let detail = "The application exited while upload publish was in progress".to_string();
+        match &config {
+            FileConnectionConfig::Ftp(_) => {
+                reconcile_ftp_upload_publish(
+                    &config,
+                    &partial,
+                    &target,
+                    expected_size,
+                    secrets.password.as_deref(),
+                    detail,
+                )
+                .await
+            }
+            FileConnectionConfig::S3(_) => {
+                let operator = build_operator_with_secrets(&config, &secrets)?;
+                let source = configured_entry_path(&config, partial.as_str(), false);
+                let target = configured_entry_path(&config, target.as_str(), false);
+                let source_size = s3_file_size_if_exists(&operator, &source, &secrets).await?;
+                let target_size = s3_file_size_if_exists(&operator, &target, &secrets).await?;
+                Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
+            }
+        }
     }
 
     fn operator_for(
         &self,
         record: &FileConnectionStorageRecord,
         config: &FileConnectionConfig,
-        password: Option<&str>,
+        secrets: &ResolvedFileSecrets,
     ) -> Result<Operator, String> {
         if let Some(cached) = self
             .operators
@@ -739,7 +890,7 @@ impl FileManagerRuntime {
             return Ok(cached.operator.clone());
         }
 
-        let operator = build_operator(config, password)?;
+        let operator = build_operator_with_secrets(config, secrets)?;
         self.operators
             .write()
             .unwrap_or_else(|error| error.into_inner())
@@ -785,7 +936,16 @@ impl Drop for PreparedFileMutation<'_> {
     }
 }
 
+impl PreparedFileOperation {
+    pub(super) fn redact_remote_error(&self, message: String) -> String {
+        redact_secrets(message, &self.secrets)
+    }
+}
+
 impl PreparedFileMutation<'_> {
+    pub(super) fn redact_remote_error(&self, message: String) -> String {
+        redact_secrets(message, &self.secrets)
+    }
     #[cfg(test)]
     pub(super) fn mutation_lock_is_available(&self) -> bool {
         self.mutation_lock.try_lock().is_ok()
@@ -798,13 +958,47 @@ impl PreparedFileMutation<'_> {
     pub(super) async fn delete_owned_remote_partial(&self, path: &str) -> Result<(), String> {
         let path = RemotePath::parse(path)?;
         let _mutation_guard = self.mutation_lock.lock().await;
-        delete_ftp_file_if_exists(&self.config, &path, self.password.as_deref()).await
+        match &self.config {
+            FileConnectionConfig::Ftp(_) => {
+                delete_ftp_file_if_exists(&self.config, &path, self.password.as_deref()).await
+            }
+            FileConnectionConfig::S3(_) => {
+                let configured = self.configured_path(path.as_str())?;
+                match self.operator.stat(&configured).await {
+                    Ok(metadata) => {
+                        delete_s3_current(&self.operator, &configured, Some(&metadata), &self.secrets).await
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(self.redact_remote_error(error.to_string())),
+                }
+            }
+        }
     }
 
     pub(super) async fn create_empty_owned_upload_partial(&self, path: &str) -> Result<(), String> {
         let path = RemotePath::parse(path)?;
         let _mutation_guard = self.mutation_lock.lock().await;
-        create_empty_ftp_file_exact(&self.config, &path, self.password.as_deref()).await
+        match &self.config {
+            FileConnectionConfig::Ftp(_) => {
+                create_empty_ftp_file_exact(&self.config, &path, self.password.as_deref()).await
+            }
+            FileConnectionConfig::S3(_) => {
+                let configured = self.configured_path(path.as_str())?;
+                if self
+                    .operator
+                    .exists(&configured)
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?
+                {
+                    return Err("Operation-owned empty upload partial already exists".to_string());
+                }
+                self.operator
+                    .write(&configured, Vec::<u8>::new())
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                Ok(())
+            }
+        }
     }
 
     pub(super) async fn publish_owned_upload_partial(
@@ -814,6 +1008,7 @@ impl PreparedFileMutation<'_> {
         target_path: &str,
         expected_size: i64,
         policy: UploadPolicy,
+        transfer_cancellation: &CancellationToken,
     ) -> Result<UploadPublishResolution, String> {
         policy.validate()?;
         let partial = RemotePath::parse(partial_path)?;
@@ -832,6 +1027,18 @@ impl PreparedFileMutation<'_> {
             .ok_or_else(|| "File connection not found".to_string())?;
         if current.revision != self.revision || current.config_json != self.config_json {
             return Err("File connection revision changed before upload publish".to_string());
+        }
+        if matches!(self.config, FileConnectionConfig::S3(_)) {
+            return self
+                .publish_s3_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    false,
+                    "Upload publish",
+                    transfer_cancellation,
+                )
+                .await;
         }
         let mutation = tokio::time::timeout(
             MUTATION_TIMEOUT,
@@ -875,8 +1082,9 @@ impl PreparedFileMutation<'_> {
 
     pub(super) async fn stat_remote_file(&self, relative_path: &str) -> Result<RemoteFileFingerprint, String> {
         let relative_path = validate_remote_relative_path(relative_path)?;
-        let metadata =
-            stat_remote_metadata(&self.operator, &self.config, &relative_path, self.password.as_deref()).await?;
+        let metadata = stat_remote_metadata(&self.operator, &self.config, &relative_path, self.password.as_deref())
+            .await
+            .map_err(|error| self.redact_remote_error(error))?;
         if !metadata.mode().is_file() {
             return Err("Unsupported: directory copy and rename are not available in v1".to_string());
         }
@@ -888,22 +1096,42 @@ impl PreparedFileMutation<'_> {
         match stat_remote_metadata_once(&self.operator, &self.config, &relative_path).await {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(redact_error(error.to_string(), self.password.as_deref())),
+            Err(error) => Err(self.redact_remote_error(error.to_string())),
         }
     }
 
     pub(super) async fn fingerprint_remote_file(&self, relative_path: &str) -> Result<RemoteFileFingerprint, String> {
         let path = RemotePath::parse(relative_path)?;
-        let FileConnectionConfig::Ftp(config) = &self.config;
-        let mut ftp = open_ftp_root_session(config, self.password.as_deref()).await?;
-        let fingerprint = ftp_file_fingerprint_in_session(&mut ftp, &path, self.password.as_deref()).await?;
-        let _ = ftp.quit().await;
-        fingerprint.ok_or_else(|| "Remote file no longer exists".to_string())
+        match &self.config {
+            FileConnectionConfig::Ftp(config) => {
+                let mut ftp = open_ftp_root_session(config, self.password.as_deref()).await?;
+                let fingerprint = ftp_file_fingerprint_in_session(&mut ftp, &path, self.password.as_deref()).await?;
+                let _ = ftp.quit().await;
+                fingerprint.ok_or_else(|| "Remote file no longer exists".to_string())
+            }
+            FileConnectionConfig::S3(_) => {
+                let configured = self.configured_path(path.as_str())?;
+                match self.operator.stat(&configured).await {
+                    Ok(metadata) if metadata.mode().is_file() => Ok(remote_fingerprint_from_metadata(&metadata)),
+                    Ok(_) => Err("Unsupported: directory copy and rename are not available in v1".to_string()),
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        Err("Remote file no longer exists".to_string())
+                    }
+                    Err(error) => Err(self.redact_remote_error(error.to_string())),
+                }
+            }
+        }
     }
 
     pub(super) async fn open_exact_ftp_read_session(&self) -> Result<AsyncFtpStream, String> {
-        let FileConnectionConfig::Ftp(config) = &self.config;
+        let FileConnectionConfig::Ftp(config) = &self.config else {
+            return Err("FTP relay session is unavailable for this connection".to_string());
+        };
         open_ftp_root_session(config, self.password.as_deref()).await
+    }
+
+    pub(super) fn uses_server_side_copy(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::S3(_))
     }
 
     pub(super) fn redact_exact_ftp_error(&self, error: FtpError) -> String {
@@ -917,6 +1145,7 @@ impl PreparedFileMutation<'_> {
         target_path: &str,
         expected_size: i64,
         replace: bool,
+        transfer_cancellation: &CancellationToken,
     ) -> Result<UploadPublishResolution, String> {
         let partial = RemotePath::parse(partial_path)?;
         let target = RemotePath::parse(target_path)?;
@@ -936,6 +1165,18 @@ impl PreparedFileMutation<'_> {
             .ok_or_else(|| "File connection not found".to_string())?;
         if current.revision != self.revision || current.config_json != self.config_json {
             return Err("File connection revision changed before remote copy publish".to_string());
+        }
+        if matches!(self.config, FileConnectionConfig::S3(_)) {
+            return self
+                .publish_s3_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    replace,
+                    "Remote copy publish",
+                    transfer_cancellation,
+                )
+                .await;
         }
         let mutation = tokio::time::timeout(
             MUTATION_TIMEOUT,
@@ -1000,22 +1241,224 @@ impl PreparedFileMutation<'_> {
         if current.revision != self.revision || current.config_json != self.config_json {
             return Err("File connection revision changed before rename source deletion".to_string());
         }
-        let FileConnectionConfig::Ftp(config) = &self.config;
-        let mut ftp = open_ftp_root_session(config, self.password.as_deref()).await?;
-        let current_source = ftp_file_fingerprint_in_session(&mut ftp, &source, self.password.as_deref()).await?;
-        let current_destination =
-            ftp_file_fingerprint_in_session(&mut ftp, &destination, self.password.as_deref()).await?;
-        if current_source.as_ref() != Some(expected_source)
-            || current_destination.as_ref() != Some(expected_destination)
-        {
-            let _ = ftp.quit().await;
-            return Err("Source or destination fingerprint changed; source deletion was not attempted".to_string());
+        match &self.config {
+            FileConnectionConfig::Ftp(config) => {
+                let mut ftp = open_ftp_root_session(config, self.password.as_deref()).await?;
+                let current_source =
+                    ftp_file_fingerprint_in_session(&mut ftp, &source, self.password.as_deref()).await?;
+                let current_destination =
+                    ftp_file_fingerprint_in_session(&mut ftp, &destination, self.password.as_deref()).await?;
+                if current_source.as_ref() != Some(expected_source)
+                    || current_destination.as_ref() != Some(expected_destination)
+                {
+                    let _ = ftp.quit().await;
+                    return Err(
+                        "Source or destination fingerprint changed; source deletion was not attempted".to_string()
+                    );
+                }
+                let result = ftp.rm(source.as_str()).await.map_err(|error| {
+                    format!("Copied source could not be deleted: {}", redact_ftp_error(error, self.password.as_deref()))
+                });
+                let _ = ftp.quit().await;
+                result
+            }
+            FileConnectionConfig::S3(_) => {
+                let source_path = self.configured_path(source.as_str())?;
+                let destination_path = self.configured_path(destination.as_str())?;
+                let source_metadata = self
+                    .operator
+                    .stat(&source_path)
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                let destination_metadata = self
+                    .operator
+                    .stat(&destination_path)
+                    .await
+                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                if remote_fingerprint_from_metadata(&source_metadata) != *expected_source
+                    || remote_fingerprint_from_metadata(&destination_metadata) != *expected_destination
+                {
+                    return Err(
+                        "Source or destination fingerprint changed; source deletion was not attempted".to_string()
+                    );
+                }
+                delete_s3_current(&self.operator, &source_path, Some(&source_metadata), &self.secrets)
+                    .await
+                    .map_err(|error| format!("Copied source could not be deleted: {error}"))
+            }
         }
-        let result = ftp.rm(source.as_str()).await.map_err(|error| {
-            format!("Copied source could not be deleted: {}", redact_ftp_error(error, self.password.as_deref()))
-        });
-        let _ = ftp.quit().await;
-        result
+    }
+
+    async fn publish_s3_owned_partial(
+        &self,
+        partial: &RemotePath,
+        target: &RemotePath,
+        expected_size: usize,
+        replace: bool,
+        operation: &str,
+        transfer_cancellation: &CancellationToken,
+    ) -> Result<UploadPublishResolution, String> {
+        let partial_path = self.configured_path(partial.as_str())?;
+        let target_path = self.configured_path(target.as_str())?;
+        let partial_metadata =
+            self.operator.stat(&partial_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?;
+        if partial_metadata.content_length() != expected_size as u64 {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!(
+                    "{operation} partial size changed: expected {expected_size}, actual {}",
+                    partial_metadata.content_length()
+                ),
+            });
+        }
+        if !replace
+            && self.operator.exists(&target_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?
+        {
+            return Err(format!("{operation} destination already exists"));
+        }
+        let mut copier = self
+            .operator
+            .copier_with(&partial_path, &target_path)
+            .if_not_exists(!replace)
+            .source_content_length_hint(partial_metadata.content_length())
+            .concurrent(1)
+            .await
+            .map_err(|error| self.redact_remote_error(error.to_string()))?;
+        loop {
+            let step = tokio::select! {
+                _ = transfer_cancellation.cancelled() => {
+                    let abort = copier.abort().await;
+                    let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
+                    return self.reconcile_uncertain_s3_publish(
+                        &partial_path, &target_path, &partial_metadata,
+                        format!("{operation} cancelled{detail}"),
+                    ).await;
+                }
+                _ = self.cancellation.cancelled() => {
+                    let abort = copier.abort().await;
+                    let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
+                    return self.reconcile_uncertain_s3_publish(
+                        &partial_path, &target_path, &partial_metadata,
+                        format!("{operation} connection cancelled{detail}"),
+                    ).await;
+                }
+                result = tokio::time::timeout(MUTATION_TIMEOUT, copier.next()) => result,
+            };
+            match step {
+                Ok(Ok(Some(_))) => continue,
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => {
+                    let abort = copier.abort().await;
+                    let detail = abort.err().map(|abort| format!("; abort failed: {abort}")).unwrap_or_default();
+                    return self
+                        .reconcile_uncertain_s3_publish(
+                            &partial_path,
+                            &target_path,
+                            &partial_metadata,
+                            self.redact_remote_error(format!("{operation} failed: {error}{detail}")),
+                        )
+                        .await;
+                }
+                Err(_) => {
+                    let abort = copier.abort().await;
+                    let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
+                    return self
+                        .reconcile_uncertain_s3_publish(
+                            &partial_path,
+                            &target_path,
+                            &partial_metadata,
+                            format!("{operation} timed out{detail}"),
+                        )
+                        .await;
+                }
+            }
+        }
+        #[cfg(test)]
+        if take_test_s3_publish_after_commit_response_loss(&target_path) {
+            return self
+                .reconcile_uncertain_s3_publish(
+                    &partial_path,
+                    &target_path,
+                    &partial_metadata,
+                    format!("{operation} injected after-commit response loss"),
+                )
+                .await;
+        }
+        let target_metadata =
+            self.operator.stat(&target_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?;
+        if target_metadata.content_length() != expected_size as u64 {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialTarget,
+                detail: format!(
+                    "{operation} destination size mismatch: expected {expected_size}, actual {}",
+                    target_metadata.content_length()
+                ),
+            });
+        }
+        delete_s3_current(&self.operator, &partial_path, Some(&partial_metadata), &self.secrets)
+            .await
+            .map_err(|error| format!("{operation} completed but owned partial cleanup failed: {error}"))?;
+        Ok(UploadPublishResolution {
+            state: UploadPublishState::Completed,
+            detail: format!("{operation} completed with server-side S3 copy"),
+        })
+    }
+
+    async fn reconcile_uncertain_s3_publish(
+        &self,
+        partial_path: &str,
+        target_path: &str,
+        partial: &Metadata,
+        detail: String,
+    ) -> Result<UploadPublishResolution, String> {
+        match self.operator.stat(target_path).await {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{detail}; destination is absent and the owned partial remains"),
+            }),
+            Ok(target)
+                if target.content_length() == partial.content_length()
+                    && partial.etag().is_some()
+                    && target.etag() == partial.etag() =>
+            {
+                Ok(UploadPublishResolution {
+                    state: UploadPublishState::PartialTarget,
+                    detail: format!(
+                        "{detail}; destination is committed and fingerprint-matching, but publish response was lost; owned partial remains at {partial_path}"
+                    ),
+                })
+            }
+            Ok(_) => Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialTarget,
+                detail: format!("{detail}; destination exists but is unproven; owned partial remains at {partial_path}"),
+            }),
+            Err(error) => Ok(UploadPublishResolution {
+                state: UploadPublishState::Unknown,
+                detail: self.redact_remote_error(format!("{detail}; destination reconciliation failed: {error}")),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn install_test_s3_publish_after_commit_response_loss(target_path: &str) {
+    *TEST_S3_PUBLISH_AFTER_COMMIT_RESPONSE_LOSS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(target_path.to_string());
+}
+
+#[cfg(test)]
+fn take_test_s3_publish_after_commit_response_loss(target_path: &str) -> bool {
+    let mut target = TEST_S3_PUBLISH_AFTER_COMMIT_RESPONSE_LOSS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if target.as_deref() == Some(target_path) {
+        target.take();
+        true
+    } else {
+        false
     }
 }
 
@@ -1110,28 +1553,76 @@ impl DeleteLease {
     }
 }
 
-async fn resolve_input_password(state: &AppState, input: &FileConnectionInput) -> Result<Option<String>, String> {
-    if input.secrets.as_ref().is_some_and(|secrets| secrets.clear_password) {
-        return Ok(None);
-    }
-    if let Some(password) = input.secrets.as_ref().and_then(|secrets| secrets.password.clone()) {
-        return Ok(Some(password));
-    }
-    match input.id.as_deref() {
-        Some(id) => {
-            let record =
-                state.storage.load_file_connection(id).await?.ok_or_else(|| "File connection not found".to_string())?;
-            if input.expected_revision != Some(record.revision) {
-                return Err("Saved password cannot be reused after the connection revision changed".to_string());
+async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) -> Result<ResolvedFileSecrets, String> {
+    match &input.config {
+        FileConnectionConfig::Ftp(_) => {
+            if input.secrets.as_ref().is_some_and(|secrets| secrets.clear_password == Some(true)) {
+                return Ok(ResolvedFileSecrets::default());
             }
-            let stored_config = parse_storage_config(&record)?;
-            let input_scope = password_scope(&input.config)?;
-            if input_scope != password_scope(&stored_config)? {
-                return Err("Re-enter or clear the password after changing the FTP endpoint or username".to_string());
+            if let Some(password) = input.secrets.as_ref().and_then(|secrets| secrets.password.clone()) {
+                return Ok(ResolvedFileSecrets { password: Some(password), ..ResolvedFileSecrets::default() });
             }
-            state.storage.load_file_connection_password(id, &input_scope).await
         }
-        None => Ok(None),
+        FileConnectionConfig::S3(config) => {
+            if config.anonymous {
+                return Ok(ResolvedFileSecrets::default());
+            }
+            if input.secrets.as_ref().is_some_and(|secrets| secrets.clear_s3_credentials == Some(true)) {
+                return Ok(ResolvedFileSecrets::default());
+            }
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.access_key_id.is_some()
+                    || secrets.secret_access_key.is_some()
+                    || secrets.session_token.is_some()
+            }) {
+                let secrets = input.secrets.as_ref().expect("checked");
+                return Ok(ResolvedFileSecrets {
+                    access_key_id: secrets.access_key_id.clone(),
+                    secret_access_key: secrets.secret_access_key.clone(),
+                    session_token: secrets.session_token.clone(),
+                    ..ResolvedFileSecrets::default()
+                });
+            }
+        }
+    }
+
+    let Some(id) = input.id.as_deref() else {
+        return Ok(ResolvedFileSecrets::default());
+    };
+    let record =
+        state.storage.load_file_connection(id).await?.ok_or_else(|| "File connection not found".to_string())?;
+    if input.expected_revision != Some(record.revision) {
+        return Err("Saved credentials cannot be reused after the connection revision changed".to_string());
+    }
+    let stored_config = parse_storage_config(&record)?;
+    if password_scope(&input.config)? != password_scope(&stored_config)? {
+        return Err("Re-enter or clear the credentials after changing the connection endpoint or identity".to_string());
+    }
+    load_file_connection_secrets(&state.storage, id, &input.config).await
+}
+
+async fn load_file_connection_secrets(
+    storage: &dbx_core::storage::Storage,
+    id: &str,
+    config: &FileConnectionConfig,
+) -> Result<ResolvedFileSecrets, String> {
+    match config {
+        FileConnectionConfig::Ftp(_) => Ok(ResolvedFileSecrets {
+            password: storage.load_file_connection_password(id, &password_scope(config)?).await?,
+            ..ResolvedFileSecrets::default()
+        }),
+        FileConnectionConfig::S3(_) => {
+            let stored_scope = storage.load_file_connection_secret(id, "s3_scope").await?;
+            let access_key_id = storage.load_file_connection_secret(id, "access_key_id").await?;
+            let secret_access_key = storage.load_file_connection_secret(id, "secret_access_key").await?;
+            let session_token = storage.load_file_connection_secret(id, "session_token").await?;
+            if (access_key_id.is_some() || secret_access_key.is_some() || session_token.is_some())
+                && stored_scope.as_deref() != Some(password_scope(config)?.as_str())
+            {
+                return Err("Stored S3 credentials do not match this endpoint and bucket; re-enter them".to_string());
+            }
+            Ok(ResolvedFileSecrets { password: None, access_key_id, secret_access_key, session_token })
+        }
     }
 }
 
@@ -1194,7 +1685,7 @@ async fn run_locked_mutation<T, Mutate, Mutation>(
     mutate: Mutate,
 ) -> Result<T, String>
 where
-    Mutate: FnOnce(FileConnectionConfig, Option<String>) -> Mutation,
+    Mutate: FnOnce(FileConnectionConfig, ResolvedFileSecrets) -> Mutation,
     Mutation: Future<Output = Result<T, String>>,
 {
     let mutation_guard = mutation_lock.lock().await;
@@ -1210,7 +1701,7 @@ async fn run_locked_mutation_with_guard<T, Mutate, Mutation>(
     mutate: Mutate,
 ) -> Result<T, String>
 where
-    Mutate: FnOnce(FileConnectionConfig, Option<String>) -> Mutation,
+    Mutate: FnOnce(FileConnectionConfig, ResolvedFileSecrets) -> Mutation,
     Mutation: Future<Output = Result<T, String>>,
 {
     cancellation.ensure_active()?;
@@ -1221,27 +1712,60 @@ where
         .ok_or_else(|| "File connection not found".to_string())?;
     let revision = record.revision;
     let config = parse_storage_config(&record)?;
-    let scope = password_scope(&config)?;
-    let password = state.storage.load_file_connection_password(connection_id, &scope).await?;
+    let secrets = load_file_connection_secrets(&state.storage, connection_id, &config).await?;
     // Declared after the lock guard so every return/cancellation path evicts
     // the cached operator before the per-connection lock is released.
     let _retirement = CachedOperatorRetirement { runtime, connection_id, revision };
     // FTP mutations use exact, short-lived protocol sessions and never share
     // OpenDAL's pooled browsing connections.
     runtime.evict_revision(connection_id, revision);
-    mutate(config, password).await
+    mutate(config, secrets).await
 }
 
 async fn delete_entry(
     config: &FileConnectionConfig,
     path: &RemotePath,
-    password: Option<&str>,
+    expected_kind: Option<&str>,
+    secrets: &ResolvedFileSecrets,
 ) -> Result<FileMutationResult, String> {
-    let FileConnectionConfig::Ftp(ftp_config) = config;
-    let mut ftp = open_ftp_root_session(ftp_config, password).await?;
-    let kind = prepare_ftp_delete_in_session(&mut ftp, ftp_config, path, password).await?;
-    delete_ftp_entry_in_session(ftp, ftp_config, path, kind, password).await?;
-    Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+    match config {
+        FileConnectionConfig::Ftp(ftp_config) => {
+            let password = secrets.password.as_deref();
+            let mut ftp = open_ftp_root_session(ftp_config, password).await?;
+            let kind = prepare_ftp_delete_in_session(&mut ftp, ftp_config, path, password).await?;
+            delete_ftp_entry_in_session(ftp, ftp_config, path, kind, password).await?;
+            Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+        }
+        FileConnectionConfig::S3(config) => delete_s3_backend_entry(config, path, expected_kind, secrets).await,
+    }
+}
+
+#[cfg(test)]
+async fn delete_s3_entry(
+    config: &FileConnectionConfig,
+    path: &RemotePath,
+    expected_kind: Option<&str>,
+    secrets: &ResolvedFileSecrets,
+) -> Result<FileMutationResult, String> {
+    let FileConnectionConfig::S3(config) = config else {
+        return Err("S3 delete received a non-S3 configuration".to_string());
+    };
+    delete_s3_backend_entry(config, path, expected_kind, secrets).await
+}
+
+async fn create_directory_entry(
+    config: &FileConnectionConfig,
+    path: &RemotePath,
+    secrets: &ResolvedFileSecrets,
+) -> Result<(), String> {
+    match config {
+        FileConnectionConfig::Ftp(_) => create_ftp_directory_exact(config, path, secrets.password.as_deref()).await,
+        FileConnectionConfig::S3(config) => {
+            let operator = build_s3_operator(config, secrets)?;
+            let marker = format!("{}/", path.as_str().trim_end_matches('/'));
+            write_s3_object_exact(&operator, &marker, Buffer::new(), true, secrets).await.map(|_| ())
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1291,7 +1815,9 @@ async fn delete_ftp_directory_exact(
     path: &RemotePath,
     password: Option<&str>,
 ) -> Result<(), String> {
-    let FileConnectionConfig::Ftp(config) = config;
+    let FileConnectionConfig::Ftp(config) = config else {
+        return Err("FTP partial cleanup helper received a non-FTP connection".to_string());
+    };
     let ftp = open_ftp_root_session(config, password).await?;
     delete_ftp_entry_in_session(ftp, config, path, FtpEntryKind::Directory, password).await
 }
@@ -1301,7 +1827,9 @@ async fn delete_ftp_file_if_exists(
     path: &RemotePath,
     password: Option<&str>,
 ) -> Result<(), String> {
-    let FileConnectionConfig::Ftp(config) = config;
+    let FileConnectionConfig::Ftp(config) = config else {
+        return Err("FTP empty-file helper received a non-FTP connection".to_string());
+    };
     let mut ftp = open_ftp_root_session(config, password).await?;
     let exists = ftp_file_size_if_exists(&mut ftp, path)
         .await
@@ -1319,7 +1847,9 @@ async fn delete_ftp_file_exact(
     path: &RemotePath,
     password: Option<&str>,
 ) -> Result<(), String> {
-    let FileConnectionConfig::Ftp(config) = config;
+    let FileConnectionConfig::Ftp(config) = config else {
+        return Err("FTP rename helper received a non-FTP connection".to_string());
+    };
     let ftp = open_ftp_root_session(config, password).await?;
     delete_ftp_entry_in_session(ftp, config, path, FtpEntryKind::File, password).await
 }
@@ -1329,7 +1859,9 @@ async fn create_empty_ftp_file_exact(
     path: &RemotePath,
     password: Option<&str>,
 ) -> Result<(), String> {
-    let FileConnectionConfig::Ftp(config) = config;
+    let FileConnectionConfig::Ftp(config) = config else {
+        return Err("FTP empty-file helper received a non-FTP connection".to_string());
+    };
     let mut ftp = open_ftp_root_session(config, password).await?;
     if ftp_file_size_if_exists(&mut ftp, path)
         .await
@@ -1374,7 +1906,9 @@ async fn rename_ftp_file_exact_with_replace(
     replace: bool,
     operation: &str,
 ) -> Result<(), String> {
-    let FileConnectionConfig::Ftp(config) = config;
+    let FileConnectionConfig::Ftp(config) = config else {
+        return Err("FTP rename helper received a non-FTP connection".to_string());
+    };
     let mut ftp = open_ftp_root_session(config, password).await?;
     if !replace
         && ftp_file_size_if_exists(&mut ftp, target)
@@ -1456,6 +1990,8 @@ async fn ftp_file_fingerprint_in_session(
     Ok(Some(RemoteFileFingerprint {
         size: u64::try_from(size).map_err(|_| "Remote file size is not representable".to_string())?,
         modified,
+        etag: None,
+        version: None,
     }))
 }
 
@@ -1503,7 +2039,9 @@ async fn reconcile_ftp_upload_publish(
     password: Option<&str>,
     detail: String,
 ) -> Result<UploadPublishResolution, String> {
-    let FileConnectionConfig::Ftp(config) = config;
+    let FileConnectionConfig::Ftp(config) = config else {
+        return Err("FTP publish reconciliation received a non-FTP connection".to_string());
+    };
     let mut ftp = match open_ftp_root_session(config, password).await {
         Ok(ftp) => ftp,
         Err(error) => {
@@ -1642,7 +2180,9 @@ async fn create_ftp_directory_exact(
     path: &RemotePath,
     password: Option<&str>,
 ) -> Result<(), String> {
-    let FileConnectionConfig::Ftp(config) = config;
+    let FileConnectionConfig::Ftp(config) = config else {
+        return Err("FTP directory helper received a non-FTP connection".to_string());
+    };
     let mut ftp = open_ftp_root_session(config, password).await?;
     let create_result = ftp.mkdir(path.as_str()).await;
     let create_error = create_result
@@ -1895,7 +2435,12 @@ async fn open_ftp_root_session_once(
 
 async fn test_ftp_connection(input: &FileConnectionInput, password: Option<&str>) -> FileConnectionTestResult {
     let mut stages = Vec::with_capacity(5);
-    let FileConnectionConfig::Ftp(config) = &input.config;
+    let FileConnectionConfig::Ftp(config) = &input.config else {
+        return FileConnectionTestResult {
+            success: false,
+            stages: vec![failed_stage("configuration", "Expected an FTP configuration".to_string())],
+        };
+    };
     if let Err(error) = validate_input(input).and_then(|_| validate_ftp_session_arguments(config, password)) {
         stages.push(failed_stage("configuration", error));
         append_skipped_stages(&mut stages, &["dns", "tcp", "authentication", "root"]);
@@ -1948,6 +2493,24 @@ async fn test_ftp_connection(input: &FileConnectionInput, password: Option<&str>
     }
 }
 
+async fn test_connection_for_input(
+    input: &FileConnectionInput,
+    secrets: ResolvedFileSecrets,
+) -> FileConnectionTestResult {
+    match &input.config {
+        FileConnectionConfig::Ftp(_) => test_ftp_connection(input, secrets.password.as_deref()).await,
+        FileConnectionConfig::S3(config) => match validate_input(input) {
+            Ok(()) => test_s3_connection(config, &secrets).await,
+            Err(error) => FileConnectionTestResult {
+                success: false,
+                stages: std::iter::once(failed_stage("configuration", error))
+                    .chain(["dns", "tcp", "authentication", "bucket", "root"].into_iter().map(skipped_stage))
+                    .collect(),
+            },
+        },
+    }
+}
+
 async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     tokio::time::timeout(CONNECTION_TIMEOUT, lookup_host((host, port)))
         .await
@@ -1957,7 +2520,9 @@ async fn resolve_addresses(host: &str, port: u16) -> Result<Vec<SocketAddr>, Str
 }
 
 async fn verify_ftp_root_read_only(config: &FileConnectionConfig, password: Option<&str>) -> Result<(), String> {
-    let FileConnectionConfig::Ftp(config) = config;
+    let FileConnectionConfig::Ftp(config) = config else {
+        return Err("FTP root verification received a non-FTP connection".to_string());
+    };
     let mut ftp = open_ftp_root_session(config, password).await?;
     let _ = ftp.quit().await;
     Ok(())
@@ -1969,6 +2534,14 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
     }
     match &input.config {
         FileConnectionConfig::Ftp(config) => {
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.access_key_id.is_some()
+                    || secrets.secret_access_key.is_some()
+                    || secrets.session_token.is_some()
+                    || secrets.clear_s3_credentials.is_some()
+            }) {
+                return Err("FTP connections cannot include S3 credentials or clearS3Credentials".to_string());
+            }
             endpoint_host_port(&config.endpoint)?;
             normalize_ftp_root(&config.root)?;
             reject_ftp_command_injection(&config.username, "FTP username")?;
@@ -1976,6 +2549,24 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
                 reject_ftp_command_injection(password, "FTP password")?;
             }
             Ok(())
+        }
+        FileConnectionConfig::S3(config) => {
+            if input
+                .secrets
+                .as_ref()
+                .is_some_and(|secrets| secrets.password.is_some() || secrets.clear_password.is_some())
+            {
+                return Err("S3 connections cannot include an FTP password or clearPassword".to_string());
+            }
+            let access_key_id = input.secrets.as_ref().and_then(|secrets| secrets.access_key_id.as_deref());
+            let secret_access_key = input.secrets.as_ref().and_then(|secrets| secrets.secret_access_key.as_deref());
+            validate_s3_config(
+                config,
+                input.id.is_none(),
+                access_key_id,
+                secret_access_key,
+                input.secrets.as_ref().and_then(|secrets| secrets.session_token.as_deref()),
+            )
         }
     }
 }
@@ -1995,9 +2586,19 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16), String> {
     Ok((host.to_string(), url.port().unwrap_or(21)))
 }
 
+#[cfg(test)]
 pub(super) fn build_operator(config: &FileConnectionConfig, password: Option<&str>) -> Result<Operator, String> {
+    let secrets = ResolvedFileSecrets { password: password.map(ToString::to_string), ..ResolvedFileSecrets::default() };
+    build_operator_with_secrets(config, &secrets)
+}
+
+fn build_operator_with_secrets(
+    config: &FileConnectionConfig,
+    secrets: &ResolvedFileSecrets,
+) -> Result<Operator, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
+            let password = secrets.password.as_deref();
             validate_ftp_session_arguments(config, password)?;
             let (username, resolved_password) = ftp_credentials(config, password);
             let builder =
@@ -2006,6 +2607,7 @@ pub(super) fn build_operator(config: &FileConnectionConfig, password: Option<&st
                 .map(|builder| builder.finish())
                 .map_err(|error| redact_error(error.to_string(), password))
         }
+        FileConnectionConfig::S3(config) => build_s3_operator(config, secrets),
     }
 }
 
@@ -2016,6 +2618,12 @@ fn normalize_input(input: &mut FileConnectionInput) -> Result<(), String> {
             config.root = normalize_ftp_root(&config.root)?;
             reject_ftp_command_injection(&config.username, "FTP username")?;
             config.username = config.username.trim().to_string();
+        }
+        FileConnectionConfig::S3(config) => {
+            config.endpoint = config.endpoint.trim().trim_end_matches('/').to_string();
+            config.region = config.region.trim().to_string();
+            config.bucket = config.bucket.trim().to_string();
+            config.root = normalize_s3_root(&config.root)?;
         }
     }
     Ok(())
@@ -2052,6 +2660,7 @@ fn configured_root_list_path(config: &FileConnectionConfig) -> String {
                 format!("{relative}/")
             }
         }
+        FileConnectionConfig::S3(_) => "/".to_string(),
     }
 }
 
@@ -2089,7 +2698,11 @@ fn normalize_relative_remote_path(path: &str, allow_root: bool) -> Result<String
     if path.is_empty() {
         return if allow_root { Ok(String::new()) } else { Err("Remote path is required".to_string()) };
     }
-    for segment in path.split('/') {
+    if path.ends_with("//") {
+        return Err("Remote path cannot contain empty path segments".to_string());
+    }
+    let validation_path = path.strip_suffix('/').unwrap_or(path);
+    for segment in validation_path.split('/') {
         if segment.is_empty() {
             return Err("Remote path cannot contain empty path segments".to_string());
         }
@@ -2125,7 +2738,11 @@ fn list_session_binding(
     ListSessionBinding { connection_id: connection_id.to_string(), revision, path: path.to_string(), options }
 }
 
-fn file_entry_from_opendal(list_path: &str, entry: opendal::Entry) -> Result<FileEntry, String> {
+fn file_entry_from_opendal(
+    list_path: &str,
+    entry: opendal::Entry,
+    preserve_directory_suffix: bool,
+) -> Result<FileEntry, String> {
     let metadata = entry.metadata();
     let kind = if metadata.mode().is_dir() {
         "directory"
@@ -2135,7 +2752,7 @@ fn file_entry_from_opendal(list_path: &str, entry: opendal::Entry) -> Result<Fil
         return Err("Storage returned an entry with an unknown type".to_string());
     };
     let relative_path = root_relative_entry_path(list_path, entry.path())?;
-    let relative_path = if kind == "directory" {
+    let relative_path = if kind == "directory" && !preserve_directory_suffix {
         relative_path
             .strip_suffix('/')
             .ok_or_else(|| "Storage returned a directory path without a trailing slash".to_string())?
@@ -2143,7 +2760,8 @@ fn file_entry_from_opendal(list_path: &str, entry: opendal::Entry) -> Result<Fil
         relative_path.as_str()
     };
     let path = normalize_relative_remote_path(relative_path, false)?;
-    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+    let name_path = path.strip_suffix('/').unwrap_or(&path);
+    let name = name_path.rsplit('/').next().unwrap_or(name_path).to_string();
     Ok(FileEntry {
         path,
         name,
@@ -2182,21 +2800,35 @@ async fn stat_remote_metadata_once(
     config: &FileConnectionConfig,
     path: &str,
 ) -> Result<Metadata, opendal::Error> {
-    let file_path = configured_entry_path(config, path, path.is_empty());
+    let is_directory = path.is_empty() || path.ends_with('/');
+    let file_path = configured_entry_path(config, path, is_directory);
     match operator.stat(&file_path).await {
         Ok(metadata) => Ok(metadata),
-        Err(error) if !path.is_empty() && error.kind() == ErrorKind::NotFound => {
+        Err(error)
+            if is_directory && error.kind() == ErrorKind::NotFound && matches!(config, FileConnectionConfig::S3(_)) =>
+        {
+            stat_s3_directory_or_virtual(operator, &file_path).await
+        }
+        Err(error) if !path.is_empty() && !is_directory && error.kind() == ErrorKind::NotFound => {
             let directory_path = configured_entry_path(config, path, true);
-            operator.stat(&directory_path).await
+            match config {
+                FileConnectionConfig::S3(_) => stat_s3_directory_or_virtual(operator, &directory_path).await,
+                FileConnectionConfig::Ftp(_) => operator.stat(&directory_path).await,
+            }
         }
         Err(error) => Err(error),
     }
 }
 
 fn file_stat_from_metadata(path: &str, metadata: &Metadata) -> FileStat {
+    let named_path = path.trim_end_matches('/');
     FileStat {
         path: path.to_string(),
-        name: if path.is_empty() { "/".to_string() } else { path.rsplit('/').next().unwrap_or(path).to_string() },
+        name: if named_path.is_empty() {
+            "/".to_string()
+        } else {
+            named_path.rsplit('/').next().unwrap_or(named_path).to_string()
+        },
         kind: if metadata.mode().is_dir() {
             "directory"
         } else if metadata.mode().is_file() {
@@ -2218,12 +2850,25 @@ fn file_stat_from_metadata(path: &str, metadata: &Metadata) -> FileStat {
     }
 }
 
+fn remote_fingerprint_from_metadata(metadata: &Metadata) -> RemoteFileFingerprint {
+    RemoteFileFingerprint {
+        size: metadata.content_length(),
+        modified: metadata.last_modified().map(|value| value.to_string()).unwrap_or_default(),
+        etag: metadata.etag().map(ToString::to_string),
+        version: metadata.version().map(ToString::to_string),
+    }
+}
+
 pub(super) fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
             let (host, port) = endpoint_host_port(&config.endpoint)?;
             reject_ftp_command_injection(&config.username, "FTP username")?;
             Ok(format!("ftp\n{}\n{port}\n{}", host.to_ascii_lowercase(), config.username))
+        }
+        FileConnectionConfig::S3(config) => {
+            let (host, port) = endpoint_host_port_for_s3(&config.endpoint)?;
+            Ok(format!("s3\n{}\n{port}\n{}\n{}", host.to_ascii_lowercase(), config.region, config.bucket))
         }
     }
 }
@@ -2266,6 +2911,8 @@ fn parse_storage_config(record: &FileConnectionStorageRecord) -> Result<FileConn
 
 fn file_connection_from_storage(record: FileConnectionStorageRecord) -> Result<FileConnection, String> {
     let config = parse_storage_config(&record)?;
+    let capabilities = file_connection_capabilities(&config);
+    let has_password = record.has_secret && matches!(config, FileConnectionConfig::Ftp(_));
     Ok(FileConnection {
         id: record.id,
         name: record.name,
@@ -2273,19 +2920,62 @@ fn file_connection_from_storage(record: FileConnectionStorageRecord) -> Result<F
         revision: record.revision,
         created_at: record.created_at,
         updated_at: record.updated_at,
-        has_password: record.has_secret,
+        has_password,
+        has_credentials: record.has_secret,
+        capabilities,
     })
 }
 
 fn config_kind(config: &FileConnectionConfig) -> &'static str {
     match config {
         FileConnectionConfig::Ftp(_) => "ftp",
+        FileConnectionConfig::S3(_) => "s3",
+    }
+}
+
+fn file_connection_capabilities(config: &FileConnectionConfig) -> FileConnectionCapabilities {
+    match config {
+        FileConnectionConfig::S3(_) => s3_capabilities(),
+        FileConnectionConfig::Ftp(_) => FileConnectionCapabilities {
+            read: true,
+            write: true,
+            stat: true,
+            list: true,
+            create_directory: true,
+            delete: true,
+            copy: true,
+            rename: true,
+            server_side_copy: false,
+            atomic_rename: false,
+            atomic_no_clobber: false,
+        },
     }
 }
 
 fn redact_error(mut message: String, password: Option<&str>) -> String {
     if let Some(password) = password.filter(|password| !password.is_empty()) {
         message = message.replace(password, "[REDACTED]");
+    }
+    message
+}
+
+fn redact_secrets(mut message: String, secrets: &ResolvedFileSecrets) -> String {
+    for secret in [
+        secrets.password.as_deref(),
+        secrets.access_key_id.as_deref(),
+        secrets.secret_access_key.as_deref(),
+        secrets.session_token.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|value| !value.is_empty())
+    {
+        message = message.replace(secret, "[REDACTED]");
+        let percent_encoded =
+            percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC).to_string();
+        message = message.replace(&percent_encoded, "[REDACTED]");
+        let form_encoded = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect::<String>();
+        message = message.replace(&form_encoded, "[REDACTED]");
     }
     message
 }
@@ -2309,6 +2999,7 @@ fn append_skipped_stages(stages: &mut Vec<ConnectionTestStage>, remaining: &[&'s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use tokio::io::AsyncWriteExt;
 
     fn input(endpoint: &str, root: &str) -> FileConnectionInput {
@@ -2325,9 +3016,178 @@ mod tests {
         }
     }
 
+    fn s3_input() -> FileConnectionInput {
+        FileConnectionInput {
+            id: None,
+            expected_revision: None,
+            name: "S3".to_string(),
+            config: FileConnectionConfig::S3(S3ConnectionConfig {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "dbx-test".to_string(),
+                root: "/tenant/".to_string(),
+                virtual_host_style: false,
+                anonymous: false,
+            }),
+            secrets: Some(FileConnectionSecrets {
+                access_key_id: Some("dbx-access".to_string()),
+                secret_access_key: Some("s3cr3t/+ token".to_string()),
+                session_token: Some("session/+ value".to_string()),
+                ..FileConnectionSecrets::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn file_connection_secrets_reject_unknown_fields() {
+        let secrets = serde_json::json!({
+            "password": "secret",
+            "credentialProvider": "environment"
+        });
+
+        assert!(serde_json::from_value::<FileConnectionSecrets>(secrets).is_err());
+    }
+
+    #[test]
+    fn file_connection_configs_reject_unknown_fields_for_ftp_and_s3() {
+        let ftp = serde_json::json!({
+            "type": "ftp",
+            "endpoint": "ftp://example.test:21",
+            "root": "/",
+            "username": "demo",
+            "passiveMode": true
+        });
+        let s3 = serde_json::json!({
+            "type": "s3",
+            "endpoint": "http://127.0.0.1:9000",
+            "region": "us-east-1",
+            "bucket": "dbx-test",
+            "root": "/tenant/",
+            "virtualHostStyle": false,
+            "anonymous": false,
+            "credentialProvider": "environment"
+        });
+
+        assert!(serde_json::from_value::<FileConnectionConfig>(ftp).is_err());
+        assert!(serde_json::from_value::<FileConnectionConfig>(s3).is_err());
+    }
+
+    #[test]
+    fn file_connection_validation_rejects_cross_protocol_secrets() {
+        let mut ftp = input("ftp://example.test:21", "/");
+        ftp.secrets = Some(FileConnectionSecrets {
+            access_key_id: Some("access".to_string()),
+            ..FileConnectionSecrets::default()
+        });
+        assert!(validate_input(&ftp).unwrap_err().contains("S3 credentials"));
+
+        ftp.secrets =
+            Some(FileConnectionSecrets { clear_s3_credentials: Some(false), ..FileConnectionSecrets::default() });
+        assert!(validate_input(&ftp).unwrap_err().contains("clearS3Credentials"));
+
+        let mut s3 = s3_input();
+        let secrets = s3.secrets.as_mut().unwrap();
+        secrets.password = Some("password".to_string());
+        assert!(validate_input(&s3).unwrap_err().contains("FTP password"));
+
+        let secrets = s3.secrets.as_mut().unwrap();
+        secrets.password = None;
+        secrets.clear_password = Some(false);
+        assert!(validate_input(&s3).unwrap_err().contains("clearPassword"));
+    }
+
+    #[tokio::test]
+    async fn anonymous_s3_edit_does_not_reuse_stored_credentials() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let stored_config = s3_input().config;
+        let record = storage
+            .save_file_connection_with_secret_bundle(
+                "s3-existing".to_string(),
+                "S3".to_string(),
+                "s3".to_string(),
+                serde_json::to_string(&stored_config).unwrap(),
+                vec![
+                    ("access_key_id".to_string(), "stored-access".to_string()),
+                    ("secret_access_key".to_string(), "stored-secret".to_string()),
+                    ("session_token".to_string(), "stored-session".to_string()),
+                ],
+                vec!["access_key_id".to_string(), "secret_access_key".to_string(), "session_token".to_string()],
+                "s3_scope".to_string(),
+                password_scope(&stored_config).unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = AppState::new(storage);
+        assert_eq!(
+            state.storage.load_file_connection_secret(&record.id, "access_key_id").await.unwrap().as_deref(),
+            Some("stored-access")
+        );
+
+        let mut edited = s3_input();
+        edited.id = Some(record.id);
+        edited.expected_revision = Some(record.revision);
+        edited.secrets = None;
+        let FileConnectionConfig::S3(config) = &mut edited.config else { unreachable!() };
+        config.anonymous = true;
+
+        let resolved = resolve_input_secrets(&state, &edited).await.unwrap();
+        assert!(resolved.access_key_id.is_none());
+        assert!(resolved.secret_access_key.is_none());
+        assert!(resolved.session_token.is_none());
+    }
+
+    #[test]
+    fn s3_configuration_and_secrets_are_strictly_separated() {
+        let mut input = s3_input();
+        validate_input(&input).unwrap();
+        normalize_input(&mut input).unwrap();
+        let config_json = serde_json::to_string(&input.config).unwrap();
+        assert!(!config_json.contains("dbx-access"));
+        assert!(!config_json.contains("s3cr3t"));
+        assert!(!config_json.contains("session"));
+
+        let FileConnectionConfig::S3(config) = &mut input.config else { unreachable!() };
+        config.endpoint = "http://user:password@127.0.0.1:9000".to_string();
+        assert!(validate_input(&input).unwrap_err().contains("embedded"));
+    }
+
+    #[test]
+    fn s3_secret_redaction_covers_raw_and_encoded_values() {
+        let input = s3_input();
+        let secrets = input.secrets.unwrap();
+        let resolved = ResolvedFileSecrets {
+            access_key_id: secrets.access_key_id,
+            secret_access_key: secrets.secret_access_key,
+            session_token: secrets.session_token,
+            ..ResolvedFileSecrets::default()
+        };
+        let redacted =
+            redact_secrets("dbx-access s3cr3t%2F%2B%20token session%2F%2B+value s3cr3t/+ token".to_string(), &resolved);
+        assert!(!redacted.contains("dbx-access"));
+        assert!(!redacted.contains("s3cr3t"));
+        assert!(!redacted.contains("session%2F"));
+    }
+
+    #[test]
+    fn s3_anonymous_mode_is_explicit_and_rejects_credentials() {
+        let mut input = s3_input();
+        let FileConnectionConfig::S3(config) = &mut input.config else { unreachable!() };
+        config.anonymous = true;
+        assert!(validate_input(&input).unwrap_err().contains("cannot include credentials"));
+        input.secrets = None;
+        assert!(validate_input(&input).is_ok());
+    }
+
     async fn direct_ftp(input: &FileConnectionInput, password: &str) -> AsyncFtpStream {
-        let FileConnectionConfig::Ftp(config) = &input.config;
+        let FileConnectionConfig::Ftp(config) = &input.config else { unreachable!() };
         open_ftp_root_session(config, Some(password)).await.unwrap()
+    }
+
+    fn ftp_resolved(password: &str) -> ResolvedFileSecrets {
+        ResolvedFileSecrets { password: Some(password.to_string()), ..ResolvedFileSecrets::default() }
     }
 
     async fn direct_ftp_write(ftp: &mut AsyncFtpStream, path: &str, content: &[u8]) {
@@ -2338,6 +3198,180 @@ mod tests {
 
     fn ftp_session_establishment_count() -> usize {
         FTP_SESSION_ESTABLISHMENT_COUNT.load(Ordering::Relaxed)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the digest-pinned MinIO contract harness"]
+    async fn fixed_s3_service_contract() {
+        let endpoint = std::env::var("DBX_TEST_S3_ENDPOINT").expect("DBX_TEST_S3_ENDPOINT is required");
+        let direct_endpoint = std::env::var("DBX_TEST_S3_DIRECT_ENDPOINT").unwrap_or_else(|_| endpoint.clone());
+        let bucket = std::env::var("DBX_TEST_S3_BUCKET").expect("DBX_TEST_S3_BUCKET is required");
+        let access_key_id = std::env::var("DBX_TEST_S3_ACCESS_KEY_ID").expect("DBX_TEST_S3_ACCESS_KEY_ID is required");
+        let secret_access_key =
+            std::env::var("DBX_TEST_S3_SECRET_ACCESS_KEY").expect("DBX_TEST_S3_SECRET_ACCESS_KEY is required");
+        let session_token = std::env::var("DBX_TEST_S3_SESSION_TOKEN").ok();
+        let region = std::env::var("DBX_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let root = std::env::var("DBX_TEST_S3_ROOT").expect("DBX_TEST_S3_ROOT is required");
+        let config = FileConnectionConfig::S3(S3ConnectionConfig {
+            endpoint: endpoint.clone(),
+            region: region.clone(),
+            bucket: bucket.clone(),
+            root,
+            virtual_host_style: false,
+            anonymous: false,
+        });
+        let secrets = ResolvedFileSecrets {
+            access_key_id: Some(access_key_id.clone()),
+            secret_access_key: Some(secret_access_key.clone()),
+            session_token: session_token.clone(),
+            ..ResolvedFileSecrets::default()
+        };
+        let operator = build_operator_with_secrets(&config, &secrets).unwrap();
+
+        let entries = operator.list("/").await.unwrap();
+        let canonical = entries
+            .into_iter()
+            .filter(|entry| entry.path() != "/")
+            .map(|entry| {
+                let converted = file_entry_from_opendal("/", entry, true).unwrap();
+                (converted.kind, converted.path)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(canonical.iter().filter(|entry| *entry == &("file".to_string(), "a".to_string())).count(), 1);
+        assert_eq!(canonical.iter().filter(|entry| *entry == &("directory".to_string(), "a/".to_string())).count(), 1);
+
+        let directory_delete =
+            delete_s3_entry(&config, &RemotePath::parse("a/").unwrap(), Some("directory"), &secrets).await.unwrap_err();
+        assert!(directory_delete.contains("cannot be proven"));
+        assert_eq!(operator.read("a/child.txt").await.unwrap().to_vec(), b"child-a");
+        assert_eq!(operator.read("a").await.unwrap().to_vec(), b"file-a");
+
+        let virtual_delete =
+            delete_s3_entry(&config, &RemotePath::parse("virtual/").unwrap(), Some("directory"), &secrets)
+                .await
+                .unwrap_err();
+        assert!(virtual_delete.contains("not empty"));
+        assert_eq!(operator.read("virtual/child.txt").await.unwrap().to_vec(), b"virtual-child");
+        let virtual_metadata = stat_remote_metadata_once(&operator, &config, "virtual/").await.unwrap();
+        let virtual_stat = file_stat_from_metadata("virtual/", &virtual_metadata);
+        assert_eq!(virtual_stat.kind, "directory");
+        assert_eq!(virtual_stat.name, "virtual");
+
+        let deleted =
+            delete_s3_entry(&config, &RemotePath::parse("empty/").unwrap(), Some("directory"), &secrets).await.unwrap();
+        assert!(matches!(deleted.outcome, FileMutationOutcome::Completed));
+        assert!(!operator.exists("empty/").await.unwrap());
+
+        let nonzero = delete_s3_entry(&config, &RemotePath::parse("nonzero/").unwrap(), Some("directory"), &secrets)
+            .await
+            .unwrap_err();
+        assert!(nonzero.contains("contains data"));
+        let nonzero_entries = operator.list_with("nonzero/").recursive(true).await.unwrap();
+        let nonzero_metadata = nonzero_entries
+            .iter()
+            .find(|entry| entry.path() == "nonzero/")
+            .expect("the rejected non-zero marker must survive")
+            .metadata();
+        assert_eq!(nonzero_metadata.content_length(), b"nonzero-marker".len() as u64);
+
+        let transient = format!("contract-{}", Uuid::new_v4());
+        let created_directory = format!("{transient}/created");
+        create_directory_entry(&config, &RemotePath::parse(&created_directory).unwrap(), &secrets).await.unwrap();
+        let created_marker = format!("{created_directory}/");
+        let created_entries = operator.list_with(&created_marker).recursive(true).await.unwrap();
+        assert_eq!(
+            created_entries
+                .iter()
+                .find(|entry| entry.path() == created_marker)
+                .expect("production directory creation must write an exact marker")
+                .metadata()
+                .content_length(),
+            0
+        );
+        let marker_metadata = stat_remote_metadata_once(&operator, &config, &created_marker).await.unwrap();
+        let marker_stat = file_stat_from_metadata(&created_marker, &marker_metadata);
+        assert_eq!(marker_stat.kind, "directory");
+        assert_eq!(marker_stat.name, "created");
+        let created_delete =
+            delete_s3_entry(&config, &RemotePath::parse(&created_marker).unwrap(), Some("directory"), &secrets)
+                .await
+                .unwrap();
+        assert!(matches!(created_delete.outcome, FileMutationOutcome::Completed));
+
+        let same_name = format!("{transient}/same-name");
+        let same_name_marker = format!("{same_name}/");
+        operator.write(&same_name, Bytes::from_static(b"same-name-file")).await.unwrap();
+        write_s3_object_exact(&operator, &same_name_marker, Buffer::new(), true, &secrets).await.unwrap();
+        let same_name_delete =
+            delete_s3_entry(&config, &RemotePath::parse(&same_name_marker).unwrap(), Some("directory"), &secrets)
+                .await
+                .unwrap_err();
+        assert!(same_name_delete.contains("cannot be proven"));
+        let same_name_marker_entries = operator.list_with(&same_name_marker).recursive(true).await.unwrap();
+        assert!(same_name_marker_entries.iter().any(|entry| entry.path() == same_name_marker));
+        assert_eq!(operator.read(&same_name).await.unwrap().to_vec(), b"same-name-file");
+
+        let versioned_file = format!("{transient}/versioned-file");
+        operator.write(&versioned_file, Bytes::from_static(b"old-version")).await.unwrap();
+        operator.write(&versioned_file, Bytes::from_static(b"current-version")).await.unwrap();
+        delete_s3_entry(&config, &RemotePath::parse(&versioned_file).unwrap(), Some("file"), &secrets).await.unwrap();
+        assert_eq!(operator.stat(&versioned_file).await.unwrap_err().kind(), ErrorKind::NotFound);
+
+        let versioned_marker = format!("{transient}/versioned-marker/");
+        write_s3_object_exact(&operator, &versioned_marker, Buffer::new(), false, &secrets).await.unwrap();
+        write_s3_object_exact(&operator, &versioned_marker, Buffer::new(), false, &secrets).await.unwrap();
+        delete_s3_entry(&config, &RemotePath::parse(&versioned_marker).unwrap(), Some("directory"), &secrets)
+            .await
+            .unwrap();
+        assert_eq!(operator.stat(&versioned_marker).await.unwrap_err().kind(), ErrorKind::NotFound);
+
+        let large_source = format!("{transient}/large-source");
+        let large_copy = format!("{transient}/large-copy");
+        let source = vec![7_u8; 12 * 1024 * 1024 + 17];
+        let mut writer = operator.writer_with(&large_source).chunk(8 * 1024 * 1024).concurrent(1).await.unwrap();
+        for chunk in source.chunks(8 * 1024 * 1024) {
+            writer.write(Bytes::copy_from_slice(chunk)).await.unwrap();
+        }
+        writer.close().await.unwrap();
+        let mut copier = operator
+            .copier_with(&large_source, &large_copy)
+            .if_not_exists(true)
+            .source_content_length_hint(source.len() as u64)
+            .chunk(8 * 1024 * 1024)
+            .concurrent(1)
+            .await
+            .unwrap();
+        while copier.next().await.unwrap().is_some() {}
+        assert_eq!(operator.stat(&large_copy).await.unwrap().content_length(), source.len() as u64);
+        assert_eq!(operator.read(&large_copy).await.unwrap().to_vec(), source);
+
+        let existing = format!("{transient}/existing");
+        operator.write(&existing, Bytes::from_static(b"keep")).await.unwrap();
+        assert!(operator.exists(&existing).await.unwrap());
+        assert_eq!(operator.read(&existing).await.unwrap().to_vec(), b"keep");
+
+        let aborted_upload = format!("{transient}/aborted-upload");
+        let mut aborted = operator.writer_with(&aborted_upload).chunk(8 * 1024 * 1024).concurrent(1).await.unwrap();
+        aborted.write(Bytes::from(vec![1_u8; 8 * 1024 * 1024])).await.unwrap();
+        aborted.write(Bytes::from(vec![2_u8; 8 * 1024 * 1024])).await.unwrap();
+        aborted.abort().await.unwrap();
+        assert!(!operator.exists(&aborted_upload).await.unwrap());
+
+        let outside_key =
+            std::env::var("DBX_TEST_S3_OUTSIDE_CANARY_KEY").expect("DBX_TEST_S3_OUTSIDE_CANARY_KEY is required");
+        let bucket_canary_key =
+            std::env::var("DBX_TEST_S3_BUCKET_CANARY_KEY").expect("DBX_TEST_S3_BUCKET_CANARY_KEY is required");
+        let bucket_config = FileConnectionConfig::S3(S3ConnectionConfig {
+            endpoint: direct_endpoint,
+            region,
+            bucket,
+            root: "/".to_string(),
+            virtual_host_style: false,
+            anonymous: false,
+        });
+        let bucket_operator = build_operator_with_secrets(&bucket_config, &secrets).unwrap();
+        assert_eq!(bucket_operator.read(&outside_key).await.unwrap().to_vec(), b"tenant-canary");
+        assert_eq!(bucket_operator.read(&bucket_canary_key).await.unwrap().to_vec(), b"bucket-canary");
     }
 
     #[test]
@@ -2381,13 +3415,16 @@ mod tests {
             assert!(validate_input(&root_input).unwrap_err().contains("FTP root"));
 
             let mut username_input = input("ftp://example.test:21", "/");
-            let FileConnectionConfig::Ftp(config) = &mut username_input.config;
+            let FileConnectionConfig::Ftp(config) = &mut username_input.config else { unreachable!() };
             config.username = injected.to_string();
             assert!(validate_input(&username_input).unwrap_err().contains("FTP username"));
 
             let mut password_input = input("ftp://example.test:21", "/");
-            password_input.secrets =
-                Some(FileConnectionSecrets { password: Some(injected.to_string()), clear_password: false });
+            password_input.secrets = Some(FileConnectionSecrets {
+                password: Some(injected.to_string()),
+                clear_password: None,
+                ..FileConnectionSecrets::default()
+            });
             assert!(validate_input(&password_input).unwrap_err().contains("FTP password"));
         }
     }
@@ -2482,7 +3519,7 @@ mod tests {
             )
             .await
             .unwrap();
-        runtime.operator_for(&record, &config, None).unwrap();
+        runtime.operator_for(&record, &config, &ResolvedFileSecrets::default()).unwrap();
         assert_eq!(runtime.operator_count(), 1);
         let state = Arc::new(AppState::new(storage));
         let first_started = Arc::new(Notify::new());
@@ -2509,7 +3546,7 @@ mod tests {
                     &first_cancellation,
                     move |config, _password| async move {
                         assert_eq!(mutation_runtime.operator_count(), 0);
-                        let FileConnectionConfig::Ftp(config) = config;
+                        let FileConnectionConfig::Ftp(config) = config else { unreachable!() };
                         assert_eq!(config.endpoint, "ftp://revision-1.example.test:21");
                         first_started_signal.notify_one();
                         first_release_signal.notified().await;
@@ -2543,7 +3580,7 @@ mod tests {
                     &second_cancellation,
                     move |config, _password| async move {
                         assert_eq!(mutation_runtime.operator_count(), 0);
-                        let FileConnectionConfig::Ftp(config) = config;
+                        let FileConnectionConfig::Ftp(config) = config else { unreachable!() };
                         assert_eq!(config.endpoint, "ftp://revision-2.example.test:21");
                         second_acquired_flag.store(true, Ordering::Release);
                         Ok::<_, String>(())
@@ -2664,7 +3701,7 @@ mod tests {
             updated_at: String::new(),
             has_secret: false,
         };
-        runtime.operator_for(&record, &config, None).unwrap();
+        runtime.operator_for(&record, &config, &ResolvedFileSecrets::default()).unwrap();
         assert_eq!(runtime.operator_count(), 1);
         let cancellation = lease.cancellation();
         let error = run_list_operation(
@@ -2705,7 +3742,7 @@ mod tests {
         assert!(normalize_relative_remote_path("%2Fabsolute", false).is_err());
         assert!(normalize_relative_remote_path("safe/%2e%2e/escape", false).is_err());
         assert!(normalize_relative_remote_path("safe//file", false).is_err());
-        assert!(normalize_relative_remote_path("folder/", false).is_err());
+        assert_eq!(normalize_relative_remote_path("folder/", false).unwrap(), "folder/");
         assert!(normalize_relative_remote_path(" folder /../escape", false).is_err());
         assert!(normalize_relative_remote_path("safe\r\nDELE victim", false).is_err());
         assert!(normalize_relative_remote_path("safe%0d%0aDELE%20victim", false).is_err());
@@ -2734,7 +3771,11 @@ mod tests {
             expected_revision: None,
             name: "FTP contract".to_string(),
             config: FileConnectionConfig::Ftp(FtpConnectionConfig { endpoint, root: "/ftp/dbx".to_string(), username }),
-            secrets: Some(FileConnectionSecrets { password: Some(password.clone()), clear_password: false }),
+            secrets: Some(FileConnectionSecrets {
+                password: Some(password.clone()),
+                clear_password: None,
+                ..FileConnectionSecrets::default()
+            }),
         };
 
         let result = test_ftp_connection(&input, Some(&password)).await;
@@ -2783,7 +3824,9 @@ mod tests {
         let lister = operator.lister_with(&list_path).limit(50).await.unwrap();
         let list_root = list_path.clone();
         let stream = lister.map(move |result| {
-            result.map_err(|error| error.to_string()).and_then(|entry| file_entry_from_opendal(&list_root, entry))
+            result
+                .map_err(|error| error.to_string())
+                .and_then(|entry| file_entry_from_opendal(&list_root, entry, false))
         });
         let registry = ListSessionRegistry::default();
         let binding = list_session_binding(
@@ -2847,7 +3890,7 @@ mod tests {
             assert!(RemotePath::parse(injected_path).unwrap_err().contains("CR or LF"));
         }
 
-        let FileConnectionConfig::Ftp(base_config) = &input.config;
+        let FileConnectionConfig::Ftp(base_config) = &input.config else { unreachable!() };
         for injected_root in [
             "/ftp/dbx\r\nDELE /ftp/dbx/ticket-4-injection-victim",
             "/ftp/dbx%0d%0aDELE%20/ftp/dbx/ticket-4-injection-victim",
@@ -2879,7 +3922,7 @@ mod tests {
         );
         let sessions_before_directory_delete = ftp_session_establishment_count();
         assert!(matches!(
-            delete_entry(&input.config, &empty_directory, Some(&password)).await.unwrap().outcome,
+            delete_entry(&input.config, &empty_directory, None, &ftp_resolved(&password)).await.unwrap().outcome,
             FileMutationOutcome::Completed
         ));
         assert_eq!(
@@ -2894,7 +3937,7 @@ mod tests {
         direct.quit().await.unwrap();
         let sessions_before_file_delete = ftp_session_establishment_count();
         assert!(matches!(
-            delete_entry(&input.config, &removable_file, Some(&password)).await.unwrap().outcome,
+            delete_entry(&input.config, &removable_file, None, &ftp_resolved(&password)).await.unwrap().outcome,
             FileMutationOutcome::Completed
         ));
         assert_eq!(
@@ -2926,7 +3969,7 @@ mod tests {
             assert!(direct.cwd(format!("/ftp/dbx/{decoded_name}")).await.is_err());
             let _ = direct.quit().await;
             assert!(matches!(
-                delete_entry(&input.config, &literal_directory, Some(&password)).await.unwrap().outcome,
+                delete_entry(&input.config, &literal_directory, None, &ftp_resolved(&password)).await.unwrap().outcome,
                 FileMutationOutcome::Completed
             ));
             direct = direct_ftp(&input, &password).await;
@@ -2948,7 +3991,7 @@ mod tests {
         );
         drop(operator);
         direct.quit().await.unwrap();
-        delete_entry(&input.config, &percent_space_file, Some(&password)).await.unwrap();
+        delete_entry(&input.config, &percent_space_file, None, &ftp_resolved(&password)).await.unwrap();
         direct = direct_ftp(&input, &password).await;
         assert!(direct.size("/ftp/dbx/ticket-4%20literal-file").await.is_err());
         let _ = direct.quit().await;
@@ -2972,7 +4015,7 @@ mod tests {
         );
         drop(operator);
         direct.quit().await.unwrap();
-        delete_entry(&input.config, &percent_slash_file, Some(&password)).await.unwrap();
+        delete_entry(&input.config, &percent_slash_file, None, &ftp_resolved(&password)).await.unwrap();
         direct = direct_ftp(&input, &password).await;
         assert!(direct.size("/ftp/dbx/ticket-4-decoded%2Fliteral-file").await.is_err());
         let _ = direct.quit().await;
@@ -2987,7 +4030,7 @@ mod tests {
         direct = direct_ftp(&input, &password).await;
         direct_ftp_write(&mut direct, "/ftp/dbx/ticket-4-nonempty/child.txt", b"keep me").await;
         direct.quit().await.unwrap();
-        assert!(delete_entry(&input.config, &nonempty_directory, Some(&password))
+        assert!(delete_entry(&input.config, &nonempty_directory, None, &ftp_resolved(&password))
             .await
             .unwrap_err()
             .contains("not empty"));
@@ -2999,7 +4042,7 @@ mod tests {
         let raced_directory = RemotePath::parse("ticket-4-raced").unwrap();
         drop(operator);
         create_ftp_directory_exact(&input.config, &raced_directory, Some(&password)).await.unwrap();
-        let FileConnectionConfig::Ftp(ftp_config) = &input.config;
+        let FileConnectionConfig::Ftp(ftp_config) = &input.config else { unreachable!() };
         let mut preflight = direct_ftp(&input, &password).await;
         assert!(matches!(
             prepare_ftp_delete_in_session(&mut preflight, ftp_config, &raced_directory, Some(&password)).await.unwrap(),
@@ -3062,10 +4105,12 @@ mod tests {
         let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.endpoint.clone(),
+                FileConnectionConfig::S3(_) => unreachable!(),
             },
             root: "/ftp/dbx/must-not-be-created".to_string(),
             username: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.username.clone(),
+                FileConnectionConfig::S3(_) => unreachable!(),
             },
         });
         direct = direct_ftp(&input, &password).await;

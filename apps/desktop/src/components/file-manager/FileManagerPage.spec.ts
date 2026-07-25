@@ -36,6 +36,20 @@ const connection = (id: string, name: string) => ({
   createdAt: "2026-07-24T00:00:00Z",
   updatedAt: "2026-07-24T00:00:00Z",
   hasPassword: true,
+  hasCredentials: true,
+  capabilities: {
+    read: true,
+    write: true,
+    stat: true,
+    list: true,
+    createDirectory: true,
+    delete: true,
+    copy: true,
+    rename: true,
+    serverSideCopy: false,
+    atomicRename: false,
+    atomicNoClobber: false,
+  },
 });
 const directory = {
   path: "docs",
@@ -98,6 +112,49 @@ afterEach(() => {
 });
 
 describe("FileManagerPage paginated directory browsing", () => {
+  it("keeps S3 object and directory-marker identities distinct and normalizes directory navigation", async () => {
+    api.listFileConnections.mockResolvedValue([
+      {
+        ...connection("s3-1", "Objects"),
+        config: {
+          type: "s3",
+          endpoint: "http://localhost:9000",
+          region: "us-east-1",
+          bucket: "dbx",
+          root: "/tenant/",
+          virtualHostStyle: false,
+          anonymous: false,
+        },
+        capabilities: {
+          ...connection("unused", "unused").capabilities,
+          read: false,
+          copy: false,
+          rename: false,
+        },
+      },
+    ]);
+    api.listFileEntries
+      .mockResolvedValueOnce({
+        entries: [
+          { ...file, path: "a", name: "a" },
+          { ...directory, path: "a/", name: "a" },
+        ],
+        cursor: null,
+      })
+      .mockResolvedValueOnce({ entries: [], cursor: null });
+    await mountPage();
+
+    const rows = Array.from(document.querySelectorAll<HTMLTableRowElement>("tbody tr"));
+    expect(rows).toHaveLength(2);
+    expect(document.querySelector('[aria-label^="Download:"]')).toBeNull();
+    rows[1]?.click();
+    await flush();
+    expect(api.statFileEntry).toHaveBeenCalledWith("s3-1", "a/");
+    rows[1]?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await flush();
+    expect(api.listFileEntries).toHaveBeenLastCalledWith("s3-1", "a", { pageSize: 200 });
+  });
+
   it("closes the current cursor before refresh, connection switch, and directory switch", async () => {
     api.listFileEntries
       .mockResolvedValueOnce({ entries: [directory], cursor: "cursor-root-1" })

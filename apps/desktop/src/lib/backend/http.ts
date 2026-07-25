@@ -119,6 +119,7 @@ import type {
   FileConnectionInput,
   FileConnectionTestResult,
   FileEntryStat,
+  FileManagerEntry,
   FileListOptions,
   FileListPage,
   FileMutationResult,
@@ -342,7 +343,7 @@ export async function createFileDirectory(_connectionId: string, _path: string):
   return desktopFileManagerUnavailable();
 }
 
-export async function deleteFileEntry(_connectionId: string, _path: string, _recursive = false): Promise<FileMutationResult> {
+export async function deleteFileEntry(_connectionId: string, _path: string, _recursive = false, _expectedKind?: FileManagerEntry["kind"]): Promise<FileMutationResult> {
   return desktopFileManagerUnavailable();
 }
 

@@ -34,6 +34,7 @@ use super::file_manager::{
 
 const DOWNLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const UPLOAD_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+const S3_UPLOAD_BUFFER_SIZE: usize = 8 * 1024 * 1024;
 const REMOTE_COPY_BUFFER_SIZE: usize = 4 * 1024 * 1024;
 const GLOBAL_TRANSFER_LIMIT: usize = 8;
 const CONNECTION_TRANSFER_LIMIT: usize = 4;
@@ -72,6 +73,12 @@ static TEST_REMOTE_COPY_AFTER_CLOSE_BARRIER: std::sync::OnceLock<Mutex<Option<Te
 #[cfg(test)]
 static TEST_REMOTE_RENAME_AFTER_PUBLISH_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
     std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_S3_COPY_AFTER_COMMIT_RESPONSE_LOSS: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_S3_COPY_CHUNK: std::sync::OnceLock<Mutex<Option<(String, usize)>>> = std::sync::OnceLock::new();
 
 #[cfg(test)]
 static TEST_REMOTE_COPY_WRITER_OPEN_SIDE_EFFECT_FAILURE: AtomicBool = AtomicBool::new(false);
@@ -767,6 +774,30 @@ async fn retry_file_rename_source_delete_inner<R: Runtime>(
     let prepared = file_manager
         .prepare_file_mutation_operation(state, &record.connection_id, &record.remote_path, expected_revision)
         .await?;
+    if prepared.uses_server_side_copy() {
+        let destination = prepared.fingerprint_remote_file(&record.local_path).await?;
+        if record.destination_fingerprint.as_deref() != Some(destination.encode().as_str()) {
+            return Err("Destination fingerprint changed; source was not deleted".to_string());
+        }
+        let source = match prepared.fingerprint_remote_file(&record.remote_path).await {
+            Ok(source) => source,
+            Err(error) if error.contains("no longer exists") => {
+                let completed = state.storage.complete_file_rename_retry(transfer_id).await?;
+                emit_transfer(app, &completed);
+                return Ok(completed);
+            }
+            Err(error) => return Err(error),
+        };
+        if record.source_fingerprint.as_deref() != Some(source.encode().as_str()) {
+            return Err("Source fingerprint changed; source was not deleted".to_string());
+        }
+        prepared
+            .delete_source_if_fingerprints_match(state, &record.remote_path, &record.local_path, &source, &destination)
+            .await?;
+        let completed = state.storage.complete_file_rename_retry(transfer_id).await?;
+        emit_transfer(app, &completed);
+        return Ok(completed);
+    }
     let destination = match verify_remote_content(&prepared, &record.local_path, &cancellation).await {
         Ok(verified) => verified,
         Err(failure) => {
@@ -1192,6 +1223,21 @@ async fn execute_remote_transfer<R: Runtime>(
     cancellation: &CancellationToken,
     progress: Arc<TransferProgressSnapshot>,
 ) -> Result<RemoteTransferOutcome, RemoteTransferFailure> {
+    if prepared.uses_server_side_copy() {
+        return execute_server_side_remote_transfer(
+            app,
+            state,
+            transfer_id,
+            operation,
+            policy,
+            source_path,
+            destination_path,
+            prepared,
+            cancellation,
+            progress,
+        )
+        .await;
+    }
     let source_before =
         prepared.stat_remote_file(source_path).await.map_err(remote_failure).map_err(remote_transfer_before_copy)?;
     let total_bytes = i64::try_from(source_before.size)
@@ -1447,7 +1493,14 @@ async fn execute_remote_transfer<R: Runtime>(
         .await);
     }
     match prepared
-        .publish_owned_remote_partial(state, &partial_relative, destination_path, total_bytes, policy.replace())
+        .publish_owned_remote_partial(
+            state,
+            &partial_relative,
+            destination_path,
+            total_bytes,
+            policy.replace(),
+            cancellation,
+        )
         .await
     {
         Ok(UploadPublishResolution { state: UploadPublishState::Completed, .. }) => {}
@@ -1631,6 +1684,365 @@ async fn execute_remote_transfer<R: Runtime>(
     })
 }
 
+async fn reconcile_uncertain_s3_copy(
+    prepared: &PreparedFileMutation<'_>,
+    source: &RemoteFileFingerprint,
+    destination_path: &str,
+    detail: String,
+    cancelled: bool,
+) -> RemoteTransferFailure {
+    match prepared.fingerprint_remote_file(destination_path).await {
+        Err(error) if error.contains("no longer exists") => remote_transfer_before_copy(TransferFailure {
+            status: if cancelled { "cancelled" } else { "failed" },
+            message: format!("{detail}; destination is absent after reconciliation"),
+            invalidate_operator: false,
+        }),
+        Ok(destination)
+            if destination.size == source.size
+                && source.etag.is_some()
+                && destination.etag == source.etag =>
+        {
+            RemoteTransferFailure {
+                failure: partial_failure(format!(
+                    "{detail}; destination is committed and matches the durable source fingerprint, but the copy response was lost"
+                )),
+                operation_outcome: "copy_committed_response_unknown",
+                operation_phase: "copying",
+                partial_destination: Some(destination_path.to_string()),
+                source_fingerprint: Some(source.encode()),
+                destination_fingerprint: Some(destination.encode()),
+            }
+        }
+        Ok(destination) => RemoteTransferFailure {
+            failure: partial_failure(format!(
+                "{detail}; destination exists but could not be proven to match the source"
+            )),
+            operation_outcome: "destination_present_unproven",
+            operation_phase: "copying",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source.encode()),
+            destination_fingerprint: Some(destination.encode()),
+        },
+        Err(error) => RemoteTransferFailure {
+            failure: partial_failure(format!("{detail}; destination reconciliation failed: {error}")),
+            operation_outcome: "destination_state_unknown",
+            operation_phase: "copying",
+            partial_destination: None,
+            source_fingerprint: Some(source.encode()),
+            destination_fingerprint: None,
+        },
+    }
+}
+
+#[cfg(test)]
+fn install_test_s3_copy_after_commit_response_loss(destination_path: &str) {
+    *TEST_S3_COPY_AFTER_COMMIT_RESPONSE_LOSS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(destination_path.to_string());
+}
+
+#[cfg(test)]
+fn take_test_s3_copy_after_commit_response_loss(destination_path: &str) -> bool {
+    let mut target = TEST_S3_COPY_AFTER_COMMIT_RESPONSE_LOSS
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if target.as_deref() == Some(destination_path) {
+        target.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+fn install_test_s3_copy_chunk(destination_path: &str, chunk_size: usize) {
+    *TEST_S3_COPY_CHUNK.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner()) =
+        Some((destination_path.to_string(), chunk_size));
+}
+
+#[cfg(test)]
+fn take_test_s3_copy_chunk(destination_path: &str) -> Option<usize> {
+    let mut target =
+        TEST_S3_COPY_CHUNK.get_or_init(|| Mutex::new(None)).lock().unwrap_or_else(|error| error.into_inner());
+    if target.as_ref().is_some_and(|(path, _)| path == destination_path) {
+        target.take().map(|(_, chunk_size)| chunk_size)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_server_side_remote_transfer<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    transfer_id: &str,
+    operation: &'static str,
+    policy: RemoteMutationPolicy,
+    source_path: &str,
+    destination_path: &str,
+    prepared: &PreparedFileMutation<'_>,
+    cancellation: &CancellationToken,
+    progress: Arc<TransferProgressSnapshot>,
+) -> Result<RemoteTransferOutcome, RemoteTransferFailure> {
+    let source_before =
+        prepared.stat_remote_file(source_path).await.map_err(remote_failure).map_err(remote_transfer_before_copy)?;
+    let total_bytes = i64::try_from(source_before.size)
+        .map_err(|_| local_failure("Remote source size is not representable"))
+        .map_err(remote_transfer_before_copy)?;
+    progress.record_total(Some(total_bytes));
+    if prepared
+        .remote_entry_exists(destination_path)
+        .await
+        .map_err(remote_failure)
+        .map_err(remote_transfer_before_copy)?
+        && !policy.replace()
+    {
+        return Err(remote_transfer_before_copy(remote_failure(
+            "Remote destination already exists; best_effort_no_clobber does not replace it",
+        )));
+    }
+    let source_configured =
+        prepared.configured_path(source_path).map_err(local_failure).map_err(remote_transfer_before_copy)?;
+    let destination_configured =
+        prepared.configured_path(destination_path).map_err(local_failure).map_err(remote_transfer_before_copy)?;
+    let copying = state
+        .storage
+        .update_file_remote_transfer_phase(
+            transfer_id,
+            "running".to_string(),
+            "copying".to_string(),
+            0,
+            Some(total_bytes),
+            None,
+            Some(source_before.encode()),
+            None,
+        )
+        .await
+        .map_err(local_failure)
+        .map_err(remote_transfer_before_copy)?;
+    emit_transfer(app, &copying);
+    if copying.status == "cancelling" || cancellation.is_cancelled() {
+        return Err(remote_transfer_before_copy(cancelled_failure()));
+    }
+
+    let copier = prepared
+        .operator
+        .copier_with(&source_configured, &destination_configured)
+        .if_not_exists(!policy.replace())
+        .source_content_length_hint(source_before.size);
+    #[cfg(test)]
+    let copier = if let Some(chunk_size) = take_test_s3_copy_chunk(destination_path) {
+        copier.chunk(chunk_size)
+    } else {
+        copier
+    };
+    let mut copier = copier.concurrent(1).await.map_err(|error| {
+        remote_transfer_before_copy(remote_failure(prepared.redact_remote_error(error.to_string())))
+    })?;
+    let mut server_side_copied_bytes = 0_i64;
+    let mut last_progress = Instant::now();
+    loop {
+        let step = tokio::select! {
+            _ = cancellation.cancelled() => {
+                let abort = copier.abort().await;
+                let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
+                return Err(reconcile_uncertain_s3_copy(
+                    prepared, &source_before, destination_path,
+                    format!("S3 server-side copy cancellation response was uncertain{detail}"),
+                    true,
+                ).await);
+            }
+            _ = prepared.cancellation.cancelled() => {
+                let abort = copier.abort().await;
+                let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
+                return Err(reconcile_uncertain_s3_copy(
+                    prepared, &source_before, destination_path,
+                    format!("The file connection was removed during S3 copy{detail}"),
+                    true,
+                ).await);
+            }
+            result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, copier.next()) => result,
+        };
+        match step {
+            Ok(Ok(Some(bytes))) => {
+                server_side_copied_bytes =
+                    server_side_copied_bytes.saturating_add(i64::try_from(bytes).unwrap_or(i64::MAX)).min(total_bytes);
+                progress.record_bytes(server_side_copied_bytes);
+                if last_progress.elapsed() >= PROGRESS_INTERVAL {
+                    let update = state
+                        .storage
+                        .update_file_remote_transfer_phase(
+                            transfer_id,
+                            "running".to_string(),
+                            "copying".to_string(),
+                            server_side_copied_bytes,
+                            Some(total_bytes),
+                            None,
+                            Some(source_before.encode()),
+                            None,
+                        )
+                        .await
+                        .map_err(local_failure)
+                        .map_err(remote_transfer_before_copy)?;
+                    emit_transfer(app, &update);
+                    last_progress = Instant::now();
+                }
+                continue;
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(error)) => {
+                let abort = copier.abort().await;
+                let detail = abort.err().map(|abort| format!("; abort failed: {abort}")).unwrap_or_default();
+                return Err(reconcile_uncertain_s3_copy(
+                    prepared,
+                    &source_before,
+                    destination_path,
+                    prepared.redact_remote_error(format!("{error}{detail}")),
+                    false,
+                )
+                .await);
+            }
+            Err(_) => {
+                let abort = copier.abort().await;
+                let detail = abort.err().map(|error| format!("; abort failed: {error}")).unwrap_or_default();
+                return Err(reconcile_uncertain_s3_copy(
+                    prepared,
+                    &source_before,
+                    destination_path,
+                    format!("S3 server-side copy timed out{detail}"),
+                    false,
+                )
+                .await);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    if take_test_s3_copy_after_commit_response_loss(destination_path) {
+        return Err(reconcile_uncertain_s3_copy(
+            prepared,
+            &source_before,
+            destination_path,
+            "Injected after-commit S3 copy response loss".to_string(),
+            false,
+        )
+        .await);
+    }
+
+    let source_after = prepared.fingerprint_remote_file(source_path).await.map_err(|error| RemoteTransferFailure {
+        failure: partial_failure(error),
+        operation_outcome: "failed_with_partial_destination",
+        operation_phase: "copying",
+        partial_destination: Some(destination_path.to_string()),
+        source_fingerprint: Some(source_before.encode()),
+        destination_fingerprint: None,
+    })?;
+    let destination =
+        prepared.fingerprint_remote_file(destination_path).await.map_err(|error| RemoteTransferFailure {
+            failure: partial_failure(error),
+            operation_outcome: "failed_with_partial_destination",
+            operation_phase: "copying",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_after.encode()),
+            destination_fingerprint: None,
+        })?;
+    if source_after != source_before || destination.size != source_before.size {
+        return Err(RemoteTransferFailure {
+            failure: partial_failure(
+                "S3 source changed during server-side copy or destination size did not match; source deletion was not attempted",
+            ),
+            operation_outcome: "failed_with_partial_destination",
+            operation_phase: "copying",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_after.encode()),
+            destination_fingerprint: Some(destination.encode()),
+        });
+    }
+    progress.record_bytes(total_bytes);
+    let source_durable = source_after.encode();
+    let destination_durable = destination.encode();
+    if operation == "copy" {
+        return Ok(RemoteTransferOutcome {
+            bytes_transferred: total_bytes,
+            total_bytes,
+            operation_outcome: "completed",
+            operation_phase: "completed",
+            source_fingerprint: source_durable,
+            destination_fingerprint: destination_durable,
+        });
+    }
+
+    let published = state
+        .storage
+        .update_file_remote_transfer_phase(
+            transfer_id,
+            "publishing".to_string(),
+            "published_before_delete".to_string(),
+            total_bytes,
+            Some(total_bytes),
+            None,
+            Some(source_durable.clone()),
+            Some(destination_durable.clone()),
+        )
+        .await
+        .map_err(local_failure)
+        .map_err(|failure| RemoteTransferFailure {
+            failure,
+            operation_outcome: "copied_source_delete_failed",
+            operation_phase: "published_before_delete",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_durable.clone()),
+            destination_fingerprint: Some(destination_durable.clone()),
+        })?;
+    emit_transfer(app, &published);
+    wait_at_test_remote_rename_after_publish_barrier().await;
+    state
+        .storage
+        .update_file_remote_transfer_phase(
+            transfer_id,
+            "publishing".to_string(),
+            "delete_uncertain".to_string(),
+            total_bytes,
+            Some(total_bytes),
+            None,
+            Some(source_durable.clone()),
+            Some(destination_durable.clone()),
+        )
+        .await
+        .map_err(local_failure)
+        .map_err(|failure| RemoteTransferFailure {
+            failure,
+            operation_outcome: "copied_source_delete_failed",
+            operation_phase: "published_before_delete",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_durable.clone()),
+            destination_fingerprint: Some(destination_durable.clone()),
+        })?;
+    if let Err(error) = prepared
+        .delete_source_if_fingerprints_match(state, source_path, destination_path, &source_after, &destination)
+        .await
+    {
+        return Err(RemoteTransferFailure {
+            failure: partial_failure(error),
+            operation_outcome: "copied_source_delete_failed",
+            operation_phase: "delete_uncertain",
+            partial_destination: Some(destination_path.to_string()),
+            source_fingerprint: Some(source_durable),
+            destination_fingerprint: Some(destination_durable),
+        });
+    }
+    Ok(RemoteTransferOutcome {
+        bytes_transferred: total_bytes,
+        total_bytes,
+        operation_outcome: "completed",
+        operation_phase: "completed",
+        source_fingerprint: source_durable,
+        destination_fingerprint: destination_durable,
+    })
+}
+
 struct UploadExecutionContext<'a, 'runtime, R: Runtime> {
     app: &'a AppHandle<R>,
     state: &'a AppState,
@@ -1662,7 +2074,7 @@ async fn execute_upload<R: Runtime>(
         progress_snapshot,
         policy,
     } = context;
-    ensure_remote_target_absent(&prepared.operator, &prepared.remote_path).await.map_err(UploadFailure::from)?;
+    ensure_remote_target_absent(prepared, &prepared.remote_path).await.map_err(UploadFailure::from)?;
     if local.total_bytes == 0 {
         return execute_empty_upload(
             app,
@@ -1677,6 +2089,7 @@ async fn execute_upload<R: Runtime>(
         )
         .await;
     }
+    let upload_buffer_size = if prepared.uses_server_side_copy() { S3_UPLOAD_BUFFER_SIZE } else { UPLOAD_BUFFER_SIZE };
     let mut writer = tokio::select! {
         _ = cancellation.cancelled() => return Err(UploadFailure::from(upload_cancelled_failure())),
         _ = prepared.cancellation.cancelled() => {
@@ -1688,11 +2101,18 @@ async fn execute_upload<R: Runtime>(
         },
         result = tokio::time::timeout(
             IO_PROGRESS_WATCHDOG,
-            prepared.operator.writer_with(partial_configured).append(true).chunk(UPLOAD_BUFFER_SIZE).concurrent(1),
+            prepared
+                .operator
+                .writer_with(partial_configured)
+                .append(!prepared.uses_server_side_copy())
+                .chunk(upload_buffer_size)
+                .concurrent(1),
         ) => {
             result
                 .map_err(|_| remote_failure("Opening the remote upload timed out"))
-                .and_then(|result| result.map_err(|error| remote_failure(error.to_string())))
+                .and_then(|result| {
+                    result.map_err(|error| remote_failure(prepared.redact_remote_error(error.to_string())))
+                })
                 .map_err(UploadFailure::from)?
         }
     };
@@ -1700,7 +2120,7 @@ async fn execute_upload<R: Runtime>(
     let proof = local.proof();
     let file = local.file;
     let mut source = tokio::fs::File::from_std(file);
-    let mut buffer = vec![0_u8; UPLOAD_BUFFER_SIZE];
+    let mut buffer = vec![0_u8; upload_buffer_size];
     let mut bytes_transferred = 0_i64;
     let mut last_progress = Instant::now();
     let deadline = tokio::time::Instant::now() + DOWNLOAD_OPERATION_TIMEOUT;
@@ -1741,7 +2161,7 @@ async fn execute_upload<R: Runtime>(
                 result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.write(chunk)) => {
                     result
                         .map_err(|_| remote_failure("Remote upload write made no progress before the I/O watchdog expired"))?
-                        .map_err(|error| remote_failure(error.to_string()))?;
+                        .map_err(|error| remote_failure(prepared.redact_remote_error(error.to_string())))?;
                 }
             }
             bytes_transferred =
@@ -1771,7 +2191,7 @@ async fn execute_upload<R: Runtime>(
         }
 
         verify_upload_source_unchanged(&proof, bytes_transferred).map_err(local_failure)?;
-        ensure_remote_target_absent(&prepared.operator, &prepared.remote_path).await?;
+        ensure_remote_target_absent(prepared, &prepared.remote_path).await?;
         Ok(())
     }
     .await;
@@ -1783,7 +2203,13 @@ async fn execute_upload<R: Runtime>(
     match tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.close()).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
-            return Err(abort_upload(writer, prepared, partial_relative, remote_failure(error.to_string())).await);
+            return Err(abort_upload(
+                writer,
+                prepared,
+                partial_relative,
+                remote_failure(prepared.redact_remote_error(error.to_string())),
+            )
+            .await);
         }
         Err(_) => {
             return Err(abort_upload(
@@ -1953,7 +2379,7 @@ async fn publish_closed_upload<R: Runtime>(
         .await);
     }
     match prepared
-        .publish_owned_upload_partial(state, partial_relative, target_relative, proof.total_bytes, policy)
+        .publish_owned_upload_partial(state, partial_relative, target_relative, proof.total_bytes, policy, cancellation)
         .await
     {
         Ok(UploadPublishResolution { state: UploadPublishState::Completed, .. }) => Ok(UploadOutcome {
@@ -1990,11 +2416,11 @@ async fn publish_closed_upload<R: Runtime>(
     }
 }
 
-async fn ensure_remote_target_absent(operator: &opendal::Operator, path: &str) -> Result<(), TransferFailure> {
-    match tokio::time::timeout(IO_PROGRESS_WATCHDOG, operator.stat(path)).await {
+async fn ensure_remote_target_absent(prepared: &PreparedFileMutation<'_>, path: &str) -> Result<(), TransferFailure> {
+    match tokio::time::timeout(IO_PROGRESS_WATCHDOG, prepared.operator.stat(path)).await {
         Ok(Ok(_)) => Err(remote_failure("Remote upload destination already exists")),
         Ok(Err(error)) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
-        Ok(Err(error)) => Err(remote_failure(error.to_string())),
+        Ok(Err(error)) => Err(remote_failure(prepared.redact_remote_error(error.to_string()))),
         Err(_) => Err(remote_failure("Checking the remote upload destination timed out")),
     }
 }
@@ -2005,10 +2431,14 @@ async fn abort_upload(
     partial_relative: &str,
     failure: TransferFailure,
 ) -> UploadFailure {
-    abort_upload_control_flow(writer, partial_relative, failure, IO_PROGRESS_WATCHDOG, || {
+    let mut outcome = abort_upload_control_flow(writer, partial_relative, failure, IO_PROGRESS_WATCHDOG, || {
         prepared.delete_owned_upload_partial(partial_relative)
     })
-    .await
+    .await;
+    outcome.failure.message = prepared.redact_remote_error(outcome.failure.message);
+    outcome.abort_outcome = outcome.abort_outcome.map(|value| prepared.redact_remote_error(value));
+    outcome.publish_outcome = outcome.publish_outcome.map(|value| prepared.redact_remote_error(value));
+    outcome
 }
 
 #[derive(Debug)]
@@ -2449,8 +2879,12 @@ async fn execute_download<R: Runtime>(
         .ok_or_else(|| local_failure("File transfer not found"))?;
     let local_path = PathBuf::from(&record.local_path);
 
-    let metadata =
-        watched_remote(prepared.operator.stat(&prepared.remote_path), "Remote file metadata timed out").await?;
+    let metadata = watched_remote(prepared.operator.stat(&prepared.remote_path), "Remote file metadata timed out")
+        .await
+        .map_err(|mut failure| {
+            failure.message = prepared.redact_remote_error(failure.message);
+            failure
+        })?;
     if !metadata.mode().is_file() {
         return Err(remote_failure("The remote path is not a file"));
     }
@@ -2548,9 +2982,18 @@ async fn execute_download<R: Runtime>(
 
     let mut output = tokio::fs::File::from_std(std_file);
     let reader_future = prepared.operator.reader_with(&prepared.remote_path).concurrent(1).chunk(DOWNLOAD_BUFFER_SIZE);
-    let reader = watched_remote(async { reader_future.await }, "Opening the remote file timed out").await?;
-    let mut reader =
-        watched_remote(reader.into_futures_async_read(..), "Preparing the remote stream timed out").await?;
+    let reader = watched_remote(async { reader_future.await }, "Opening the remote file timed out").await.map_err(
+        |mut failure| {
+            failure.message = prepared.redact_remote_error(failure.message);
+            failure
+        },
+    )?;
+    let mut reader = watched_remote(reader.into_futures_async_read(..), "Preparing the remote stream timed out")
+        .await
+        .map_err(|mut failure| {
+            failure.message = prepared.redact_remote_error(failure.message);
+            failure
+        })?;
     wait_at_test_remote_reader_barrier().await;
     let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_SIZE];
     let mut bytes_transferred = 0_i64;
@@ -2565,7 +3008,11 @@ async fn execute_download<R: Runtime>(
             &mut bytes_transferred,
             &progress_snapshot,
         )
-        .await?;
+        .await
+        .map_err(|mut failure| {
+            failure.message = prepared.redact_remote_error(failure.message);
+            failure
+        })?;
         if count == 0 {
             break;
         }
@@ -3527,10 +3974,13 @@ async fn recover_interrupted_transfer(
                     expected_revision,
                 )
                 .await?;
+            let server_side_copy = prepared.uses_server_side_copy();
             let source = prepared.fingerprint_remote_file(&transfer.remote_path).await;
             let destination = prepared.fingerprint_remote_file(&transfer.local_path).await;
-            let relay_hashes_match = persisted_relay_hash(transfer.source_fingerprint.as_deref())
-                == persisted_relay_hash(transfer.destination_fingerprint.as_deref());
+            let source_relay_hash = persisted_relay_hash(transfer.source_fingerprint.as_deref());
+            let destination_relay_hash = persisted_relay_hash(transfer.destination_fingerprint.as_deref());
+            let relay_hashes_match =
+                server_side_copy || source_relay_hash.is_some_and(|source| Some(source) == destination_relay_hash);
             let destination_matches = relay_hashes_match
                 && destination.as_ref().is_ok_and(|fingerprint| {
                     transfer
@@ -3547,7 +3997,9 @@ async fn recover_interrupted_transfer(
                 });
             let source_missing = source.as_ref().is_err_and(|error| error.contains("no longer exists"));
             let mut destination_verification_error = None;
-            let destination_content_matches = if source_missing && destination_matches {
+            let destination_content_matches = if source_missing && destination_matches && server_side_copy {
+                true
+            } else if source_missing && destination_matches {
                 let cancellation = CancellationToken::new();
                 match verify_remote_content(&prepared, &transfer.local_path, &cancellation).await {
                     Ok(verified) => transfer
@@ -3606,8 +4058,16 @@ async fn recover_interrupted_transfer(
             .as_deref()
             .filter(|path| is_owned_remote_copy_partial(transfer, path))
             .map(str::to_string);
-        let partial_destination =
-            owned_partial.or_else(|| (transfer.status == "publishing").then(|| transfer.local_path.clone()));
+        // S3 writes directly to the final key during the copying phase. Its
+        // durable fingerprint intentionally has no FTP relay hash.
+        let direct_destination_may_exist = phase == "copying"
+            && transfer
+                .source_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| persisted_relay_hash(Some(fingerprint)).is_none());
+        let partial_destination = owned_partial.or_else(|| {
+            (transfer.status == "publishing" || direct_destination_may_exist).then(|| transfer.local_path.clone())
+        });
         let (status, outcome, error) = if let Some(path) = partial_destination.as_ref() {
             (
                 "partial",
@@ -3795,10 +4255,14 @@ fn is_owned_remote_copy_partial(transfer: &FileTransferStorageRecord, partial_pa
 }
 
 fn persisted_remote_fingerprint_matches(persisted: &str, observed: &RemoteFileFingerprint) -> bool {
-    let Some((remote, relay_hash)) = persisted.rsplit_once(";relay_sha256:") else {
-        return false;
-    };
-    remote == observed.encode() && relay_hash.len() == 64 && relay_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+    match persisted.rsplit_once(";relay_sha256:") {
+        Some((remote, relay_hash)) => {
+            remote == observed.encode()
+                && relay_hash.len() == 64
+                && relay_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        None => persisted == observed.encode(),
+    }
 }
 
 fn persisted_verified_remote_content_matches(persisted: &str, observed: &VerifiedRemoteContent) -> bool {
@@ -4006,8 +4470,9 @@ mod tests {
     }
 
     #[test]
-    fn persisted_remote_fingerprint_requires_exact_remote_fields_and_relay_hash() {
-        let observed = RemoteFileFingerprint { size: 16, modified: "2026-07-25T00:00:00Z".to_string() };
+    fn persisted_remote_fingerprint_accepts_s3_fields_and_validates_optional_ftp_relay_hash() {
+        let observed =
+            RemoteFileFingerprint { size: 16, modified: "2026-07-25T00:00:00Z".to_string(), etag: None, version: None };
         let hash = "a".repeat(64);
         let persisted = format!("{};relay_sha256:{hash}", observed.encode());
         assert!(persisted_remote_fingerprint_matches(&persisted, &observed));
@@ -4016,7 +4481,8 @@ mod tests {
             &format!("{}0;relay_sha256:{hash}", observed.encode()),
             &observed
         ));
-        assert!(!persisted_remote_fingerprint_matches(&observed.encode(), &observed));
+        assert!(persisted_remote_fingerprint_matches(&observed.encode(), &observed));
+        assert!(!persisted_remote_fingerprint_matches(&format!("{}0", observed.encode()), &observed));
         assert!(!persisted_remote_fingerprint_matches(&format!("{};relay_sha256:short", observed.encode()), &observed));
     }
 
@@ -5355,13 +5821,26 @@ mod tests {
     where
         R: Runtime,
     {
+        create_worker_transfer_for_connection(app, "ftp-contract", transfer_id, remote_path, local_path).await
+    }
+
+    async fn create_worker_transfer_for_connection<R>(
+        app: &tauri::App<R>,
+        connection_id: &str,
+        transfer_id: &str,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> (CancellationToken, tokio::task::JoinHandle<()>)
+    where
+        R: Runtime,
+    {
         let state = app.state::<Arc<AppState>>();
         let parent = local_path.parent().unwrap();
         state
             .storage
             .create_file_transfer(
                 transfer_id.to_string(),
-                "ftp-contract".into(),
+                connection_id.to_string(),
                 "download".into(),
                 remote_path.to_string(),
                 local_path.to_string_lossy().into_owned(),
@@ -5372,13 +5851,13 @@ mod tests {
         let cancellation = CancellationToken::new();
         app.state::<FileTransferRuntime>().register(
             transfer_id.to_string(),
-            "ftp-contract".into(),
+            connection_id.to_string(),
             cancellation.clone(),
         );
         let worker = tokio::spawn(run_download_worker(
             app.handle().clone(),
             transfer_id.to_string(),
-            "ftp-contract".into(),
+            connection_id.to_string(),
             cancellation.clone(),
         ));
         (cancellation, worker)
@@ -5393,14 +5872,27 @@ mod tests {
     where
         R: Runtime,
     {
+        create_upload_worker_transfer_for_connection(app, "ftp-contract", transfer_id, remote_path, local_path).await
+    }
+
+    async fn create_upload_worker_transfer_for_connection<R>(
+        app: &tauri::App<R>,
+        connection_id: &str,
+        transfer_id: &str,
+        remote_path: &str,
+        local_path: &Path,
+    ) -> (CancellationToken, tokio::task::JoinHandle<()>)
+    where
+        R: Runtime,
+    {
         let local = validate_local_source(local_path).await.unwrap();
         let state = app.state::<Arc<AppState>>();
-        let connection = state.storage.load_file_connection("ftp-contract").await.unwrap().unwrap();
+        let connection = state.storage.load_file_connection(connection_id).await.unwrap().unwrap();
         state
             .storage
             .create_file_upload_transfer(
                 transfer_id.to_string(),
-                "ftp-contract".into(),
+                connection_id.to_string(),
                 remote_path.to_string(),
                 local.path.to_string_lossy().into_owned(),
                 local.directory_identity.clone(),
@@ -5412,12 +5904,12 @@ mod tests {
             .unwrap();
         let cancellation = CancellationToken::new();
         app.state::<FileTransferRuntime>()
-            .register_upload(transfer_id.to_string(), "ftp-contract".into(), cancellation.clone())
+            .register_upload(transfer_id.to_string(), connection_id.to_string(), cancellation.clone())
             .unwrap();
         let worker = tokio::spawn(run_upload_worker(
             app.handle().clone(),
             transfer_id.to_string(),
-            "ftp-contract".into(),
+            connection_id.to_string(),
             cancellation.clone(),
             local,
             UploadPolicy::best_effort_no_clobber(),
@@ -5493,6 +5985,99 @@ mod tests {
         (app, state, operator, directory, container)
     }
 
+    async fn build_s3_contract_app(
+    ) -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, opendal::Operator, opendal::Operator, tempfile::TempDir)
+    {
+        use super::super::file_manager::{password_scope, FileConnectionConfig, S3ConnectionConfig};
+        use opendal::services::S3;
+
+        let endpoint = std::env::var("DBX_TEST_S3_ENDPOINT").expect("DBX_TEST_S3_ENDPOINT is required");
+        let direct_endpoint = std::env::var("DBX_TEST_S3_DIRECT_ENDPOINT").unwrap_or_else(|_| endpoint.clone());
+        let bucket = std::env::var("DBX_TEST_S3_BUCKET").expect("DBX_TEST_S3_BUCKET is required");
+        let root = std::env::var("DBX_TEST_S3_ROOT").expect("DBX_TEST_S3_ROOT is required");
+        let region = std::env::var("DBX_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let access_key_id = std::env::var("DBX_TEST_S3_ACCESS_KEY_ID").expect("DBX_TEST_S3_ACCESS_KEY_ID is required");
+        let secret_access_key =
+            std::env::var("DBX_TEST_S3_SECRET_ACCESS_KEY").expect("DBX_TEST_S3_SECRET_ACCESS_KEY is required");
+        let session_token = std::env::var("DBX_TEST_S3_SESSION_TOKEN").ok();
+        let config = FileConnectionConfig::S3(S3ConnectionConfig {
+            endpoint: endpoint.clone(),
+            region: region.clone(),
+            bucket: bucket.clone(),
+            root: root.clone(),
+            virtual_host_style: false,
+            anonymous: false,
+        });
+        let build_operator = |endpoint: &str, root: &str| {
+            let mut builder = S3::default()
+                .endpoint(endpoint)
+                .region(&region)
+                .bucket(&bucket)
+                .root(root)
+                .access_key_id(&access_key_id)
+                .secret_access_key(&secret_access_key)
+                .disable_config_load()
+                .disable_ec2_metadata();
+            if let Some(session_token) = session_token.as_deref() {
+                builder = builder.session_token(session_token);
+            }
+            opendal::Operator::new(builder).unwrap().finish()
+        };
+        let operator = build_operator(&endpoint, &root);
+        let bucket_operator = build_operator(&direct_endpoint, "/");
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let mut persisted_secrets =
+            vec![("access_key_id".to_string(), access_key_id), ("secret_access_key".to_string(), secret_access_key)];
+        if let Some(session_token) = session_token {
+            persisted_secrets.push(("session_token".to_string(), session_token));
+        }
+        storage
+            .save_file_connection_with_secret_bundle(
+                "s3-contract".into(),
+                "S3 contract".into(),
+                "s3".into(),
+                serde_json::to_string(&config).unwrap(),
+                persisted_secrets,
+                vec![
+                    "password".to_string(),
+                    "password_scope".to_string(),
+                    "access_key_id".to_string(),
+                    "secret_access_key".to_string(),
+                    "session_token".to_string(),
+                ],
+                "s3_scope".to_string(),
+                password_scope(&config).unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        (app, state, operator, bucket_operator, directory)
+    }
+
+    async fn assert_no_s3_owned_partial(operator: &opendal::Operator, transfer_id: &str) {
+        let upload_prefix = format!(".dbx-upload-{transfer_id}-");
+        let copy_prefix = format!(".dbx-copy-{transfer_id}-");
+        let residuals = operator
+            .list_with("/")
+            .recursive(true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path().to_string())
+            .filter(|path| (path.contains(&upload_prefix) || path.contains(&copy_prefix)) && path.ends_with(".part"))
+            .collect::<Vec<_>>();
+        assert!(residuals.is_empty(), "residual S3 operation-owned partials: {residuals:?}");
+    }
+
     async fn create_remote_worker_transfer<R: Runtime>(
         app: &tauri::App<R>,
         transfer_id: &str,
@@ -5500,32 +6085,53 @@ mod tests {
         source_path: &str,
         destination_path: &str,
     ) -> tokio::task::JoinHandle<()> {
+        create_remote_worker_transfer_for_connection(
+            app,
+            "ftp-contract",
+            transfer_id,
+            operation,
+            source_path,
+            destination_path,
+        )
+        .await
+    }
+
+    async fn create_remote_worker_transfer_for_connection<R: Runtime>(
+        app: &tauri::App<R>,
+        connection_id: &str,
+        transfer_id: &str,
+        operation: &'static str,
+        source_path: &str,
+        destination_path: &str,
+    ) -> tokio::task::JoinHandle<()> {
         let state = app.state::<Arc<AppState>>();
+        let connection = state.storage.load_file_connection(connection_id).await.unwrap().unwrap();
         state
             .storage
             .create_file_remote_transfer(
                 transfer_id.to_string(),
-                "ftp-contract".into(),
+                connection_id.to_string(),
                 operation.to_string(),
                 source_path.to_string(),
                 destination_path.to_string(),
-                1,
+                connection.revision,
             )
             .await
             .unwrap();
         let cancellation = CancellationToken::new();
         app.state::<FileTransferRuntime>().register(
             transfer_id.to_string(),
-            "ftp-contract".into(),
+            connection_id.to_string(),
             cancellation.clone(),
         );
         let app_handle = app.handle().clone();
         let transfer_id = transfer_id.to_string();
+        let connection_id = connection_id.to_string();
         tokio::spawn(async move {
             run_remote_transfer_worker(
                 app_handle,
                 transfer_id,
-                "ftp-contract".into(),
+                connection_id,
                 cancellation,
                 operation,
                 RemoteMutationPolicy::BestEffortNoClobber { atomic_no_clobber: false, external_toctou_risk: true },
@@ -5568,6 +6174,443 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "FTP fixture rewrite failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/s3-contract.sh with digest-pinned MinIO"]
+    async fn fixed_s3_transfer_contract() {
+        let (app, state, operator, bucket_operator, directory) = build_s3_contract_app().await;
+        let local_root = directory.path().canonicalize().unwrap();
+        let prefix = format!("runtime-{}", Uuid::new_v4());
+        let proxy_faults = std::env::var("DBX_TEST_S3_FAULT_PROXY").as_deref() == Ok("1");
+        let small_payload = b"dbx s3 runtime contract\n".to_vec();
+        let large_payload = (0..(S3_UPLOAD_BUFFER_SIZE * 2 + 257)).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+
+        for (name, payload) in
+            [("empty", Vec::new()), ("small", small_payload.clone()), ("large", large_payload.clone())]
+        {
+            let remote_path = format!("{prefix}/download-{name}.bin");
+            operator.write(&remote_path, Bytes::from(payload.clone())).await.unwrap();
+            let transfer_id = format!("s3-download-{name}");
+            let local_path = local_root.join(format!("download-{name}.bin"));
+            let (_, worker) =
+                create_worker_transfer_for_connection(&app, "s3-contract", &transfer_id, &remote_path, &local_path)
+                    .await;
+            worker.await.unwrap();
+            let transfer = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
+            assert_eq!(transfer.status, "completed", "{transfer:?}");
+            assert_eq!(transfer.bytes_transferred, i64::try_from(payload.len()).unwrap());
+            assert_eq!(tokio::fs::read(&local_path).await.unwrap(), payload);
+            assert_no_owned_temp(&local_root, &transfer_id);
+        }
+
+        for (name, payload) in
+            [("empty", Vec::new()), ("small", small_payload.clone()), ("large", large_payload.clone())]
+        {
+            let transfer_id = format!("s3-upload-{name}");
+            let local_path = local_root.join(format!("upload-{name}.bin"));
+            let remote_path = format!("{prefix}/upload-{name}.bin");
+            tokio::fs::write(&local_path, &payload).await.unwrap();
+            let (_, worker) = create_upload_worker_transfer_for_connection(
+                &app,
+                "s3-contract",
+                &transfer_id,
+                &remote_path,
+                &local_path,
+            )
+            .await;
+            worker.await.unwrap();
+            let transfer = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
+            assert_eq!(transfer.status, "completed", "{transfer:?}");
+            assert_eq!(transfer.publish_outcome.as_deref(), Some("completed"), "{transfer:?}");
+            assert_eq!(transfer.bytes_transferred, i64::try_from(payload.len()).unwrap());
+            assert_eq!(operator.read(&remote_path).await.unwrap().to_vec(), payload);
+            assert_no_s3_owned_partial(&operator, &transfer_id).await;
+        }
+
+        for (name, payload) in [("small", small_payload.clone()), ("large", large_payload.clone())] {
+            let source = format!("{prefix}/copy-{name}-source.bin");
+            let destination = format!("{prefix}/copy-{name}-destination.bin");
+            let transfer_id = format!("s3-copy-{name}");
+            operator.write(&source, Bytes::from(payload.clone())).await.unwrap();
+            create_remote_worker_transfer_for_connection(
+                &app,
+                "s3-contract",
+                &transfer_id,
+                "copy",
+                &source,
+                &destination,
+            )
+            .await
+            .await
+            .unwrap();
+            let transfer = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
+            assert_eq!(transfer.status, "completed", "{transfer:?}");
+            assert_eq!(transfer.operation_outcome.as_deref(), Some("completed"));
+            assert_eq!(operator.read(&source).await.unwrap().to_vec(), payload);
+            assert_eq!(operator.read(&destination).await.unwrap().to_vec(), payload);
+            assert_no_s3_owned_partial(&operator, &transfer_id).await;
+        }
+
+        let response_loss_copy_source = format!("{prefix}/response-loss-copy-source.bin");
+        let response_loss_copy_destination = format!("{prefix}/response-loss-copy-destination.bin");
+        operator.write(&response_loss_copy_source, Bytes::from_static(b"response-loss-copy")).await.unwrap();
+        if !proxy_faults {
+            install_test_s3_copy_after_commit_response_loss(&response_loss_copy_destination);
+        }
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "s3-contract",
+            "s3-copy-response-loss",
+            "copy",
+            &response_loss_copy_source,
+            &response_loss_copy_destination,
+        )
+        .await
+        .await
+        .unwrap();
+        let response_loss_copy = state.storage.get_file_transfer("s3-copy-response-loss").await.unwrap().unwrap();
+        assert_eq!(response_loss_copy.status, "partial", "{response_loss_copy:?}");
+        assert_eq!(response_loss_copy.operation_outcome.as_deref(), Some("copy_committed_response_unknown"));
+        assert_eq!(operator.read(&response_loss_copy_destination).await.unwrap().to_vec(), b"response-loss-copy");
+        assert!(operator.exists(&response_loss_copy_source).await.unwrap());
+
+        let response_loss_rename_source = format!("{prefix}/response-loss-rename-source.bin");
+        let response_loss_rename_destination = format!("{prefix}/response-loss-rename-destination.bin");
+        operator.write(&response_loss_rename_source, Bytes::from_static(b"response-loss-rename")).await.unwrap();
+        if !proxy_faults {
+            install_test_s3_copy_after_commit_response_loss(&response_loss_rename_destination);
+        }
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "s3-contract",
+            "s3-rename-response-loss",
+            "rename",
+            &response_loss_rename_source,
+            &response_loss_rename_destination,
+        )
+        .await
+        .await
+        .unwrap();
+        let response_loss_rename = state.storage.get_file_transfer("s3-rename-response-loss").await.unwrap().unwrap();
+        assert_eq!(response_loss_rename.status, "partial", "{response_loss_rename:?}");
+        assert_eq!(response_loss_rename.operation_outcome.as_deref(), Some("copy_committed_response_unknown"));
+        assert!(operator.exists(&response_loss_rename_source).await.unwrap());
+        assert_eq!(operator.read(&response_loss_rename_destination).await.unwrap().to_vec(), b"response-loss-rename");
+
+        let response_loss_upload_source = local_root.join("response-loss-upload.bin");
+        let response_loss_upload_target = format!("{prefix}/response-loss-upload-target.bin");
+        tokio::fs::write(&response_loss_upload_source, b"response-loss-upload").await.unwrap();
+        if !proxy_faults {
+            super::super::file_manager::install_test_s3_publish_after_commit_response_loss(
+                &response_loss_upload_target,
+            );
+        }
+        let (_, response_loss_upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "s3-contract",
+            "s3-upload-response-loss",
+            &response_loss_upload_target,
+            &response_loss_upload_source,
+        )
+        .await;
+        response_loss_upload_worker.await.unwrap();
+        let response_loss_upload = state.storage.get_file_transfer("s3-upload-response-loss").await.unwrap().unwrap();
+        assert_eq!(response_loss_upload.status, "partial", "{response_loss_upload:?}");
+        assert_eq!(response_loss_upload.publish_outcome.as_deref(), Some("partial_target_unproven"));
+        assert_eq!(operator.read(&response_loss_upload_target).await.unwrap().to_vec(), b"response-loss-upload");
+
+        if proxy_faults {
+            let protocol_error_source = format!("{prefix}/fault-200-error-source.bin");
+            let protocol_error_destination = format!("{prefix}/fault-200-error-destination.bin");
+            operator.write(&protocol_error_source, Bytes::from_static(b"protocol error source")).await.unwrap();
+            create_remote_worker_transfer_for_connection(
+                &app,
+                "s3-contract",
+                "s3-copy-200-error",
+                "copy",
+                &protocol_error_source,
+                &protocol_error_destination,
+            )
+            .await
+            .await
+            .unwrap();
+            let protocol_error = state.storage.get_file_transfer("s3-copy-200-error").await.unwrap().unwrap();
+            assert_eq!(protocol_error.status, "failed", "{protocol_error:?}");
+            assert_eq!(protocol_error.operation_outcome.as_deref(), Some("failed_before_copy"));
+            assert!(
+                protocol_error.error.as_deref().is_some_and(|error| error.contains("InvalidRequest")),
+                "{protocol_error:?}"
+            );
+            assert_eq!(
+                operator.stat(&protocol_error_destination).await.unwrap_err().kind(),
+                opendal::ErrorKind::NotFound
+            );
+
+            let abort_error_source = format!("{prefix}/fault-abort-error-source.bin");
+            let abort_error_destination = format!("{prefix}/fault-abort-error-destination.bin");
+            operator.write(&abort_error_source, Bytes::from(vec![11_u8; 8 * 1024 * 1024 + 31])).await.unwrap();
+            install_test_s3_copy_chunk(&abort_error_destination, 5 * 1024 * 1024);
+            create_remote_worker_transfer_for_connection(
+                &app,
+                "s3-contract",
+                "s3-copy-abort-error",
+                "copy",
+                &abort_error_source,
+                &abort_error_destination,
+            )
+            .await
+            .await
+            .unwrap();
+            let abort_error = state.storage.get_file_transfer("s3-copy-abort-error").await.unwrap().unwrap();
+            assert_eq!(abort_error.status, "failed", "{abort_error:?}");
+            assert_eq!(abort_error.operation_outcome.as_deref(), Some("failed_before_copy"));
+            assert!(
+                abort_error.error.as_deref().is_some_and(|error| error.contains("abort failed")),
+                "{abort_error:?}"
+            );
+            assert_eq!(operator.stat(&abort_error_destination).await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        }
+
+        let no_clobber_source = format!("{prefix}/no-clobber-source.bin");
+        let no_clobber_destination = format!("{prefix}/no-clobber-destination.bin");
+        operator.write(&no_clobber_source, Bytes::from_static(b"source")).await.unwrap();
+        operator.write(&no_clobber_destination, Bytes::from_static(b"keep")).await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "s3-contract",
+            "s3-copy-no-clobber",
+            "copy",
+            &no_clobber_source,
+            &no_clobber_destination,
+        )
+        .await
+        .await
+        .unwrap();
+        let no_clobber = state.storage.get_file_transfer("s3-copy-no-clobber").await.unwrap().unwrap();
+        assert_eq!(no_clobber.status, "failed", "{no_clobber:?}");
+        assert_eq!(no_clobber.operation_outcome.as_deref(), Some("failed_before_copy"));
+        assert_eq!(operator.read(&no_clobber_destination).await.unwrap().to_vec(), b"keep");
+        assert_eq!(operator.read(&no_clobber_source).await.unwrap().to_vec(), b"source");
+
+        let rename_source = format!("{prefix}/rename-source.bin");
+        let rename_destination = format!("{prefix}/rename-destination.bin");
+        operator.write(&rename_source, Bytes::from_static(b"old-rename-version")).await.unwrap();
+        operator.write(&rename_source, Bytes::from_static(b"rename")).await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "s3-contract",
+            "s3-rename-success",
+            "rename",
+            &rename_source,
+            &rename_destination,
+        )
+        .await
+        .await
+        .unwrap();
+        let rename = state.storage.get_file_transfer("s3-rename-success").await.unwrap().unwrap();
+        assert_eq!(rename.status, "completed", "{rename:?}");
+        assert_eq!(operator.stat(&rename_source).await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        assert_eq!(operator.read(&rename_destination).await.unwrap().to_vec(), b"rename");
+
+        let connection = state.storage.load_file_connection("s3-contract").await.unwrap().unwrap();
+        let file_manager = app.state::<FileManagerRuntime>();
+        let prepared = file_manager
+            .prepare_file_mutation_operation(&state, "s3-contract", &rename_destination, connection.revision)
+            .await
+            .unwrap();
+
+        let retry_source = format!("{prefix}/versioned-retry-source.bin");
+        let retry_destination = format!("{prefix}/versioned-retry-destination.bin");
+        operator.write(&retry_source, Bytes::from_static(b"old-retry-version")).await.unwrap();
+        operator.write(&retry_source, Bytes::from_static(b"current-retry-version")).await.unwrap();
+        operator.copy(&retry_source, &retry_destination).await.unwrap();
+        let retry_source_fingerprint = prepared.fingerprint_remote_file(&retry_source).await.unwrap().encode();
+        let retry_destination_fingerprint =
+            prepared.fingerprint_remote_file(&retry_destination).await.unwrap().encode();
+        state
+            .storage
+            .create_file_remote_transfer(
+                "s3-versioned-rename-retry".into(),
+                "s3-contract".into(),
+                "rename".into(),
+                retry_source.clone(),
+                retry_destination.clone(),
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .finish_file_remote_transfer(
+                "s3-versioned-rename-retry",
+                "partial".into(),
+                i64::try_from(b"current-retry-version".len()).unwrap(),
+                Some(i64::try_from(b"current-retry-version".len()).unwrap()),
+                Some("injected source delete failure".into()),
+                Some(retry_destination.clone()),
+                "copied_source_delete_failed".into(),
+                "delete_uncertain".into(),
+                Some(retry_source_fingerprint),
+                Some(retry_destination_fingerprint),
+            )
+            .await
+            .unwrap();
+        let retry_result = retry_file_rename_source_delete_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            file_manager.inner(),
+            "s3-versioned-rename-retry",
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry_result.status, "completed");
+        assert_eq!(operator.stat(&retry_source).await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        assert_eq!(operator.read(&retry_destination).await.unwrap().to_vec(), b"current-retry-version");
+
+        let recovery_copy_source = format!("{prefix}/recovery-copy-source.bin");
+        operator.write(&recovery_copy_source, Bytes::from_static(b"copy recovery")).await.unwrap();
+        let recovery_copy_fingerprint = prepared.fingerprint_remote_file(&recovery_copy_source).await.unwrap().encode();
+        state
+            .storage
+            .create_file_remote_transfer(
+                "s3-recovery-copying".into(),
+                "s3-contract".into(),
+                "copy".into(),
+                recovery_copy_source,
+                format!("{prefix}/recovery-copy-destination.bin"),
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_remote_transfer_phase(
+                "s3-recovery-copying",
+                "running".into(),
+                "copying".into(),
+                1,
+                Some(13),
+                None,
+                Some(recovery_copy_fingerprint),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let recovery_rename_source = format!("{prefix}/recovery-rename-source.bin");
+        let recovery_rename_destination = format!("{prefix}/recovery-rename-destination.bin");
+        operator.write(&recovery_rename_source, Bytes::from_static(b"rename recovery")).await.unwrap();
+        operator.copy(&recovery_rename_source, &recovery_rename_destination).await.unwrap();
+        let recovery_rename_source_fingerprint =
+            prepared.fingerprint_remote_file(&recovery_rename_source).await.unwrap().encode();
+        let recovery_rename_destination_fingerprint =
+            prepared.fingerprint_remote_file(&recovery_rename_destination).await.unwrap().encode();
+        state
+            .storage
+            .create_file_remote_transfer(
+                "s3-recovery-rename".into(),
+                "s3-contract".into(),
+                "rename".into(),
+                recovery_rename_source.clone(),
+                recovery_rename_destination.clone(),
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_remote_transfer_phase(
+                "s3-recovery-rename",
+                "publishing".into(),
+                "delete_uncertain".into(),
+                15,
+                Some(15),
+                None,
+                Some(recovery_rename_source_fingerprint),
+                Some(recovery_rename_destination_fingerprint),
+            )
+            .await
+            .unwrap();
+        operator.delete(&recovery_rename_source).await.unwrap();
+
+        let recovery_upload_id = "s3-recovery-upload-publishing";
+        let recovery_upload_partial = format!("{prefix}/.dbx-upload-{recovery_upload_id}-random.part");
+        let recovery_upload_target = format!("{prefix}/recovery-upload-target.bin");
+        let recovery_upload_payload = b"upload recovery";
+        operator.write(&recovery_upload_partial, Bytes::from_static(recovery_upload_payload)).await.unwrap();
+        state
+            .storage
+            .create_file_upload_transfer(
+                recovery_upload_id.into(),
+                "s3-contract".into(),
+                recovery_upload_target,
+                local_root.join("recovery-source.bin").to_string_lossy().into_owned(),
+                canonical_directory_identity(&local_root),
+                "recovery-source-fingerprint".into(),
+                i64::try_from(recovery_upload_payload.len()).unwrap(),
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .start_file_upload_transfer(
+                recovery_upload_id,
+                recovery_upload_partial.clone(),
+                "recovery-source-fingerprint".into(),
+                i64::try_from(recovery_upload_payload.len()).unwrap(),
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_transfer(
+                recovery_upload_id,
+                "publishing".into(),
+                i64::try_from(recovery_upload_payload.len()).unwrap(),
+                Some(i64::try_from(recovery_upload_payload.len()).unwrap()),
+                Some(recovery_upload_partial.clone()),
+                Some("recovery-source-fingerprint".into()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        drop(prepared);
+
+        let interrupted = state.storage.recover_interrupted_file_transfers().await.unwrap();
+        for id in ["s3-recovery-copying", "s3-recovery-rename", recovery_upload_id] {
+            let transfer = interrupted.iter().find(|transfer| transfer.id == id).unwrap();
+            recover_interrupted_transfer(&state, app.state::<FileManagerRuntime>().inner(), transfer).await.unwrap();
+        }
+        let recovered_copy = state.storage.get_file_transfer("s3-recovery-copying").await.unwrap().unwrap();
+        assert_eq!(recovered_copy.status, "partial", "{recovered_copy:?}");
+        assert_eq!(recovered_copy.operation_outcome.as_deref(), Some("failed_with_partial_destination"));
+        let recovered_rename = state.storage.get_file_transfer("s3-recovery-rename").await.unwrap().unwrap();
+        assert_eq!(recovered_rename.status, "completed", "{recovered_rename:?}");
+        let recovered_upload = state.storage.get_file_transfer(recovery_upload_id).await.unwrap().unwrap();
+        assert_eq!(recovered_upload.status, "partial", "{recovered_upload:?}");
+        assert_eq!(recovered_upload.publish_outcome.as_deref(), Some("partial_source"));
+        assert_eq!(recovered_upload.partial_destination.as_deref(), Some(recovery_upload_partial.as_str()));
+
+        let outside_canary_key =
+            std::env::var("DBX_TEST_S3_OUTSIDE_CANARY_KEY").expect("DBX_TEST_S3_OUTSIDE_CANARY_KEY is required");
+        let bucket_canary_key =
+            std::env::var("DBX_TEST_S3_BUCKET_CANARY_KEY").expect("DBX_TEST_S3_BUCKET_CANARY_KEY is required");
+        assert_eq!(bucket_operator.read(&outside_canary_key).await.unwrap().to_vec(), b"tenant-canary");
+        assert_eq!(bucket_operator.read(&bucket_canary_key).await.unwrap().to_vec(), b"bucket-canary");
+
+        let serialized =
+            serde_json::to_string(&state.storage.list_file_transfers(Some("s3-contract"), 100).await.unwrap()).unwrap();
+        for secret in [
+            std::env::var("DBX_TEST_S3_ACCESS_KEY_ID").unwrap(),
+            std::env::var("DBX_TEST_S3_SECRET_ACCESS_KEY").unwrap(),
+        ] {
+            assert!(!serialized.contains(&secret), "serialized transfer DTO leaked S3 credentials");
+        }
     }
 
     #[tokio::test]

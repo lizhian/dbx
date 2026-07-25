@@ -113,6 +113,20 @@ const connection: FileConnection = {
     username: "tester",
   },
   hasPassword: true,
+  hasCredentials: true,
+  capabilities: {
+    read: true,
+    write: true,
+    stat: true,
+    list: true,
+    createDirectory: true,
+    delete: true,
+    copy: true,
+    rename: true,
+    serverSideCopy: false,
+    atomicRename: false,
+    atomicNoClobber: false,
+  },
   createdAt: "2026-07-25T08:00:00Z",
   updatedAt: "2026-07-25T08:00:00Z",
 };
@@ -202,6 +216,23 @@ afterEach(() => {
 });
 
 describe("FileManagerPage transfer lifecycle", () => {
+  it("shows protocol-specific connection security warnings", async () => {
+    await mountPage();
+
+    expect(root?.textContent).toContain("fileManager.ftpSecurity");
+    expect(root?.textContent).not.toContain("fileManager.s3Security");
+
+    const typeSelect = root?.querySelector<HTMLSelectElement>("#file-connection-type");
+    expect(typeSelect).toBeTruthy();
+    if (!typeSelect) return;
+    typeSelect.value = "s3";
+    typeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    await nextTick();
+
+    expect(root?.textContent).not.toContain("fileManager.ftpSecurity");
+    expect(root?.textContent).toContain("fileManager.s3Security");
+  });
+
   it("hydrates terminal and active transfers, applies progress, and exposes cancellation", async () => {
     const completed = transfer("completed", "completed", {
       bytesTransferred: 100,

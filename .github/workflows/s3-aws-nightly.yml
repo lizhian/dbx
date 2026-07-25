@@ -1,0 +1,95 @@
+name: AWS S3 nightly contract
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-s3-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  s3-contract:
+    if: github.repository == 'lizhian/dbx' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    environment: aws-s3-contract
+
+    steps:
+      - name: Check protected AWS configuration
+        id: preflight
+        shell: bash
+        env:
+          CONTRACT_BUCKET: ${{ secrets.DBX_AWS_S3_BUCKET || vars.DBX_AWS_S3_BUCKET }}
+          CONTRACT_REGION: ${{ secrets.DBX_AWS_S3_REGION || vars.DBX_AWS_S3_REGION }}
+          CONTRACT_ROLE_ARN: ${{ secrets.DBX_AWS_S3_ROLE_ARN || vars.DBX_AWS_S3_ROLE_ARN }}
+        run: |
+          missing=()
+          [[ -n "$CONTRACT_BUCKET" ]] || missing+=("DBX_AWS_S3_BUCKET")
+          [[ -n "$CONTRACT_REGION" ]] || missing+=("DBX_AWS_S3_REGION")
+          [[ -n "$CONTRACT_ROLE_ARN" ]] || missing+=("DBX_AWS_S3_ROLE_ARN")
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::AWS S3 nightly contract skipped; protected environment is missing: ${missing[*]}"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        if: steps.preflight.outputs.enabled == 'true'
+
+      - name: Install system dependencies
+        if: steps.preflight.outputs.enabled == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libsecret-1-dev jq
+
+      - name: Setup Rust
+        if: steps.preflight.outputs.enabled == 'true'
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+
+      # The role trust policy must require:
+      # sub=repo:lizhian/dbx:environment:aws-s3-contract and aud=sts.amazonaws.com.
+      # Keep its S3 policy scoped to the dedicated bucket and dbx-nightly/*,
+      # including s3:DeleteObjectVersion for permanent cleanup.
+      - name: Assume protected AWS test role
+        id: aws_auth
+        if: steps.preflight.outputs.enabled == 'true'
+        uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
+        with:
+          role-to-assume: ${{ secrets.DBX_AWS_S3_ROLE_ARN || vars.DBX_AWS_S3_ROLE_ARN }}
+          aws-region: ${{ secrets.DBX_AWS_S3_REGION || vars.DBX_AWS_S3_REGION }}
+          role-session-name: dbx-s3-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Run real AWS S3 contract
+        if: steps.preflight.outputs.enabled == 'true'
+        shell: bash
+        env:
+          DBX_AWS_S3_BUCKET: ${{ secrets.DBX_AWS_S3_BUCKET || vars.DBX_AWS_S3_BUCKET }}
+          DBX_AWS_S3_REGION: ${{ secrets.DBX_AWS_S3_REGION || vars.DBX_AWS_S3_REGION }}
+          DBX_AWS_S3_RUN_ID: ${{ github.run_id }}
+          DBX_AWS_S3_RUN_ATTEMPT: ${{ github.run_attempt }}
+          DBX_AWS_S3_RUN_NONCE: ${{ github.run_number }}
+        run: bash tests/s3-aws-contract.sh
+
+      - name: Confirm isolated-prefix cleanup
+        if: always() && steps.preflight.outputs.enabled == 'true' && steps.aws_auth.outcome == 'success'
+        shell: bash
+        env:
+          DBX_AWS_S3_BUCKET: ${{ secrets.DBX_AWS_S3_BUCKET || vars.DBX_AWS_S3_BUCKET }}
+          DBX_AWS_S3_REGION: ${{ secrets.DBX_AWS_S3_REGION || vars.DBX_AWS_S3_REGION }}
+          DBX_AWS_S3_RUN_ID: ${{ github.run_id }}
+          DBX_AWS_S3_RUN_ATTEMPT: ${{ github.run_attempt }}
+          DBX_AWS_S3_RUN_NONCE: ${{ github.run_number }}
+          DBX_AWS_S3_CLEANUP_ONLY: "true"
+        run: bash tests/s3-aws-contract.sh
+
+      - name: Report protected configuration skip
+        if: steps.preflight.outputs.enabled != 'true'
+        run: echo "The AWS S3 contract did not run because its protected configuration is unavailable."

@@ -184,26 +184,59 @@ export interface FtpFileConnectionConfig {
   username: string;
 }
 
+export interface S3FileConnectionConfig {
+  type: "s3";
+  endpoint: string;
+  region: string;
+  bucket: string;
+  root: string;
+  virtualHostStyle: boolean;
+  anonymous: boolean;
+}
+
+export type FileConnectionConfig = FtpFileConnectionConfig | S3FileConnectionConfig;
+
 export interface FileConnectionInput {
   id?: string | null;
   expectedRevision?: number | null;
   name: string;
-  config: FtpFileConnectionConfig;
-  secrets?: { password?: string | null; clearPassword?: boolean } | null;
+  config: FileConnectionConfig;
+  secrets?: {
+    password?: string | null;
+    clearPassword?: boolean;
+    accessKeyId?: string | null;
+    secretAccessKey?: string | null;
+    sessionToken?: string | null;
+    clearS3Credentials?: boolean;
+  } | null;
 }
 
 export interface FileConnection {
   id: string;
   name: string;
-  config: FtpFileConnectionConfig;
+  config: FileConnectionConfig;
   revision: number;
   createdAt: string;
   updatedAt: string;
   hasPassword: boolean;
+  hasCredentials: boolean;
+  capabilities: {
+    read: boolean;
+    write: boolean;
+    stat: boolean;
+    list: boolean;
+    createDirectory: boolean;
+    delete: boolean;
+    copy: boolean;
+    rename: boolean;
+    serverSideCopy: boolean;
+    atomicRename: boolean;
+    atomicNoClobber: boolean;
+  };
 }
 
 export interface FileConnectionTestStage {
-  stage: "configuration" | "dns" | "tcp" | "authentication" | "root";
+  stage: "configuration" | "dns" | "tcp" | "authentication" | "bucket" | "root";
   status: "passed" | "failed" | "skipped";
   message?: string | null;
 }
@@ -1408,8 +1441,8 @@ export async function createFileDirectory(connectionId: string, path: string): P
   return invoke("create_file_directory", { connectionId, path });
 }
 
-export async function deleteFileEntry(connectionId: string, path: string, recursive = false): Promise<FileMutationResult> {
-  return invoke("delete_file_entry", { connectionId, path, recursive });
+export async function deleteFileEntry(connectionId: string, path: string, recursive = false, expectedKind?: FileManagerEntry["kind"]): Promise<FileMutationResult> {
+  return invoke("delete_file_entry", { connectionId, path, recursive, expectedKind });
 }
 
 export async function startFileDownload(input: StartDownloadInput): Promise<{ transferId: string }> {

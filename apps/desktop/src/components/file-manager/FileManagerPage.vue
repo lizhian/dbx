@@ -24,12 +24,24 @@ const text = computed(() => ({
   emptyDirectory: t("fileManager.emptyDirectory"),
   name: t("fileManager.name"),
   endpoint: t("fileManager.endpoint"),
+  connectionType: t("fileManager.connectionType"),
+  ftp: "FTP",
+  s3: "S3",
+  region: t("fileManager.region"),
+  bucket: t("fileManager.bucket"),
+  accessKeyId: t("fileManager.accessKeyId"),
+  secretAccessKey: t("fileManager.secretAccessKey"),
+  sessionToken: t("fileManager.sessionToken"),
+  virtualHostStyle: t("fileManager.virtualHostStyle"),
+  anonymous: t("fileManager.anonymous"),
+  clearS3Credentials: t("fileManager.clearS3Credentials"),
   root: t("fileManager.root"),
   username: t("fileManager.username"),
   password: t("fileManager.password"),
   keepPassword: t("fileManager.keepPassword"),
   clearPassword: t("fileManager.clearPassword"),
-  security: t("fileManager.security"),
+  ftpSecurity: t("fileManager.ftpSecurity"),
+  s3Security: t("fileManager.s3Security"),
   test: t("fileManager.test"),
   save: t("common.save"),
   cancel: t("common.cancel"),
@@ -50,6 +62,7 @@ const text = computed(() => ({
     dns: "DNS",
     tcp: "TCP",
     authentication: t("fileManager.stageAuthentication"),
+    bucket: t("fileManager.bucket"),
     root: t("fileManager.root"),
   },
   type: t("fileManager.type"),
@@ -70,10 +83,13 @@ const text = computed(() => ({
   download: t("fileManager.download"),
   upload: t("fileManager.upload"),
   uploadRiskConfirm: (path: string) => t("fileManager.uploadRiskConfirm", { path }),
+  s3UploadRiskConfirm: (path: string) => t("fileManager.s3UploadRiskConfirm", { path }),
   copy: t("fileManager.copy"),
   rename: t("fileManager.rename"),
   destinationPath: t("fileManager.destinationPath"),
   copyRenameRisk: t("fileManager.copyRenameRisk"),
+  s3CopyRisk: t("fileManager.s3CopyRisk"),
+  s3RenameRisk: t("fileManager.s3RenameRisk"),
   replaceDestination: t("fileManager.replaceDestination"),
   replaceConfirm: (path: string) => t("fileManager.replaceConfirm", { path }),
   retrySourceDelete: t("fileManager.retrySourceDelete"),
@@ -131,7 +147,22 @@ const remoteDestinationPath = ref("");
 const replaceDestination = ref(false);
 const directoryPath = ref("");
 const clearPassword = ref(false);
-const form = ref({ name: "", endpoint: "ftp://localhost:21", root: "/", username: "", password: "" });
+const clearS3Credentials = ref(false);
+const form = ref({
+  type: "ftp" as "ftp" | "s3",
+  name: "",
+  endpoint: "ftp://localhost:21",
+  root: "/",
+  username: "",
+  password: "",
+  region: "us-east-1",
+  bucket: "",
+  accessKeyId: "",
+  secretAccessKey: "",
+  sessionToken: "",
+  virtualHostStyle: false,
+  anonymous: false,
+});
 let connectionsGeneration = 0;
 let rootGeneration = 0;
 let statGeneration = 0;
@@ -140,7 +171,7 @@ let unlistenTransfers: UnlistenFn | null = null;
 let transferPoll: ReturnType<typeof setInterval> | null = null;
 
 const selectedConnection = computed(() => connections.value.find((connection) => connection.id === selectedId.value));
-const canSubmit = computed(() => !!form.value.name.trim() && !!form.value.endpoint.trim() && form.value.root.startsWith("/"));
+const canSubmit = computed(() => !!form.value.name.trim() && !!form.value.endpoint.trim() && form.value.root.startsWith("/") && (form.value.type === "ftp" || (!!form.value.region.trim() && !!form.value.bucket.trim())));
 const breadcrumbs = computed(() => {
   const result = [{ label: "/", path: "" }];
   const segments = currentPath.value.split("/").filter(Boolean);
@@ -153,6 +184,32 @@ const breadcrumbs = computed(() => {
 });
 
 function inputFromForm(): FileConnectionInput {
+  if (form.value.type === "s3") {
+    const hasCredentials = !!form.value.accessKeyId || !!form.value.secretAccessKey || !!form.value.sessionToken;
+    return {
+      id: editingId.value,
+      expectedRevision: editingId.value ? selectedConnection.value?.revision : undefined,
+      name: form.value.name.trim(),
+      config: {
+        type: "s3",
+        endpoint: form.value.endpoint.trim(),
+        region: form.value.region.trim(),
+        bucket: form.value.bucket.trim(),
+        root: form.value.root.trim(),
+        virtualHostStyle: form.value.virtualHostStyle,
+        anonymous: form.value.anonymous,
+      },
+      secrets: clearS3Credentials.value
+        ? { clearS3Credentials: true }
+        : hasCredentials
+          ? {
+              accessKeyId: form.value.accessKeyId,
+              secretAccessKey: form.value.secretAccessKey,
+              sessionToken: form.value.sessionToken || undefined,
+            }
+          : undefined,
+    };
+  }
   return {
     id: editingId.value,
     expectedRevision: editingId.value ? selectedConnection.value?.revision : undefined,
@@ -290,6 +347,7 @@ async function selectConnection(id: string) {
 }
 
 async function openDirectory(path: string) {
+  path = path.replace(/\/+$/, "");
   if (path === currentPath.value) return;
   const navigation = ++navigationGeneration;
   rootGeneration += 1;
@@ -306,7 +364,7 @@ async function selectEntry(entry: FileManagerEntry) {
   statError.value = null;
   const generation = ++statGeneration;
   const connectionId = selectedId.value;
-  if (!connectionId) return;
+  if (!connectionId || selectedConnection.value?.capabilities?.stat === false) return;
   loadingStat.value = true;
   try {
     const metadata = await api.statFileEntry(connectionId, entry.path);
@@ -322,9 +380,24 @@ async function selectEntry(entry: FileManagerEntry) {
 
 function openCreate() {
   editingId.value = null;
-  form.value = { name: "", endpoint: "ftp://localhost:21", root: "/", username: "", password: "" };
+  form.value = {
+    type: "ftp",
+    name: "",
+    endpoint: "ftp://localhost:21",
+    root: "/",
+    username: "",
+    password: "",
+    region: "us-east-1",
+    bucket: "",
+    accessKeyId: "",
+    secretAccessKey: "",
+    sessionToken: "",
+    virtualHostStyle: false,
+    anonymous: false,
+  };
   testResult.value = null;
   clearPassword.value = false;
+  clearS3Credentials.value = false;
   editorOpen.value = true;
 }
 
@@ -333,14 +406,23 @@ function openEdit() {
   if (!connection) return;
   editingId.value = connection.id;
   form.value = {
+    type: connection.config.type,
     name: connection.name,
     endpoint: connection.config.endpoint,
     root: connection.config.root,
-    username: connection.config.username,
+    username: connection.config.type === "ftp" ? connection.config.username : "",
     password: "",
+    region: connection.config.type === "s3" ? connection.config.region : "us-east-1",
+    bucket: connection.config.type === "s3" ? connection.config.bucket : "",
+    accessKeyId: "",
+    secretAccessKey: "",
+    sessionToken: "",
+    virtualHostStyle: connection.config.type === "s3" && connection.config.virtualHostStyle,
+    anonymous: connection.config.type === "s3" && connection.config.anonymous,
   };
   testResult.value = null;
   clearPassword.value = false;
+  clearS3Credentials.value = false;
   editorOpen.value = true;
 }
 
@@ -418,7 +500,7 @@ async function deleteEntry() {
   if (!connectionId || !entry || mutating.value) return;
   mutating.value = true;
   try {
-    await api.deleteFileEntry(connectionId, entry.path, false);
+    await api.deleteFileEntry(connectionId, entry.path, false, entry.kind);
     entryDeleteOpen.value = false;
     pendingDeleteEntry.value = null;
     toast(text.value.operationComplete, 2000);
@@ -495,7 +577,8 @@ async function uploadFile() {
   if (typeof selected !== "string") return;
   const name = localFileName(selected);
   const remotePath = targetDirectory ? `${targetDirectory}/${name}` : name;
-  if (!globalThis.confirm(text.value.uploadRiskConfirm(remotePath))) return;
+  const uploadConfirmation = selectedConnection.value?.config.type === "s3" ? text.value.s3UploadRiskConfirm(remotePath) : text.value.uploadRiskConfirm(remotePath);
+  if (!globalThis.confirm(uploadConfirmation)) return;
   try {
     const started = await api.startFileUpload({
       connectionId,
@@ -636,7 +719,7 @@ onBeforeUnmount(() => {
         >
           <Server class="h-4 w-4 shrink-0 text-muted-foreground" />
           <span class="hidden min-w-0 flex-1 truncate sm:block">{{ connection.name }}</span>
-          <span class="hidden text-[10px] uppercase text-muted-foreground sm:inline">FTP</span>
+          <span class="hidden text-[10px] uppercase text-muted-foreground sm:inline">{{ connection.config.type }}</span>
         </button>
         <div v-if="!loadingConnections && !connections.length" class="hidden px-3 py-8 text-center text-xs text-muted-foreground sm:block">{{ text.emptyConnections }}</div>
       </div>
@@ -645,10 +728,10 @@ onBeforeUnmount(() => {
     <section class="flex min-w-0 flex-1 flex-col">
       <div class="flex h-10 items-center gap-1 border-b px-2">
         <span class="min-w-0 flex-1 truncate px-1 text-sm font-medium">{{ selectedConnection?.name ?? text.title }}</span>
-        <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="!selectedConnection || loadingEntries" :title="text.upload" :aria-label="text.upload" @click="void uploadFile()">
+        <Button v-if="selectedConnection?.capabilities?.write" variant="ghost" size="icon" class="h-7 w-7" :disabled="loadingEntries" :title="text.upload" :aria-label="text.upload" @click="void uploadFile()">
           <Upload class="h-3.5 w-3.5" />
         </Button>
-        <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="!selectedConnection || loadingEntries || mutating" :title="text.createDirectory" :aria-label="text.createDirectory" @click="openCreateDirectory">
+        <Button v-if="selectedConnection?.capabilities?.createDirectory" variant="ghost" size="icon" class="h-7 w-7" :disabled="loadingEntries || mutating" :title="text.createDirectory" :aria-label="text.createDirectory" @click="openCreateDirectory">
           <FolderPlus class="h-3.5 w-3.5" />
         </Button>
         <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="!selectedConnection || loadingEntries" :title="text.refresh" :aria-label="text.refresh" @click="void refreshDirectory()">
@@ -687,7 +770,7 @@ onBeforeUnmount(() => {
             <tbody>
               <tr
                 v-for="entry in entries"
-                :key="entry.path"
+                :key="`${entry.kind}:${entry.path}`"
                 tabindex="0"
                 class="border-b border-border/50 outline-none hover:bg-muted/40 focus-visible:bg-muted/60"
                 :class="selectedEntry?.path === entry.path ? 'bg-accent/70' : ''"
@@ -706,16 +789,16 @@ onBeforeUnmount(() => {
                 <td class="hidden px-3 py-2 text-right font-mono text-xs text-muted-foreground sm:table-cell">{{ entry.kind === "file" ? formatSize(entry.size) : "" }}</td>
                 <td class="hidden truncate px-3 py-2 text-xs text-muted-foreground lg:table-cell">{{ entry.lastModified ? new Date(entry.lastModified).toLocaleString() : "" }}</td>
                 <td class="px-2 py-1 text-right">
-                  <Button v-if="entry.kind === 'file'" size="icon" variant="ghost" class="h-7 w-7" :title="text.download" :aria-label="`${text.download}: ${entry.name}`" @click.stop="void downloadEntry(entry)">
+                  <Button v-if="entry.kind === 'file' && selectedConnection?.capabilities?.read" size="icon" variant="ghost" class="h-7 w-7" :title="text.download" :aria-label="`${text.download}: ${entry.name}`" @click.stop="void downloadEntry(entry)">
                     <Download class="h-3.5 w-3.5" />
                   </Button>
-                  <Button v-if="entry.kind === 'file'" size="icon" variant="ghost" class="h-7 w-7" :title="text.copy" :aria-label="`${text.copy}: ${entry.name}`" @click.stop="openRemoteOperation(entry, 'copy')">
+                  <Button v-if="entry.kind === 'file' && selectedConnection?.capabilities?.copy" size="icon" variant="ghost" class="h-7 w-7" :title="text.copy" :aria-label="`${text.copy}: ${entry.name}`" @click.stop="openRemoteOperation(entry, 'copy')">
                     <Copy class="h-3.5 w-3.5" />
                   </Button>
-                  <Button v-if="entry.kind === 'file'" size="icon" variant="ghost" class="h-7 w-7" :title="text.rename" :aria-label="`${text.rename}: ${entry.name}`" @click.stop="openRemoteOperation(entry, 'rename')">
+                  <Button v-if="entry.kind === 'file' && selectedConnection?.capabilities?.rename" size="icon" variant="ghost" class="h-7 w-7" :title="text.rename" :aria-label="`${text.rename}: ${entry.name}`" @click.stop="openRemoteOperation(entry, 'rename')">
                     <FilePenLine class="h-3.5 w-3.5" />
                   </Button>
-                  <Button variant="ghost" size="icon" class="h-7 w-7 text-destructive hover:text-destructive" :disabled="mutating" :title="text.deleteEntry" :aria-label="`${text.deleteEntry}: ${entry.name}`" @click.stop="openDeleteEntry(entry)">
+                  <Button v-if="selectedConnection?.capabilities?.delete" variant="ghost" size="icon" class="h-7 w-7 text-destructive hover:text-destructive" :disabled="mutating" :title="text.deleteEntry" :aria-label="`${text.deleteEntry}: ${entry.name}`" @click.stop="openDeleteEntry(entry)">
                     <Trash2 class="h-3.5 w-3.5" />
                   </Button>
                 </td>
@@ -835,19 +918,34 @@ onBeforeUnmount(() => {
       <div class="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
         <div class="flex gap-2">
           <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
-          <span>{{ text.security }}</span>
+          <span>{{ form.type === "ftp" ? text.ftpSecurity : text.s3Security }}</span>
         </div>
       </div>
       <div class="grid gap-3 py-1">
+        <div class="grid gap-1.5">
+          <Label for="file-connection-type">{{ text.connectionType }}</Label>
+          <select
+            id="file-connection-type"
+            v-model="form.type"
+            class="h-9 rounded-md border border-input bg-background px-3 text-sm"
+            @change="
+              form.endpoint = form.type === 'ftp' ? 'ftp://localhost:21' : 'http://localhost:9000';
+              testResult = null;
+            "
+          >
+            <option value="ftp">{{ text.ftp }}</option>
+            <option value="s3">{{ text.s3 }}</option>
+          </select>
+        </div>
         <div class="grid gap-1.5">
           <Label for="file-connection-name">{{ text.name }}</Label
           ><Input id="file-connection-name" v-model="form.name" />
         </div>
         <div class="grid gap-1.5">
           <Label for="file-connection-endpoint">{{ text.endpoint }}</Label
-          ><Input id="file-connection-endpoint" v-model="form.endpoint" placeholder="ftp://host:21" />
+          ><Input id="file-connection-endpoint" v-model="form.endpoint" :placeholder="form.type === 'ftp' ? 'ftp://host:21' : 'https://s3.example.com'" />
         </div>
-        <div class="grid grid-cols-2 gap-3">
+        <div v-if="form.type === 'ftp'" class="grid grid-cols-2 gap-3">
           <div class="grid gap-1.5">
             <Label for="file-connection-root">{{ text.root }}</Label
             ><Input id="file-connection-root" v-model="form.root" placeholder="/" />
@@ -857,7 +955,7 @@ onBeforeUnmount(() => {
             ><Input id="file-connection-username" v-model="form.username" />
           </div>
         </div>
-        <div class="grid gap-1.5">
+        <div v-if="form.type === 'ftp'" class="grid gap-1.5">
           <Label for="file-connection-password">{{ text.password }}</Label>
           <PasswordInput id="file-connection-password" v-model="form.password" :disabled="clearPassword" :placeholder="editingId ? text.keepPassword : ''" />
           <label v-if="editingId && selectedConnection?.hasPassword" class="flex items-center gap-2 text-xs text-muted-foreground">
@@ -865,6 +963,59 @@ onBeforeUnmount(() => {
             <span>{{ text.clearPassword }}</span>
           </label>
         </div>
+        <template v-else>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="grid gap-1.5">
+              <Label for="file-connection-region">{{ text.region }}</Label>
+              <Input id="file-connection-region" v-model="form.region" placeholder="us-east-1" />
+            </div>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-bucket">{{ text.bucket }}</Label>
+              <Input id="file-connection-bucket" v-model="form.bucket" />
+            </div>
+          </div>
+          <div class="grid gap-1.5">
+            <Label for="file-connection-s3-root">{{ text.root }}</Label>
+            <Input id="file-connection-s3-root" v-model="form.root" placeholder="/" />
+          </div>
+          <label class="flex items-center gap-2 text-xs text-muted-foreground">
+            <input v-model="form.virtualHostStyle" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+            <span>{{ text.virtualHostStyle }}</span>
+          </label>
+          <label class="flex items-center gap-2 text-xs text-muted-foreground">
+            <input v-model="form.anonymous" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+            <span>{{ text.anonymous }}</span>
+          </label>
+          <div v-if="!form.anonymous" class="grid gap-3">
+            <div class="grid gap-1.5">
+              <Label for="file-connection-access-key">{{ text.accessKeyId }}</Label>
+              <PasswordInput id="file-connection-access-key" v-model="form.accessKeyId" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+            </div>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-secret-key">{{ text.secretAccessKey }}</Label>
+              <PasswordInput id="file-connection-secret-key" v-model="form.secretAccessKey" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+            </div>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-session-token">{{ text.sessionToken }}</Label>
+              <PasswordInput id="file-connection-session-token" v-model="form.sessionToken" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+            </div>
+            <label v-if="editingId && selectedConnection?.hasCredentials" class="flex items-center gap-2 text-xs text-muted-foreground">
+              <input
+                v-model="clearS3Credentials"
+                type="checkbox"
+                class="h-3.5 w-3.5 accent-primary"
+                @change="
+                  if (clearS3Credentials) {
+                    form.accessKeyId = '';
+                    form.secretAccessKey = '';
+                    form.sessionToken = '';
+                  }
+                "
+              />
+              <span>{{ text.clearS3Credentials }}</span>
+            </label>
+          </div>
+        </template>
       </div>
       <div v-if="testResult" class="space-y-1 rounded border p-2">
         <div v-for="stage in testResult.stages" :key="stage.stage" class="flex min-w-0 items-start gap-2 text-xs">
@@ -915,7 +1066,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="flex gap-2 rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
           <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
-          <span>{{ text.copyRenameRisk }}</span>
+          <span>{{ selectedConnection?.config.type === "s3" ? (remoteOperation === "copy" ? text.s3CopyRisk : text.s3RenameRisk) : text.copyRenameRisk }}</span>
         </div>
         <label class="flex items-center gap-2 text-sm">
           <input v-model="replaceDestination" type="checkbox" class="h-4 w-4 accent-primary" />
