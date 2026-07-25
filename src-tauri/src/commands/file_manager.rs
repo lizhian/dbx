@@ -39,6 +39,12 @@ use super::file_manager_webdav::{
     validate_config as validate_webdav_config, WebdavMutationError,
 };
 pub use super::file_manager_webdav::{WebdavAuthentication, WebdavConnectionConfig};
+use super::file_manager_webhdfs::{
+    build_direct_adapter as build_webhdfs_direct_adapter, build_operator as build_webhdfs_operator,
+    capabilities as webhdfs_capabilities, normalize_config as normalize_webhdfs_config,
+    test_connection as test_webhdfs_connection, validate_config as validate_webhdfs_config, WebhdfsAuthentication,
+    WebhdfsConnectionConfig, WebhdfsMutationError, WebhdfsStreamingWriter,
+};
 use dbx_core::connection::AppState;
 use dbx_core::storage::{FileConnectionStorageRecord, FileTransferStorageRecord};
 use futures::StreamExt;
@@ -166,6 +172,7 @@ pub(super) struct PreparedFileOperation {
     secrets: ResolvedFileSecrets,
     is_sftp: bool,
     is_hdfs_native: bool,
+    is_webhdfs: bool,
     _sftp_key_material: Option<Arc<SftpKeyMaterial>>,
     _lease: OperationLease,
 }
@@ -291,6 +298,7 @@ pub enum FileConnectionConfig {
 #[serde(tag = "implementation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum HdfsConnectionConfig {
     Native(HdfsNativeConnectionConfig),
+    Webhdfs(WebhdfsConnectionConfig),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -320,6 +328,9 @@ pub struct FileConnectionSecrets {
     pub sftp_private_key_passphrase: Option<String>,
     #[serde(default)]
     pub clear_sftp_credentials: Option<bool>,
+    pub webhdfs_delegation_token: Option<String>,
+    #[serde(default)]
+    pub clear_webhdfs_credentials: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -371,6 +382,7 @@ pub(super) struct ResolvedFileSecrets {
     pub(super) webdav_token: Option<String>,
     pub(super) sftp_private_key: Option<String>,
     pub(super) sftp_private_key_passphrase: Option<String>,
+    pub(super) webhdfs_delegation_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -451,6 +463,10 @@ pub async fn save_file_connection(
     let record = run_mutation_operation(&cancellation, "Save connection", async {
         let _mutation_guard = lease.entry.mutation_lock.lock().await;
         cancellation.ensure_active()?;
+        if let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) = &input.config {
+            let resolved = resolve_input_secrets(state.inner().as_ref(), &input).await?;
+            validate_webhdfs_config(config, true, resolved.webhdfs_delegation_token.as_deref())?;
+        }
         let record = match &input.config {
             FileConnectionConfig::Ftp(_) => {
                 let password = input.secrets.as_ref().and_then(|secrets| secrets.password.clone());
@@ -475,6 +491,8 @@ pub async fn save_file_connection(
                             "sftp_private_key".to_string(),
                             "sftp_private_key_passphrase".to_string(),
                             "sftp_scope".to_string(),
+                            "webhdfs_delegation_token".to_string(),
+                            "webhdfs_scope".to_string(),
                         ],
                         "password_scope".to_string(),
                         password_scope(&input.config)?,
@@ -519,6 +537,8 @@ pub async fn save_file_connection(
                             "webdav_scope".to_string(),
                             "sftp_private_key".to_string(),
                             "sftp_private_key_passphrase".to_string(),
+                            "webhdfs_delegation_token".to_string(),
+                            "webhdfs_scope".to_string(),
                         ],
                         "sftp_scope".to_string(),
                         password_scope(&input.config)?,
@@ -570,6 +590,8 @@ pub async fn save_file_connection(
                             "sftp_private_key".to_string(),
                             "sftp_private_key_passphrase".to_string(),
                             "sftp_scope".to_string(),
+                            "webhdfs_delegation_token".to_string(),
+                            "webhdfs_scope".to_string(),
                         ],
                         "s3_scope".to_string(),
                         password_scope(&input.config)?,
@@ -612,6 +634,8 @@ pub async fn save_file_connection(
                             "sftp_private_key".to_string(),
                             "sftp_private_key_passphrase".to_string(),
                             "sftp_scope".to_string(),
+                            "webhdfs_delegation_token".to_string(),
+                            "webhdfs_scope".to_string(),
                         ],
                         "webdav_scope".to_string(),
                         password_scope(&input.config)?,
@@ -620,7 +644,52 @@ pub async fn save_file_connection(
                     )
                     .await?
             }
-            FileConnectionConfig::Hdfs(_) => {
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+                let supplied = input.secrets.as_ref();
+                let clear = supplied.is_some_and(|secrets| secrets.clear_webhdfs_credentials == Some(true));
+                let replace_secrets = clear
+                    || config.authentication != WebhdfsAuthentication::Delegation
+                    || supplied.is_some_and(|secrets| secrets.webhdfs_delegation_token.is_some());
+                let values = if !clear && config.authentication == WebhdfsAuthentication::Delegation {
+                    supplied
+                        .and_then(|secrets| secrets.webhdfs_delegation_token.clone())
+                        .into_iter()
+                        .map(|value| ("webhdfs_delegation_token".to_string(), value))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                state
+                    .storage
+                    .save_file_connection_with_secret_bundle(
+                        id.clone(),
+                        input.name.trim().to_string(),
+                        config_kind(&input.config).to_string(),
+                        config_json,
+                        values,
+                        vec![
+                            "password".to_string(),
+                            "password_scope".to_string(),
+                            "access_key_id".to_string(),
+                            "secret_access_key".to_string(),
+                            "session_token".to_string(),
+                            "s3_scope".to_string(),
+                            "webdav_token".to_string(),
+                            "webdav_scope".to_string(),
+                            "sftp_private_key".to_string(),
+                            "sftp_private_key_passphrase".to_string(),
+                            "sftp_scope".to_string(),
+                            "webhdfs_delegation_token".to_string(),
+                            "webhdfs_scope".to_string(),
+                        ],
+                        "webhdfs_scope".to_string(),
+                        password_scope(&input.config)?,
+                        replace_secrets,
+                        input.expected_revision,
+                    )
+                    .await?
+            }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
                 state
                     .storage
                     .save_file_connection_with_secret_bundle(
@@ -641,6 +710,8 @@ pub async fn save_file_connection(
                             "sftp_private_key".to_string(),
                             "sftp_private_key_passphrase".to_string(),
                             "sftp_scope".to_string(),
+                            "webhdfs_delegation_token".to_string(),
+                            "webhdfs_scope".to_string(),
                         ],
                         "password_scope".to_string(),
                         password_scope(&input.config)?,
@@ -1028,6 +1099,7 @@ impl FileManagerRuntime {
             cancellation: lease.cancellation(),
             is_sftp: matches!(config, FileConnectionConfig::Sftp(_)),
             is_hdfs_native: matches!(config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))),
+            is_webhdfs: matches!(config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_))),
             secrets,
             _sftp_key_material: built.sftp_key_material,
             _lease: lease,
@@ -1140,6 +1212,14 @@ impl FileManagerRuntime {
                 let target_size = s3_file_size_if_exists(&built.operator, &target, &secrets).await?;
                 Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
             }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => {
+                let built = build_operator_with_secrets(&config, &secrets)?;
+                let source = configured_entry_path(&config, partial.as_str(), false);
+                let target = configured_entry_path(&config, target.as_str(), false);
+                let source_size = file_size_if_exists(&built.operator, &source, &secrets).await?;
+                let target_size = file_size_if_exists(&built.operator, &target, &secrets).await?;
+                Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
+            }
             FileConnectionConfig::Sftp(_) => {
                 let built = build_operator_with_secrets(&config, &secrets)?;
                 let path_guard = built.sftp_path_guard.as_ref().expect("SFTP operator has a path guard");
@@ -1242,6 +1322,10 @@ impl Drop for PreparedFileMutation<'_> {
 }
 
 impl PreparedFileOperation {
+    pub(super) fn uses_streaming_webhdfs_read(&self) -> bool {
+        self.is_webhdfs
+    }
+
     pub(super) fn redact_remote_error(&self, message: String) -> String {
         let message = redact_secrets(message, &self.secrets);
         if self.is_sftp && !message.starts_with("Sftp") {
@@ -1328,6 +1412,10 @@ impl PreparedFileMutation<'_> {
                 let adapter = build_hdfs_native_direct_adapter(config)?;
                 adapter.delete_owned_file_if_exists(path.as_str()).await
             }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+                let adapter = build_webhdfs_direct_adapter(config, &self.secrets)?;
+                adapter.delete_owned_file_if_exists(path.as_str()).await
+            }
             FileConnectionConfig::Sftp(_) | FileConnectionConfig::Webdav(_) => {
                 let configured = self.configured_path(path.as_str())?;
                 match self.operator.stat(&configured).await {
@@ -1374,11 +1462,33 @@ impl PreparedFileMutation<'_> {
                     .map_err(|error| self.redact_operator_error(error))?;
                 Ok(())
             }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+                let adapter = build_webhdfs_direct_adapter(config, &self.secrets)?;
+                let mut writer =
+                    adapter.open_streaming_write(path.as_str(), 0, Arc::new(AtomicBool::new(false))).await?;
+                writer.close().await
+            }
         }
     }
 
     pub(super) fn uses_streaming_webdav_upload(&self) -> bool {
         matches!(self.config, FileConnectionConfig::Webdav(_))
+    }
+
+    pub(super) fn uses_streaming_webhdfs_upload(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)))
+    }
+
+    pub(super) async fn open_webhdfs_streaming_writer(
+        &self,
+        path: &str,
+        size: u64,
+        dispatch_started: Arc<AtomicBool>,
+    ) -> Result<WebhdfsStreamingWriter, String> {
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) = &self.config else {
+            return Err("WebHDFS streaming writer received an incompatible connection".to_string());
+        };
+        build_webhdfs_direct_adapter(config, &self.secrets)?.open_streaming_write(path, size, dispatch_started).await
     }
 
     pub(super) async fn put_webdav_upload_partial(
@@ -1440,6 +1550,18 @@ impl PreparedFileMutation<'_> {
         if matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))) {
             return self
                 .publish_hdfs_native_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    false,
+                    "Upload publish",
+                    transfer_cancellation,
+                )
+                .await;
+        }
+        if matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_))) {
+            return self
+                .publish_webhdfs_owned_partial(
                     &partial,
                     &target,
                     expected_size,
@@ -1551,7 +1673,8 @@ impl PreparedFileMutation<'_> {
             FileConnectionConfig::Sftp(_)
             | FileConnectionConfig::S3(_)
             | FileConnectionConfig::Webdav(_)
-            | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
+            | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))
+            | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => {
                 let configured = self.configured_path(path.as_str())?;
                 match self.operator.stat(&configured).await {
                     Ok(metadata) if metadata.mode().is_file() => Ok(remote_fingerprint_from_metadata(&metadata)),
@@ -1584,12 +1707,31 @@ impl PreparedFileMutation<'_> {
         protocol_requires_append_streaming_write(&self.config)
     }
 
+    pub(super) fn transfer_chunk_size(&self, default_size: usize) -> usize {
+        match &self.config {
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+                config.chunk_size_mib as usize * 1024 * 1024
+            }
+            _ => default_size,
+        }
+    }
+
+    pub(super) fn transfer_idle_timeout(&self, default_timeout: Duration) -> Duration {
+        match &self.config {
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+                Duration::from_secs(config.idle_timeout_seconds)
+            }
+            _ => default_timeout,
+        }
+    }
+
     pub(super) fn uses_native_rename(&self) -> bool {
         matches!(
             self.config,
             FileConnectionConfig::Sftp(_)
                 | FileConnectionConfig::Webdav(_)
                 | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))
+                | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_))
         )
     }
 
@@ -1601,29 +1743,42 @@ impl PreparedFileMutation<'_> {
         matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)))
     }
 
-    pub(super) fn evict_uncertain_hdfs_native_rename(&self) {
-        if self.uses_direct_hdfs_native_rename() {
+    pub(super) fn uses_direct_webhdfs_rename(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)))
+    }
+
+    pub(super) fn evict_uncertain_direct_rename(&self) {
+        if self.uses_direct_hdfs_native_rename() || self.uses_direct_webhdfs_rename() {
             self.runtime.evict_revision(&self.connection_id, self.revision);
         }
     }
 
-    pub(super) async fn observe_uncertain_hdfs_native_rename_fresh(
+    pub(super) async fn observe_uncertain_direct_rename_fresh(
         &self,
         source_path: &str,
         destination_path: &str,
         timeout: Duration,
     ) -> Result<(Result<RemoteFileFingerprint, String>, Result<RemoteFileFingerprint, String>), String> {
-        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) = &self.config else {
-            return Err("Fresh HDFS Native reconciliation received an incompatible connection".to_string());
-        };
         let source = self.configured_path(source_path)?;
         let destination = self.configured_path(destination_path)?;
-        let (operator, _) = build_hdfs_native_operator(config)?;
-        let (source, destination) = tokio::join!(
-            fresh_hdfs_native_fingerprint(&operator, &source, timeout),
-            fresh_hdfs_native_fingerprint(&operator, &destination, timeout),
-        );
-        Ok((source, destination))
+        let observations = match &self.config {
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => {
+                let operator = build_hdfs_native_operator(config)?.0;
+                tokio::join!(
+                    fresh_hdfs_native_fingerprint(&operator, &source, timeout),
+                    fresh_hdfs_native_fingerprint(&operator, &destination, timeout),
+                )
+            }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+                let operator = build_webhdfs_operator(config, &self.secrets)?;
+                tokio::join!(
+                    fresh_webhdfs_fingerprint(&operator, &source, timeout, &self.secrets),
+                    fresh_webhdfs_fingerprint(&operator, &destination, timeout, &self.secrets),
+                )
+            }
+            _ => return Err("Fresh direct rename reconciliation received an incompatible connection".to_string()),
+        };
+        Ok(observations)
     }
 
     pub(super) fn native_rename_destination_matches(
@@ -1631,7 +1786,8 @@ impl PreparedFileMutation<'_> {
         source: &RemoteFileFingerprint,
         destination: &RemoteFileFingerprint,
     ) -> bool {
-        if self.uses_native_sftp_rename() || self.uses_direct_hdfs_native_rename() {
+        if self.uses_native_sftp_rename() || self.uses_direct_hdfs_native_rename() || self.uses_direct_webhdfs_rename()
+        {
             source == destination
         } else {
             source.size == destination.size
@@ -1652,7 +1808,10 @@ impl PreparedFileMutation<'_> {
         destination_path: &str,
         replace: bool,
     ) -> Result<RemoteFileFingerprint, String> {
-        if !self.uses_native_sftp_rename() && !self.uses_direct_hdfs_native_rename() {
+        if !self.uses_native_sftp_rename()
+            && !self.uses_direct_hdfs_native_rename()
+            && !self.uses_direct_webhdfs_rename()
+        {
             return Err("Native filesystem rename received an incompatible connection".to_string());
         }
         self.guard_existing_path(source_path).await?;
@@ -1663,7 +1822,7 @@ impl PreparedFileMutation<'_> {
         if !metadata.mode().is_file() {
             return Err("Unsupported: directory copy and rename are not available in v1".to_string());
         }
-        if !replace {
+        if !replace || self.uses_direct_webhdfs_rename() {
             match self.operator.stat(&destination).await {
                 Ok(_) => {
                     return Err(
@@ -1683,7 +1842,8 @@ impl PreparedFileMutation<'_> {
         destination_path: &str,
         replace: bool,
     ) -> Result<(), String> {
-        if self.uses_native_sftp_rename() || self.uses_direct_hdfs_native_rename() {
+        if self.uses_native_sftp_rename() || self.uses_direct_hdfs_native_rename() || self.uses_direct_webhdfs_rename()
+        {
             self.preflight_native_sftp_rename(source_path, destination_path, replace).await.map(|_| ())
         } else {
             self.preflight_native_webdav_mutation(source_path, destination_path, replace).await
@@ -1728,6 +1888,16 @@ impl PreparedFileMutation<'_> {
                 .rename(source_path, destination_path, replace)
                 .await
                 .map_err(|error| NativeRenameError { message: error.message, outcome_unknown: error.outcome_unknown })
+        } else if self.uses_direct_webhdfs_rename() {
+            let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) = &self.config else {
+                unreachable!()
+            };
+            let adapter = build_webhdfs_direct_adapter(config, &self.secrets)
+                .map_err(|message| NativeRenameError { message, outcome_unknown: false })?;
+            adapter.rename(source_path, destination_path, dispatch_started).await.map_err(|error| {
+                let outcome_unknown = error.is_outcome_unknown();
+                NativeRenameError { message: self.redact_remote_error(error.message), outcome_unknown }
+            })
         } else {
             self.dispatch_native_webdav_rename(source_path, destination_path, dispatch_started).await.map_err(|error| {
                 NativeRenameError { outcome_unknown: error.is_outcome_unknown(), message: error.message }
@@ -1838,6 +2008,18 @@ impl PreparedFileMutation<'_> {
         if matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))) {
             return self
                 .publish_hdfs_native_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    replace,
+                    "Remote copy publish",
+                    transfer_cancellation,
+                )
+                .await;
+        }
+        if matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_))) {
+            return self
+                .publish_webhdfs_owned_partial(
                     &partial,
                     &target,
                     expected_size,
@@ -1996,6 +2178,9 @@ impl PreparedFileMutation<'_> {
             FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
                 Err("HDFS Native rename must use the direct rename2 adapter".to_string())
             }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => {
+                Err("WebHDFS rename must use the direct REST adapter".to_string())
+            }
         }
     }
 
@@ -2077,7 +2262,7 @@ impl PreparedFileMutation<'_> {
                     detail: format!("{operation} completed with native WebDAV MOVE"),
                 })
             }
-            Ok(Err(error)) if !error.is_outcome_unknown() => Err(error.message),
+            Ok(Err(error)) if !error.is_outcome_unknown() => Err(self.redact_remote_error(error.message)),
             Ok(Err(error)) => {
                 self.reconcile_uncertain_webdav_move(&partial_path, &target_path, expected_size, error.message).await
             }
@@ -2355,6 +2540,131 @@ impl PreparedFileMutation<'_> {
                 .await
             }
         }
+    }
+
+    async fn publish_webhdfs_owned_partial(
+        &self,
+        partial: &RemotePath,
+        target: &RemotePath,
+        expected_size: usize,
+        replace: bool,
+        operation: &str,
+        transfer_cancellation: &CancellationToken,
+    ) -> Result<UploadPublishResolution, String> {
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) = &self.config else {
+            return Err("WebHDFS publish received an incompatible connection".to_string());
+        };
+        let partial_path = self.configured_path(partial.as_str())?;
+        let target_path = self.configured_path(target.as_str())?;
+        let partial_metadata =
+            self.operator.stat(&partial_path).await.map_err(|error| self.redact_operator_error(error))?;
+        if !partial_metadata.mode().is_file() || partial_metadata.content_length() != expected_size as u64 {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} WebHDFS partial is missing or changed"),
+            });
+        }
+        if self.operator.exists(&target_path).await.map_err(|error| self.redact_operator_error(error))? {
+            return Err(if replace {
+                format!("{operation} cannot safely replace an existing WebHDFS destination; no data was changed")
+            } else {
+                format!("{operation} destination already exists")
+            });
+        }
+        if transfer_cancellation.is_cancelled() || self.cancellation.is_cancelled() {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} was cancelled before WebHDFS RENAME dispatch"),
+            });
+        }
+        let adapter = build_webhdfs_direct_adapter(config, &self.secrets)?;
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let rename = adapter.rename(partial.as_str(), target.as_str(), dispatched.clone());
+        tokio::pin!(rename);
+        let result: Result<Result<(), WebhdfsMutationError>, &'static str> = tokio::select! {
+            biased;
+            result = tokio::time::timeout(MUTATION_TIMEOUT, &mut rename) => {
+                result.map_err(|_| "timed out")
+            },
+            _ = transfer_cancellation.cancelled() => Err("was cancelled"),
+            _ = self.cancellation.cancelled() => Err("connection was removed"),
+        };
+        match result {
+            Ok(Ok(())) => {
+                let target_metadata =
+                    self.operator.stat(&target_path).await.map_err(|error| self.redact_operator_error(error))?;
+                match self.operator.stat(&partial_path).await {
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Ok(UploadPublishResolution {
+                            state: UploadPublishState::Unknown,
+                            detail: format!("{operation} RENAME returned success but the source remains"),
+                        });
+                    }
+                    Err(error) => return Err(self.redact_operator_error(error)),
+                }
+                if target_metadata.mode().is_file() && target_metadata.content_length() == expected_size as u64 {
+                    Ok(UploadPublishResolution {
+                        state: UploadPublishState::Completed,
+                        detail: format!("{operation} completed with WebHDFS REST RENAME"),
+                    })
+                } else {
+                    Ok(UploadPublishResolution {
+                        state: UploadPublishState::PartialTarget,
+                        detail: format!("{operation} returned success but destination verification failed"),
+                    })
+                }
+            }
+            Ok(Err(error)) if !error.is_outcome_unknown() => Err(error.message),
+            Ok(Err(error)) => {
+                self.reconcile_webhdfs_publish(
+                    config,
+                    partial.as_str(),
+                    target.as_str(),
+                    expected_size,
+                    format!("{operation} response was uncertain: {}", self.redact_remote_error(error.message)),
+                    true,
+                )
+                .await
+            }
+            Err(reason) if !dispatched.load(Ordering::Acquire) => Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} {reason} before WebHDFS RENAME dispatch"),
+            }),
+            Err(reason) => {
+                self.reconcile_webhdfs_publish(
+                    config,
+                    partial.as_str(),
+                    target.as_str(),
+                    expected_size,
+                    format!("{operation} {reason} after WebHDFS RENAME dispatch"),
+                    true,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reconcile_webhdfs_publish(
+        &self,
+        config: &WebhdfsConnectionConfig,
+        partial: &str,
+        target: &str,
+        expected_size: usize,
+        detail: String,
+        outcome_unknown: bool,
+    ) -> Result<UploadPublishResolution, String> {
+        let fresh = build_webhdfs_operator(config, &self.secrets)?;
+        let source_path = configured_entry_path(&self.config, partial, false);
+        let target_path = configured_entry_path(&self.config, target, false);
+        let source_size = file_size_if_exists(&fresh, &source_path, &self.secrets).await?;
+        let target_size = file_size_if_exists(&fresh, &target_path, &self.secrets).await?;
+        let mut resolution = resolve_upload_publish_observation(source_size, target_size, expected_size, detail);
+        if outcome_unknown && resolution.state == UploadPublishState::PartialSource {
+            resolution.state = UploadPublishState::Unknown;
+            resolution.detail.push_str("; the dispatched WebHDFS RENAME may still commit, so the source was preserved");
+        }
+        Ok(resolution)
     }
 
     async fn reconcile_hdfs_native_publish(
@@ -2752,7 +3062,22 @@ async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) ->
                 });
             }
         }
-        FileConnectionConfig::Hdfs(_) => return Ok(ResolvedFileSecrets::default()),
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+            if config.authentication != WebhdfsAuthentication::Delegation
+                || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_webhdfs_credentials == Some(true))
+            {
+                return Ok(ResolvedFileSecrets::default());
+            }
+            if let Some(token) = input.secrets.as_ref().and_then(|secrets| secrets.webhdfs_delegation_token.clone()) {
+                return Ok(ResolvedFileSecrets {
+                    webhdfs_delegation_token: Some(token),
+                    ..ResolvedFileSecrets::default()
+                });
+            }
+        }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
+            return Ok(ResolvedFileSecrets::default());
+        }
     }
 
     let Some(id) = input.id.as_deref() else {
@@ -2806,13 +3131,10 @@ async fn load_file_connection_secrets(
                 return Err("Stored S3 credentials do not match this endpoint and bucket; re-enter them".to_string());
             }
             Ok(ResolvedFileSecrets {
-                password: None,
                 access_key_id,
                 secret_access_key,
                 session_token,
-                webdav_token: None,
-                sftp_private_key: None,
-                sftp_private_key_passphrase: None,
+                ..ResolvedFileSecrets::default()
             })
         }
         FileConnectionConfig::Webdav(_) => {
@@ -2828,7 +3150,16 @@ async fn load_file_connection_secrets(
             }
             Ok(ResolvedFileSecrets { password, webdav_token, ..ResolvedFileSecrets::default() })
         }
-        FileConnectionConfig::Hdfs(_) => Ok(ResolvedFileSecrets::default()),
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => {
+            let stored_scope = storage.load_file_connection_secret(id, "webhdfs_scope").await?;
+            let webhdfs_delegation_token = storage.load_file_connection_secret(id, "webhdfs_delegation_token").await?;
+            if webhdfs_delegation_token.is_some() && stored_scope.as_deref() != Some(password_scope(config)?.as_str()) {
+                return Err("Stored WebHDFS delegation token does not match this endpoint and identity; re-enter it"
+                    .to_string());
+            }
+            Ok(ResolvedFileSecrets { webhdfs_delegation_token, ..ResolvedFileSecrets::default() })
+        }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => Ok(ResolvedFileSecrets::default()),
     }
 }
 
@@ -2978,6 +3309,27 @@ async fn delete_entry(
             let adapter = build_hdfs_native_direct_adapter(config)?;
             delete_hdfs_native_entry(&adapter, path, expected_kind).await
         }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+            let operator = build_webhdfs_operator(config, secrets)?;
+            let configured = configured_entry_path(
+                &FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config.clone())),
+                path.as_str(),
+                expected_kind == Some("directory"),
+            );
+            let metadata =
+                operator.stat(&configured).await.map_err(|error| redact_secrets(error.to_string(), secrets))?;
+            if expected_kind == Some("file") && !metadata.mode().is_file() {
+                return Err("WebHDFS entry kind changed before deletion".to_string());
+            }
+            if expected_kind == Some("directory") && !metadata.mode().is_dir() {
+                return Err("WebHDFS entry kind changed before deletion".to_string());
+            }
+            build_webhdfs_direct_adapter(config, secrets)?
+                .delete_entry(path.as_str())
+                .await
+                .map_err(|error| redact_secrets(error, secrets))?;
+            Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
+        }
     }
 }
 
@@ -3027,6 +3379,17 @@ async fn create_directory_entry(
                     operator.create_dir(&directory).await.map_err(|error| classify_hdfs_native_opendal_error(&error))
                 }
                 Err(error) => Err(classify_hdfs_native_opendal_error(&error)),
+            }
+        }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+            let operator = build_webhdfs_operator(config, secrets)?;
+            let directory = format!("{}/", path.as_str().trim_end_matches('/'));
+            match operator.stat(&directory).await {
+                Ok(_) => Err("WebHDFS destination already exists".to_string()),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    operator.create_dir(&directory).await.map_err(|error| redact_secrets(error.to_string(), secrets))
+                }
+                Err(error) => Err(redact_secrets(error.to_string(), secrets)),
             }
         }
     }
@@ -3795,6 +4158,15 @@ async fn test_connection_for_input(
                     .collect(),
             },
         },
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => match validate_input(input) {
+            Ok(()) => test_webhdfs_connection(config, &secrets).await,
+            Err(error) => FileConnectionTestResult {
+                success: false,
+                stages: std::iter::once(failed_stage("configuration", error))
+                    .chain(["dns", "tcp", "namenode", "root", "datanode"].into_iter().map(skipped_stage))
+                    .collect(),
+            },
+        },
     }
 }
 
@@ -3818,6 +4190,13 @@ async fn verify_ftp_root_read_only(config: &FileConnectionConfig, password: Opti
 fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
     if input.name.trim().is_empty() {
         return Err("Connection name is required".to_string());
+    }
+    if !matches!(input.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)))
+        && input.secrets.as_ref().is_some_and(|secrets| {
+            secrets.webhdfs_delegation_token.is_some() || secrets.clear_webhdfs_credentials.is_some()
+        })
+    {
+        return Err("Only WebHDFS connections accept delegation-token secret fields".to_string());
     }
     match &input.config {
         FileConnectionConfig::Ftp(config) => {
@@ -3997,6 +4376,46 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
             }
             validate_hdfs_native_config(config)
         }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+            let supplied = input.secrets.as_ref();
+            if supplied.is_some_and(|secrets| {
+                secrets.password.is_some()
+                    || secrets.clear_password.is_some()
+                    || secrets.access_key_id.is_some()
+                    || secrets.secret_access_key.is_some()
+                    || secrets.session_token.is_some()
+                    || secrets.clear_s3_credentials.is_some()
+                    || secrets.webdav_token.is_some()
+                    || secrets.clear_webdav_credentials.is_some()
+                    || secrets.sftp_private_key.is_some()
+                    || secrets.sftp_private_key_passphrase.is_some()
+                    || secrets.clear_sftp_credentials.is_some()
+            }) {
+                return Err("WebHDFS connections only accept delegation-token secret fields".to_string());
+            }
+            if supplied.is_some_and(|secrets| {
+                secrets.clear_webhdfs_credentials == Some(true) && secrets.webhdfs_delegation_token.is_some()
+            }) {
+                return Err("clearWebhdfsCredentials=true cannot be combined with a delegation token".to_string());
+            }
+            if supplied.and_then(|secrets| secrets.webhdfs_delegation_token.as_deref()) == Some("") {
+                return Err(
+                    "WebHDFS delegation token cannot be empty; omit it to preserve the saved token or clear it explicitly"
+                        .to_string(),
+                );
+            }
+            if config.authentication == WebhdfsAuthentication::Simple
+                && supplied.is_some_and(|secrets| {
+                    secrets.webhdfs_delegation_token.is_some() || secrets.clear_webhdfs_credentials != Some(true)
+                })
+            {
+                return Err("WebHDFS simple authentication only accepts clearWebhdfsCredentials=true".to_string());
+            }
+            let token = supplied
+                .and_then(|secrets| secrets.webhdfs_delegation_token.as_deref())
+                .filter(|value| !value.is_empty());
+            validate_webhdfs_config(config, input.id.is_none(), token)
+        }
     }
 }
 
@@ -4055,6 +4474,8 @@ fn build_operator_with_secrets(
             let (operator, _) = build_hdfs_native_operator(config)?;
             Ok(BuiltOperator { operator, sftp_key_material: None, sftp_path_guard: None })
         }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => build_webhdfs_operator(config, secrets)
+            .map(|operator| BuiltOperator { operator, sftp_key_material: None, sftp_path_guard: None }),
     }
 }
 
@@ -4084,6 +4505,9 @@ fn normalize_input(input: &mut FileConnectionInput) -> Result<(), String> {
         }
         FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => {
             normalize_hdfs_native_config(config)?;
+        }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+            normalize_webhdfs_config(config)?;
         }
     }
     Ok(())
@@ -4313,7 +4737,8 @@ async fn stat_remote_metadata_once(
                 FileConnectionConfig::Ftp(_)
                 | FileConnectionConfig::Sftp(_)
                 | FileConnectionConfig::Webdav(_)
-                | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => operator.stat(&directory_path).await,
+                | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))
+                | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => operator.stat(&directory_path).await,
             }
         }
         Err(error) => Err(error),
@@ -4373,6 +4798,25 @@ async fn fresh_hdfs_native_fingerprint(
     }
 }
 
+async fn fresh_webhdfs_fingerprint(
+    operator: &Operator,
+    configured_path: &str,
+    timeout: Duration,
+    secrets: &ResolvedFileSecrets,
+) -> Result<RemoteFileFingerprint, String> {
+    match tokio::time::timeout(timeout, operator.stat(configured_path)).await {
+        Ok(Ok(metadata)) if metadata.mode().is_file() => Ok(remote_fingerprint_from_metadata(&metadata)),
+        Ok(Ok(_)) => Err("Unsupported: directory copy and rename are not available in v1".to_string()),
+        Ok(Err(error)) if error.kind() == ErrorKind::NotFound => Err("Remote file no longer exists".to_string()),
+        Ok(Err(error)) => Err(classify_webhdfs_fresh_stat_error(&error, secrets)),
+        Err(_) => Err("WebHDFS fresh rename reconciliation stat timed out".to_string()),
+    }
+}
+
+fn classify_webhdfs_fresh_stat_error(error: &opendal::Error, secrets: &ResolvedFileSecrets) -> String {
+    format!("WebHDFS fresh rename reconciliation stat failed: {}", redact_secrets(error.to_string(), secrets))
+}
+
 pub(super) fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
@@ -4406,6 +4850,24 @@ pub(super) fn password_scope(config: &FileConnectionConfig) -> Result<String, St
                 .map(|environment| environment.user_name.as_str())
                 .unwrap_or("process_user")
         )),
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) => {
+            let mut config = config.clone();
+            normalize_webhdfs_config(&mut config)?;
+            let security_boundary = serde_json::to_string(&(
+                &config.endpoint,
+                &config.root,
+                config.authentication,
+                &config.user_name,
+                &config.allowed_data_node_origins,
+                &config.data_node_hostname_mapping,
+                &config.tls_ca_certificate_path,
+                &config.proxy_url,
+                &config.proxy_bypass,
+                config.allow_tls_downgrade,
+            ))
+            .map_err(|error| error.to_string())?;
+            Ok(format!("hdfs\nwebhdfs\nscope-v2\n{security_boundary}"))
+        }
     }
 }
 
@@ -4441,7 +4903,7 @@ fn validate_ftp_session_arguments(config: &FtpConnectionConfig, password: Option
     reject_ftp_command_injection(password.unwrap_or_default(), "FTP password")
 }
 
-fn parse_storage_config(record: &FileConnectionStorageRecord) -> Result<FileConnectionConfig, String> {
+pub(super) fn parse_storage_config(record: &FileConnectionStorageRecord) -> Result<FileConnectionConfig, String> {
     serde_json::from_str(&record.config_json).map_err(|_| "Stored file connection configuration is invalid".to_string())
 }
 
@@ -4486,6 +4948,7 @@ fn file_connection_capabilities(config: &FileConnectionConfig) -> FileConnection
         FileConnectionConfig::S3(_) => s3_capabilities(),
         FileConnectionConfig::Webdav(_) => webdav_capabilities(),
         FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => hdfs_native_capabilities(),
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)) => webhdfs_capabilities(),
         FileConnectionConfig::Ftp(_) => FileConnectionCapabilities {
             read: true,
             write: true,
@@ -4519,6 +4982,7 @@ fn redact_secrets(mut message: String, secrets: &ResolvedFileSecrets) -> String 
         secrets.webdav_token.as_deref(),
         secrets.sftp_private_key.as_deref(),
         secrets.sftp_private_key_passphrase.as_deref(),
+        secrets.webhdfs_delegation_token.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -4617,6 +5081,45 @@ mod tests {
                 }
                 WebdavAuthentication::Bearer => FileConnectionSecrets {
                     webdav_token: Some("token".to_string()),
+                    ..FileConnectionSecrets::default()
+                },
+            }),
+        }
+    }
+
+    fn webhdfs_input(authentication: WebhdfsAuthentication) -> FileConnectionInput {
+        FileConnectionInput {
+            id: None,
+            expected_revision: None,
+            name: "WebHDFS".to_string(),
+            config: FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(WebhdfsConnectionConfig {
+                endpoint: "https://namenode.example.test:9871".to_string(),
+                root: "/tenant/".to_string(),
+                authentication,
+                user_name: if authentication == WebhdfsAuthentication::Simple {
+                    "dbx".to_string()
+                } else {
+                    String::new()
+                },
+                disable_list_batch: false,
+                allowed_data_node_origins: vec!["https://datanode.example.test:9865".to_string()],
+                data_node_hostname_mapping: Default::default(),
+                tls_ca_certificate_path: None,
+                proxy_url: None,
+                proxy_bypass: None,
+                allow_tls_downgrade: false,
+                connect_timeout_seconds: 10,
+                control_timeout_seconds: 30,
+                idle_timeout_seconds: 30,
+                chunk_size_mib: 4,
+                write_options: Default::default(),
+            })),
+            secrets: Some(match authentication {
+                WebhdfsAuthentication::Simple => {
+                    FileConnectionSecrets { clear_webhdfs_credentials: Some(true), ..FileConnectionSecrets::default() }
+                }
+                WebhdfsAuthentication::Delegation => FileConnectionSecrets {
+                    webhdfs_delegation_token: Some("delegation/+ token%&?".to_string()),
                     ..FileConnectionSecrets::default()
                 },
             }),
@@ -4786,6 +5289,264 @@ mod tests {
         assert!(!redacted.contains("dbx-access"));
         assert!(!redacted.contains("s3cr3t"));
         assert!(!redacted.contains("session%2F"));
+    }
+
+    #[test]
+    fn webhdfs_delegation_secret_redaction_covers_raw_and_encoded_values() {
+        let token = "delegation/+ token%&?";
+        let resolved =
+            ResolvedFileSecrets { webhdfs_delegation_token: Some(token.to_string()), ..ResolvedFileSecrets::default() };
+        let percent_encoded =
+            percent_encoding::utf8_percent_encode(token, percent_encoding::NON_ALPHANUMERIC).to_string();
+        let form_encoded = url::form_urlencoded::byte_serialize(token.as_bytes()).collect::<String>();
+        let redacted = redact_secrets(format!("{token} {percent_encoded} {form_encoded}"), &resolved);
+        assert!(!redacted.contains(token));
+        assert!(!redacted.contains(&percent_encoded));
+        assert!(!redacted.contains(&form_encoded));
+    }
+
+    #[tokio::test]
+    async fn webhdfs_fresh_rename_reconciliation_uses_webhdfs_errors_and_redacts_tokens() {
+        let token = "delegation/+ token%&?";
+        let secrets =
+            ResolvedFileSecrets { webhdfs_delegation_token: Some(token.to_string()), ..ResolvedFileSecrets::default() };
+        let error = opendal::Error::new(ErrorKind::Unexpected, "WebHDFS stat transport failed")
+            .set_source(std::io::Error::other(format!("request contained {token}")));
+        let classified = classify_webhdfs_fresh_stat_error(&error, &secrets);
+        assert!(classified.contains("WebHDFS fresh rename reconciliation"), "{classified}");
+        assert!(!classified.contains("HdfsNative"), "{classified}");
+        assert!(!classified.contains(token), "{classified}");
+
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) =
+            webhdfs_input(WebhdfsAuthentication::Delegation).config
+        else {
+            unreachable!()
+        };
+        let operator = build_webhdfs_operator(&config, &secrets).unwrap();
+        let observed = fresh_webhdfs_fingerprint(&operator, "source.bin", Duration::ZERO, &secrets).await.unwrap_err();
+        assert!(observed.contains("WebHDFS"), "{observed}");
+        assert!(!observed.contains("HdfsNative"), "{observed}");
+        assert!(!observed.contains(token), "{observed}");
+    }
+
+    #[tokio::test]
+    async fn webhdfs_delegation_secret_is_separate_scoped_rotatable_and_clearable() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+
+        let created = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            webhdfs_input(WebhdfsAuthentication::Delegation),
+        )
+        .await
+        .unwrap();
+        assert!(created.has_credentials);
+        let stored = state.storage.load_file_connection(&created.id).await.unwrap().unwrap();
+        assert!(!stored.config_json.contains("delegation/+ token%&?"));
+        assert_eq!(
+            state
+                .storage
+                .load_file_connection_secret(&created.id, "webhdfs_delegation_token")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("delegation/+ token%&?")
+        );
+
+        let mut preserved = webhdfs_input(WebhdfsAuthentication::Delegation);
+        preserved.id = Some(created.id.clone());
+        preserved.expected_revision = Some(created.revision);
+        preserved.secrets = None;
+        let preserved =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), preserved)
+                .await
+                .unwrap();
+        assert_eq!(preserved.revision, created.revision + 1);
+        assert!(preserved.has_credentials);
+
+        let mut invalid_clear = webhdfs_input(WebhdfsAuthentication::Delegation);
+        invalid_clear.id = Some(created.id.clone());
+        invalid_clear.expected_revision = Some(preserved.revision);
+        invalid_clear.secrets =
+            Some(FileConnectionSecrets { clear_webhdfs_credentials: Some(true), ..FileConnectionSecrets::default() });
+        let clear_error =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), invalid_clear)
+                .await
+                .err()
+                .expect("delegation authentication cannot be saved after clearing its token");
+        assert!(clear_error.contains("delegation token"), "{clear_error}");
+        assert_eq!(
+            state.storage.load_file_connection(&created.id).await.unwrap().unwrap().revision,
+            preserved.revision
+        );
+        assert_eq!(
+            state
+                .storage
+                .load_file_connection_secret(&created.id, "webhdfs_delegation_token")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("delegation/+ token%&?")
+        );
+
+        let mut changed_scope = webhdfs_input(WebhdfsAuthentication::Delegation);
+        changed_scope.id = Some(created.id.clone());
+        changed_scope.expected_revision = Some(preserved.revision);
+        changed_scope.secrets = None;
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) = &mut changed_scope.config else {
+            unreachable!()
+        };
+        config.endpoint = "https://rotated-namenode.example.test:9871".to_string();
+        let scope_error = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            changed_scope.clone(),
+        )
+        .await
+        .err()
+        .expect("changing the WebHDFS secret scope without re-entering the token must fail");
+        assert!(scope_error.contains("Re-enter or clear"));
+
+        changed_scope.secrets = Some(FileConnectionSecrets {
+            webhdfs_delegation_token: Some("rotated-delegation-token".to_string()),
+            ..FileConnectionSecrets::default()
+        });
+        let rotated =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), changed_scope)
+                .await
+                .unwrap();
+        assert!(rotated.has_credentials);
+
+        let mut cleared = webhdfs_input(WebhdfsAuthentication::Simple);
+        cleared.id = Some(created.id.clone());
+        cleared.expected_revision = Some(rotated.revision);
+        let cleared = save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), cleared)
+            .await
+            .unwrap();
+        assert!(!cleared.has_credentials);
+        assert!(state
+            .storage
+            .load_file_connection_secret(&created.id, "webhdfs_delegation_token")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state.storage.load_file_connection_secret(&created.id, "webhdfs_scope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn webhdfs_simple_to_delegation_requires_a_token_before_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+
+        let simple = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            webhdfs_input(WebhdfsAuthentication::Simple),
+        )
+        .await
+        .unwrap();
+        assert!(!simple.has_credentials);
+
+        let mut delegation = webhdfs_input(WebhdfsAuthentication::Delegation);
+        delegation.id = Some(simple.id.clone());
+        delegation.expected_revision = Some(simple.revision);
+        delegation.secrets = None;
+        let error =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), delegation.clone())
+                .await
+                .err()
+                .expect("changing simple authentication to delegation without a token must fail");
+        assert!(error.contains("credentials") || error.contains("delegation token"), "{error}");
+        let unchanged = state.storage.load_file_connection(&simple.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.revision, simple.revision);
+
+        delegation.secrets = Some(FileConnectionSecrets {
+            webhdfs_delegation_token: Some("new-delegation-token".to_string()),
+            ..FileConnectionSecrets::default()
+        });
+        let delegated =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), delegation)
+                .await
+                .unwrap();
+        assert!(delegated.has_credentials);
+        assert_eq!(
+            state.storage.load_file_connection_secret(&simple.id, "webhdfs_delegation_token").await.unwrap().as_deref(),
+            Some("new-delegation-token")
+        );
+    }
+
+    #[test]
+    fn webhdfs_secret_scope_canonicalizes_and_binds_redirect_security_boundary() {
+        fn config() -> WebhdfsConnectionConfig {
+            let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)) =
+                webhdfs_input(WebhdfsAuthentication::Delegation).config
+            else {
+                unreachable!()
+            };
+            config
+        }
+
+        fn scope(config: WebhdfsConnectionConfig) -> String {
+            password_scope(&FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config))).unwrap()
+        }
+
+        let mut baseline = config();
+        baseline.allowed_data_node_origins =
+            vec!["https://datanode-a.example.test".to_string(), "https://datanode-b.example.test:9865".to_string()];
+        baseline.data_node_hostname_mapping.insert("datanode-b.example.test".to_string(), "127.0.0.1:9865".to_string());
+        let baseline_scope = scope(baseline.clone());
+
+        let mut equivalent = baseline.clone();
+        equivalent.allowed_data_node_origins = vec![
+            "https://DATANODE-B.example.test:9865/".to_string(),
+            "https://datanode-a.example.test:443".to_string(),
+            "https://datanode-a.example.test".to_string(),
+        ];
+        equivalent.data_node_hostname_mapping.clear();
+        equivalent
+            .data_node_hostname_mapping
+            .insert(" DATANODE-B.EXAMPLE.TEST ".to_string(), " 127.0.0.1:9865 ".to_string());
+        assert_eq!(scope(equivalent), baseline_scope);
+
+        let mut changed = baseline.clone();
+        changed.allowed_data_node_origins.push("https://datanode-c.example.test:9865".to_string());
+        assert_ne!(scope(changed), baseline_scope);
+
+        let mut changed = baseline.clone();
+        changed.data_node_hostname_mapping.insert("datanode-a.example.test".to_string(), "127.0.0.2:443".to_string());
+        assert_ne!(scope(changed), baseline_scope);
+
+        let mut changed = baseline.clone();
+        changed.tls_ca_certificate_path = Some("/etc/ssl/alternate-hadoop-ca.pem".to_string());
+        assert_ne!(scope(changed), baseline_scope);
+
+        let mut changed = baseline.clone();
+        changed.proxy_url = Some("http://proxy.example.test:8080".to_string());
+        assert_ne!(scope(changed), baseline_scope);
+
+        let mut changed = baseline.clone();
+        changed.proxy_bypass = Some(".example.test".to_string());
+        assert_ne!(scope(changed), baseline_scope);
+
+        let mut http = config();
+        http.endpoint = "http://namenode.example.test:9870".to_string();
+        http.allowed_data_node_origins = vec!["http://datanode.example.test:9864".to_string()];
+        let http_scope = scope(http.clone());
+        http.allow_tls_downgrade = true;
+        assert_ne!(scope(http), http_scope);
     }
 
     #[test]

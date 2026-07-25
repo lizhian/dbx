@@ -50,6 +50,7 @@ const text = computed(() => ({
   sftpSecurity: t("fileManager.sftpSecurity"),
   sftpUnsupported: t("fileManager.sftpUnsupported"),
   hdfsSecurity: t("fileManager.hdfsSecurity"),
+  webhdfsSecurity: t("fileManager.webhdfsSecurity"),
   implementation: t("fileManager.implementation"),
   native: t("fileManager.native"),
   nameNodeUri: t("fileManager.nameNodeUri"),
@@ -57,6 +58,24 @@ const text = computed(() => ({
   hdfsOptions: t("fileManager.hdfsOptions"),
   hdfsOptionsHint: t("fileManager.hdfsOptionsHint"),
   hdfsUseUserEnvironment: t("fileManager.hdfsUseUserEnvironment"),
+  webhdfsSimple: t("fileManager.webhdfsSimple"),
+  webhdfsDelegation: t("fileManager.webhdfsDelegation"),
+  webhdfsDelegationToken: t("fileManager.webhdfsDelegationToken"),
+  clearWebhdfsCredentials: t("fileManager.clearWebhdfsCredentials"),
+  webhdfsDataNodeOrigins: t("fileManager.webhdfsDataNodeOrigins"),
+  webhdfsHostnameMapping: t("fileManager.webhdfsHostnameMapping"),
+  webhdfsTlsCa: t("fileManager.webhdfsTlsCa"),
+  webhdfsProxy: t("fileManager.webhdfsProxy"),
+  webhdfsProxyBypass: t("fileManager.webhdfsProxyBypass"),
+  webhdfsConnectTimeout: t("fileManager.webhdfsConnectTimeout"),
+  webhdfsControlTimeout: t("fileManager.webhdfsControlTimeout"),
+  webhdfsIdleTimeout: t("fileManager.webhdfsIdleTimeout"),
+  webhdfsChunkSize: t("fileManager.webhdfsChunkSize"),
+  webhdfsPermission: t("fileManager.webhdfsPermission"),
+  webhdfsReplication: t("fileManager.webhdfsReplication"),
+  webhdfsBlockSize: t("fileManager.webhdfsBlockSize"),
+  webhdfsBufferSize: t("fileManager.webhdfsBufferSize"),
+  webhdfsDisableListBatch: t("fileManager.webhdfsDisableListBatch"),
   sshConfig: t("fileManager.sshConfig"),
   sshAgent: t("fileManager.sshAgent"),
   sshPrivateKey: t("fileManager.sshPrivateKey"),
@@ -93,7 +112,9 @@ const text = computed(() => ({
     host_key: t("fileManager.stageHostKey"),
     bucket: t("fileManager.bucket"),
     root: t("fileManager.root"),
+    namenode: t("fileManager.stageNameNode"),
     namenode_rpc: t("fileManager.stageNameNodeRpc"),
+    datanode: t("fileManager.stageDataNode"),
     datanode_write: t("fileManager.stageDataNodeWrite"),
     datanode_read: t("fileManager.stageDataNodeRead"),
   },
@@ -129,6 +150,9 @@ const text = computed(() => ({
   hdfsCopyRisk: t("fileManager.hdfsCopyRisk"),
   hdfsRenameRisk: t("fileManager.hdfsRenameRisk"),
   hdfsUploadRiskConfirm: (path: string) => t("fileManager.hdfsUploadRiskConfirm", { path }),
+  webhdfsCopyRisk: t("fileManager.webhdfsCopyRisk"),
+  webhdfsRenameRisk: t("fileManager.webhdfsRenameRisk"),
+  webhdfsUploadRiskConfirm: (path: string) => t("fileManager.webhdfsUploadRiskConfirm", { path }),
   sftpUploadRiskConfirm: (path: string) => t("fileManager.sftpUploadRiskConfirm", { path }),
   replaceDestination: t("fileManager.replaceDestination"),
   replaceConfirm: (path: string) => t("fileManager.replaceConfirm", { path }),
@@ -189,6 +213,7 @@ const directoryPath = ref("");
 const clearPassword = ref(false);
 const clearS3Credentials = ref(false);
 const clearWebdavCredentials = ref(false);
+const clearWebhdfsCredentials = ref(false);
 const sftpSupported = ["macos", "linux"].includes(getPlatform());
 const form = ref({
   type: "ftp" as "ftp" | "sftp" | "s3" | "webdav" | "hdfs",
@@ -212,6 +237,23 @@ const form = ref({
   hdfsOptions: "",
   hadoopConfigDirectory: "",
   hdfsUseUserEnvironment: false,
+  hdfsImplementation: "native" as "native" | "webhdfs",
+  webhdfsAuthentication: "simple" as "simple" | "delegation",
+  webhdfsDelegationToken: "",
+  webhdfsAllowedOrigins: "http://localhost:9864",
+  webhdfsHostnameMapping: "",
+  webhdfsTlsCaCertificatePath: "",
+  webhdfsProxyUrl: "",
+  webhdfsProxyBypass: "",
+  webhdfsDisableListBatch: false,
+  webhdfsConnectTimeoutSeconds: 10,
+  webhdfsControlTimeoutSeconds: 30,
+  webhdfsIdleTimeoutSeconds: 30,
+  webhdfsChunkSizeMib: 4,
+  webhdfsPermission: "",
+  webhdfsReplication: "",
+  webhdfsBlockSize: "",
+  webhdfsBufferSize: "",
 });
 let connectionsGeneration = 0;
 let rootGeneration = 0;
@@ -221,8 +263,24 @@ let unlistenTransfers: UnlistenFn | null = null;
 let transferPoll: ReturnType<typeof setInterval> | null = null;
 
 const selectedConnection = computed(() => connections.value.find((connection) => connection.id === selectedId.value));
+const remoteReplaceSupported = computed(() => !(selectedConnection.value?.config.type === "hdfs" && selectedConnection.value.config.implementation === "webhdfs"));
 const connectionSecurityText = computed(() =>
-  form.value.type === "ftp" ? text.value.ftpSecurity : form.value.type === "sftp" ? (sftpSupported ? text.value.sftpSecurity : text.value.sftpUnsupported) : form.value.type === "s3" ? text.value.s3Security : form.value.type === "hdfs" ? text.value.hdfsSecurity : text.value.webdavSecurity,
+  form.value.type === "ftp"
+    ? text.value.ftpSecurity
+    : form.value.type === "sftp"
+      ? sftpSupported
+        ? text.value.sftpSecurity
+        : text.value.sftpUnsupported
+      : form.value.type === "s3"
+        ? text.value.s3Security
+        : form.value.type === "hdfs"
+          ? form.value.hdfsImplementation === "webhdfs"
+            ? text.value.webhdfsSecurity
+            : text.value.hdfsSecurity
+          : text.value.webdavSecurity,
+);
+const canReuseWebhdfsDelegationToken = computed(
+  () => !clearWebhdfsCredentials.value && !!editingId.value && selectedConnection.value?.hasCredentials === true && selectedConnection.value.config.type === "hdfs" && selectedConnection.value.config.implementation === "webhdfs" && selectedConnection.value.config.authentication === "delegation",
 );
 const canSubmit = computed(
   () =>
@@ -231,7 +289,10 @@ const canSubmit = computed(
     form.value.root.startsWith("/") &&
     (form.value.type !== "s3" || (!!form.value.region.trim() && !!form.value.bucket.trim())) &&
     (form.value.type !== "sftp" || (sftpSupported && (form.value.sftpAuthentication !== "private_key" || !!form.value.sftpPrivateKey.trim() || (!!editingId.value && !form.value.sftpPrivateKeyPassphrase)))) &&
-    (form.value.type !== "webdav" || form.value.webdavAuthentication !== "basic" || !!form.value.username.trim()),
+    (form.value.type !== "webdav" || form.value.webdavAuthentication !== "basic" || !!form.value.username.trim()) &&
+    (form.value.type !== "hdfs" ||
+      form.value.hdfsImplementation !== "webhdfs" ||
+      (!!form.value.webhdfsAllowedOrigins.trim() && (form.value.webhdfsAuthentication !== "simple" || !!form.value.username.trim()) && (form.value.webhdfsAuthentication !== "delegation" || canReuseWebhdfsDelegationToken.value || !!form.value.webhdfsDelegationToken.trim()))),
 );
 const breadcrumbs = computed(() => {
   const result = [{ label: "/", path: "" }];
@@ -246,6 +307,53 @@ const breadcrumbs = computed(() => {
 
 function inputFromForm(): FileConnectionInput {
   if (form.value.type === "hdfs") {
+    if (form.value.hdfsImplementation === "webhdfs") {
+      const dataNodeHostnameMapping = Object.fromEntries(
+        form.value.webhdfsHostnameMapping
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line) => {
+            const separator = line.indexOf("=");
+            return separator < 1 ? [line, ""] : [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
+          }),
+      );
+      const delegationToken = form.value.webhdfsDelegationToken.trim();
+      return {
+        id: editingId.value,
+        expectedRevision: editingId.value ? selectedConnection.value?.revision : undefined,
+        name: form.value.name.trim(),
+        config: {
+          type: "hdfs",
+          implementation: "webhdfs",
+          endpoint: form.value.endpoint.trim(),
+          root: form.value.root.trim(),
+          authentication: form.value.webhdfsAuthentication,
+          userName: form.value.webhdfsAuthentication === "simple" ? form.value.username.trim() : "",
+          disableListBatch: form.value.webhdfsDisableListBatch,
+          allowedDataNodeOrigins: form.value.webhdfsAllowedOrigins
+            .split("\n")
+            .map((value) => value.trim())
+            .filter(Boolean),
+          dataNodeHostnameMapping,
+          tlsCaCertificatePath: form.value.webhdfsTlsCaCertificatePath.trim() || null,
+          proxyUrl: form.value.webhdfsProxyUrl.trim() || null,
+          proxyBypass: form.value.webhdfsProxyBypass.trim() || null,
+          allowTlsDowngrade: false,
+          connectTimeoutSeconds: form.value.webhdfsConnectTimeoutSeconds,
+          controlTimeoutSeconds: form.value.webhdfsControlTimeoutSeconds,
+          idleTimeoutSeconds: form.value.webhdfsIdleTimeoutSeconds,
+          chunkSizeMib: form.value.webhdfsChunkSizeMib,
+          writeOptions: {
+            permission: form.value.webhdfsPermission.trim() || null,
+            replication: form.value.webhdfsReplication ? Number(form.value.webhdfsReplication) : null,
+            blockSize: form.value.webhdfsBlockSize ? Number(form.value.webhdfsBlockSize) : null,
+            bufferSize: form.value.webhdfsBufferSize ? Number(form.value.webhdfsBufferSize) : null,
+          },
+        },
+        secrets: form.value.webhdfsAuthentication === "simple" || clearWebhdfsCredentials.value ? { clearWebhdfsCredentials: true } : delegationToken ? { webhdfsDelegationToken: delegationToken } : undefined,
+      };
+    }
     const options = Object.fromEntries(
       form.value.hdfsOptions
         .split("\n")
@@ -362,6 +470,9 @@ function remoteOperationRisk(): string {
     return remoteOperation.value === "copy" ? text.value.sftpCopyRisk : text.value.sftpRenameRisk;
   }
   if (selectedConnection.value?.config.type === "hdfs") {
+    if (selectedConnection.value.config.implementation === "webhdfs") {
+      return remoteOperation.value === "copy" ? text.value.webhdfsCopyRisk : text.value.webhdfsRenameRisk;
+    }
     return remoteOperation.value === "copy" ? text.value.hdfsCopyRisk : text.value.hdfsRenameRisk;
   }
   return text.value.copyRenameRisk;
@@ -545,24 +656,45 @@ function openCreate() {
     hdfsOptions: "",
     hadoopConfigDirectory: "",
     hdfsUseUserEnvironment: false,
+    hdfsImplementation: "native",
+    webhdfsAuthentication: "simple",
+    webhdfsDelegationToken: "",
+    webhdfsAllowedOrigins: "http://localhost:9864",
+    webhdfsHostnameMapping: "",
+    webhdfsTlsCaCertificatePath: "",
+    webhdfsProxyUrl: "",
+    webhdfsProxyBypass: "",
+    webhdfsDisableListBatch: false,
+    webhdfsConnectTimeoutSeconds: 10,
+    webhdfsControlTimeoutSeconds: 30,
+    webhdfsIdleTimeoutSeconds: 30,
+    webhdfsChunkSizeMib: 4,
+    webhdfsPermission: "",
+    webhdfsReplication: "",
+    webhdfsBlockSize: "",
+    webhdfsBufferSize: "",
   };
   testResult.value = null;
   clearPassword.value = false;
   clearS3Credentials.value = false;
   clearWebdavCredentials.value = false;
+  clearWebhdfsCredentials.value = false;
   editorOpen.value = true;
 }
 
 function openEdit() {
   const connection = selectedConnection.value;
   if (!connection) return;
+  const hdfsConfig = connection.config.type === "hdfs" ? connection.config : null;
+  const nativeHdfs = hdfsConfig?.implementation === "native" ? hdfsConfig : null;
+  const webhdfs = hdfsConfig?.implementation === "webhdfs" ? hdfsConfig : null;
   editingId.value = connection.id;
   form.value = {
     type: connection.config.type,
     name: connection.name,
-    endpoint: connection.config.type === "hdfs" ? connection.config.nameNodeUri : connection.config.endpoint,
+    endpoint: connection.config.type === "hdfs" ? (connection.config.implementation === "native" ? connection.config.nameNodeUri : connection.config.endpoint) : connection.config.endpoint,
     root: connection.config.root,
-    username: connection.config.type === "ftp" || connection.config.type === "sftp" || connection.config.type === "webdav" ? connection.config.username : "",
+    username: connection.config.type === "ftp" || connection.config.type === "sftp" || connection.config.type === "webdav" ? connection.config.username : (webhdfs?.userName ?? ""),
     password: "",
     region: connection.config.type === "s3" ? connection.config.region : "us-east-1",
     bucket: connection.config.type === "s3" ? connection.config.bucket : "",
@@ -576,19 +708,40 @@ function openEdit() {
     sftpAuthentication: connection.config.type === "sftp" ? connection.config.authentication : "ssh_config",
     sftpPrivateKey: "",
     sftpPrivateKeyPassphrase: "",
-    hdfsOptions:
-      connection.config.type === "hdfs"
-        ? Object.entries(connection.config.options)
-            .map(([key, value]) => `${key}=${value}`)
-            .join("\n")
-        : "",
-    hadoopConfigDirectory: connection.config.type === "hdfs" ? (connection.config.hadoopConfigDirectory ?? "") : "",
-    hdfsUseUserEnvironment: connection.config.type === "hdfs" && !!connection.config.authenticationEnvironment,
+    hdfsOptions: nativeHdfs
+      ? Object.entries(nativeHdfs.options)
+          .map(([key, value]) => `${key}=${value}`)
+          .join("\n")
+      : "",
+    hadoopConfigDirectory: nativeHdfs?.hadoopConfigDirectory ?? "",
+    hdfsUseUserEnvironment: !!nativeHdfs?.authenticationEnvironment,
+    hdfsImplementation: hdfsConfig?.implementation ?? "native",
+    webhdfsAuthentication: webhdfs?.authentication ?? "simple",
+    webhdfsDelegationToken: "",
+    webhdfsAllowedOrigins: webhdfs?.allowedDataNodeOrigins.join("\n") ?? "http://localhost:9864",
+    webhdfsHostnameMapping: webhdfs
+      ? Object.entries(webhdfs.dataNodeHostnameMapping)
+          .map(([host, address]) => `${host}=${address}`)
+          .join("\n")
+      : "",
+    webhdfsTlsCaCertificatePath: webhdfs?.tlsCaCertificatePath ?? "",
+    webhdfsProxyUrl: webhdfs?.proxyUrl ?? "",
+    webhdfsProxyBypass: webhdfs?.proxyBypass ?? "",
+    webhdfsDisableListBatch: webhdfs?.disableListBatch ?? false,
+    webhdfsConnectTimeoutSeconds: webhdfs?.connectTimeoutSeconds ?? 10,
+    webhdfsControlTimeoutSeconds: webhdfs?.controlTimeoutSeconds ?? 30,
+    webhdfsIdleTimeoutSeconds: webhdfs?.idleTimeoutSeconds ?? 30,
+    webhdfsChunkSizeMib: webhdfs?.chunkSizeMib ?? 4,
+    webhdfsPermission: webhdfs?.writeOptions.permission ?? "",
+    webhdfsReplication: webhdfs?.writeOptions.replication?.toString() ?? "",
+    webhdfsBlockSize: webhdfs?.writeOptions.blockSize?.toString() ?? "",
+    webhdfsBufferSize: webhdfs?.writeOptions.bufferSize?.toString() ?? "",
   };
   testResult.value = null;
   clearPassword.value = false;
   clearS3Credentials.value = false;
   clearWebdavCredentials.value = false;
+  clearWebhdfsCredentials.value = false;
   editorOpen.value = true;
 }
 
@@ -749,7 +902,9 @@ async function uploadFile() {
       : selectedConnection.value?.config.type === "sftp"
         ? text.value.sftpUploadRiskConfirm(remotePath)
         : selectedConnection.value?.config.type === "hdfs"
-          ? text.value.hdfsUploadRiskConfirm(remotePath)
+          ? selectedConnection.value.config.implementation === "webhdfs"
+            ? text.value.webhdfsUploadRiskConfirm(remotePath)
+            : text.value.hdfsUploadRiskConfirm(remotePath)
           : text.value.uploadRiskConfirm(remotePath);
   if (!globalThis.confirm(uploadConfirmation)) return;
   try {
@@ -791,14 +946,15 @@ async function startRemoteOperation() {
   const entry = pendingRemoteEntry.value;
   const destinationPath = remoteDestinationPath.value.trim();
   if (!connectionId || !entry || !destinationPath || mutating.value) return;
-  if (replaceDestination.value && !globalThis.confirm(text.value.replaceConfirm(destinationPath))) return;
+  const replace = remoteReplaceSupported.value && replaceDestination.value;
+  if (replace && !globalThis.confirm(text.value.replaceConfirm(destinationPath))) return;
   mutating.value = true;
   try {
     const input = {
       connectionId,
       sourcePath: entry.path,
       destinationPath,
-      policy: replaceDestination.value ? ({ mode: "replace", confirmed: true } as const) : ({ mode: "best_effort_no_clobber", atomicNoClobber: false, externalToctouRisk: true } as const),
+      policy: replace ? ({ mode: "replace", confirmed: true } as const) : ({ mode: "best_effort_no_clobber", atomicNoClobber: false, externalToctouRisk: true } as const),
     };
     const started = remoteOperation.value === "copy" ? await api.startFileCopy(input) : await api.startFileRename(input);
     upsertTransfer(await api.getFileTransfer(started.transferId));
@@ -1103,7 +1259,8 @@ onBeforeUnmount(() => {
               v-model="form.type"
               class="h-9 rounded-md border border-input bg-background px-3 text-sm"
               @change="
-                form.endpoint = form.type === 'ftp' ? 'ftp://localhost:21' : form.type === 'sftp' ? 'localhost' : form.type === 's3' ? 'http://localhost:9000' : form.type === 'hdfs' ? 'hdfs://localhost:9000' : 'http://localhost:8080';
+                form.endpoint =
+                  form.type === 'ftp' ? 'ftp://localhost:21' : form.type === 'sftp' ? 'localhost' : form.type === 's3' ? 'http://localhost:9000' : form.type === 'hdfs' ? (form.hdfsImplementation === 'native' ? 'hdfs://localhost:9000' : 'http://localhost:9870') : 'http://localhost:8080';
                 testResult = null;
               "
             >
@@ -1119,11 +1276,23 @@ onBeforeUnmount(() => {
             ><Input id="file-connection-name" v-model="form.name" />
           </div>
           <div class="grid gap-1.5">
-            <Label for="file-connection-endpoint">{{ form.type === "hdfs" ? text.nameNodeUri : text.endpoint }}</Label
+            <Label for="file-connection-endpoint">{{ form.type === "hdfs" ? (form.hdfsImplementation === "native" ? text.nameNodeUri : text.endpoint) : text.endpoint }}</Label
             ><Input
               id="file-connection-endpoint"
               v-model="form.endpoint"
-              :placeholder="form.type === 'ftp' ? 'ftp://host:21' : form.type === 'sftp' ? 'host-alias or ssh://host:22' : form.type === 's3' ? 'https://s3.example.com' : form.type === 'hdfs' ? 'hdfs://namenode:9000' : 'https://dav.example.com/webdav'"
+              :placeholder="
+                form.type === 'ftp'
+                  ? 'ftp://host:21'
+                  : form.type === 'sftp'
+                    ? 'host-alias or ssh://host:22'
+                    : form.type === 's3'
+                      ? 'https://s3.example.com'
+                      : form.type === 'hdfs'
+                        ? form.hdfsImplementation === 'native'
+                          ? 'hdfs://namenode:9000'
+                          : 'https://namenode:9871'
+                        : 'https://dav.example.com/webdav'
+              "
             />
           </div>
           <div v-if="form.type === 'ftp'" class="grid grid-cols-2 gap-3">
@@ -1237,8 +1406,17 @@ onBeforeUnmount(() => {
             <div class="grid grid-cols-2 gap-3">
               <div class="grid gap-1.5">
                 <Label for="file-connection-hdfs-implementation">{{ text.implementation }}</Label>
-                <select id="file-connection-hdfs-implementation" class="h-9 rounded-md border border-input bg-background px-3 text-sm" disabled>
+                <select
+                  id="file-connection-hdfs-implementation"
+                  v-model="form.hdfsImplementation"
+                  class="h-9 rounded-md border border-input bg-background px-3 text-sm"
+                  @change="
+                    form.endpoint = form.hdfsImplementation === 'native' ? 'hdfs://localhost:9000' : 'http://localhost:9870';
+                    testResult = null;
+                  "
+                >
                   <option value="native">{{ text.native }}</option>
+                  <option value="webhdfs">WebHDFS</option>
                 </select>
               </div>
               <div class="grid gap-1.5">
@@ -1246,18 +1424,105 @@ onBeforeUnmount(() => {
                 <Input id="file-connection-hdfs-root" v-model="form.root" placeholder="/" />
               </div>
             </div>
-            <div class="grid gap-1.5">
-              <Label for="file-connection-hdfs-config">{{ text.hadoopConfigDirectory }}</Label>
-              <Input id="file-connection-hdfs-config" v-model="form.hadoopConfigDirectory" placeholder="/etc/hadoop/conf" />
-            </div>
-            <div class="grid gap-1.5">
-              <Label for="file-connection-hdfs-options">{{ text.hdfsOptions }}</Label>
-              <textarea id="file-connection-hdfs-options" v-model="form.hdfsOptions" :placeholder="text.hdfsOptionsHint" class="min-h-24 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" spellcheck="false" />
-            </div>
-            <label class="flex items-center gap-2 text-xs text-muted-foreground">
-              <input id="file-connection-hdfs-user-environment" v-model="form.hdfsUseUserEnvironment" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
-              <span>{{ text.hdfsUseUserEnvironment }}</span>
-            </label>
+            <template v-if="form.hdfsImplementation === 'native'">
+              <div class="grid gap-1.5">
+                <Label for="file-connection-hdfs-config">{{ text.hadoopConfigDirectory }}</Label>
+                <Input id="file-connection-hdfs-config" v-model="form.hadoopConfigDirectory" placeholder="/etc/hadoop/conf" />
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-hdfs-options">{{ text.hdfsOptions }}</Label>
+                <textarea id="file-connection-hdfs-options" v-model="form.hdfsOptions" :placeholder="text.hdfsOptionsHint" class="min-h-24 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" spellcheck="false" />
+              </div>
+              <label class="flex items-center gap-2 text-xs text-muted-foreground">
+                <input id="file-connection-hdfs-user-environment" v-model="form.hdfsUseUserEnvironment" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+                <span>{{ text.hdfsUseUserEnvironment }}</span>
+              </label>
+            </template>
+            <template v-else>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-auth">{{ text.authentication }}</Label>
+                  <select id="file-connection-webhdfs-auth" v-model="form.webhdfsAuthentication" class="h-9 rounded-md border border-input bg-background px-3 text-sm">
+                    <option value="simple">{{ text.webhdfsSimple }}</option>
+                    <option value="delegation">{{ text.webhdfsDelegation }}</option>
+                  </select>
+                </div>
+                <div v-if="form.webhdfsAuthentication === 'simple'" class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-user">{{ text.username }}</Label>
+                  <Input id="file-connection-webhdfs-user" v-model="form.username" />
+                </div>
+              </div>
+              <div v-if="form.webhdfsAuthentication === 'delegation'" class="grid gap-1.5">
+                <Label for="file-connection-webhdfs-token">{{ text.webhdfsDelegationToken }}</Label>
+                <PasswordInput id="file-connection-webhdfs-token" v-model="form.webhdfsDelegationToken" :disabled="clearWebhdfsCredentials" :placeholder="editingId ? text.keepPassword : ''" />
+                <label v-if="editingId && selectedConnection?.hasCredentials" class="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input v-model="clearWebhdfsCredentials" type="checkbox" class="h-3.5 w-3.5 accent-primary" @change="clearWebhdfsCredentials && (form.webhdfsDelegationToken = '')" />
+                  <span>{{ text.clearWebhdfsCredentials }}</span>
+                </label>
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-webhdfs-origins">{{ text.webhdfsDataNodeOrigins }}</Label>
+                <textarea id="file-connection-webhdfs-origins" v-model="form.webhdfsAllowedOrigins" class="min-h-20 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" placeholder="https://datanode.example.com:9865" spellcheck="false" />
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-webhdfs-mapping">{{ text.webhdfsHostnameMapping }}</Label>
+                <textarea id="file-connection-webhdfs-mapping" v-model="form.webhdfsHostnameMapping" class="min-h-20 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" placeholder="datanode.example.com=10.0.0.12:9865" spellcheck="false" />
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-ca">{{ text.webhdfsTlsCa }}</Label>
+                  <Input id="file-connection-webhdfs-ca" v-model="form.webhdfsTlsCaCertificatePath" placeholder="/etc/ssl/certs/hadoop-ca.pem" />
+                </div>
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-proxy">{{ text.webhdfsProxy }}</Label>
+                  <Input id="file-connection-webhdfs-proxy" v-model="form.webhdfsProxyUrl" placeholder="http://proxy.example.com:8080" />
+                </div>
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-webhdfs-proxy-bypass">{{ text.webhdfsProxyBypass }}</Label>
+                <Input id="file-connection-webhdfs-proxy-bypass" v-model="form.webhdfsProxyBypass" placeholder="localhost,.example.com" />
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-connect-timeout">{{ text.webhdfsConnectTimeout }}</Label>
+                  <Input id="file-connection-webhdfs-connect-timeout" v-model.number="form.webhdfsConnectTimeoutSeconds" type="number" min="1" max="3600" />
+                </div>
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-idle-timeout">{{ text.webhdfsIdleTimeout }}</Label>
+                  <Input id="file-connection-webhdfs-idle-timeout" v-model.number="form.webhdfsIdleTimeoutSeconds" type="number" min="1" max="3600" />
+                </div>
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-control-timeout">{{ text.webhdfsControlTimeout }}</Label>
+                  <Input id="file-connection-webhdfs-control-timeout" v-model.number="form.webhdfsControlTimeoutSeconds" type="number" min="1" max="3600" />
+                </div>
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-chunk">{{ text.webhdfsChunkSize }}</Label>
+                  <Input id="file-connection-webhdfs-chunk" v-model.number="form.webhdfsChunkSizeMib" type="number" min="1" max="16" />
+                </div>
+              </div>
+              <div class="grid grid-cols-2 gap-3">
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-permission">{{ text.webhdfsPermission }}</Label>
+                  <Input id="file-connection-webhdfs-permission" v-model="form.webhdfsPermission" placeholder="755" />
+                </div>
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-replication">{{ text.webhdfsReplication }}</Label>
+                  <Input id="file-connection-webhdfs-replication" v-model="form.webhdfsReplication" type="number" min="1" />
+                </div>
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-block-size">{{ text.webhdfsBlockSize }}</Label>
+                  <Input id="file-connection-webhdfs-block-size" v-model="form.webhdfsBlockSize" type="number" min="1" />
+                </div>
+                <div class="grid gap-1.5">
+                  <Label for="file-connection-webhdfs-buffer-size">{{ text.webhdfsBufferSize }}</Label>
+                  <Input id="file-connection-webhdfs-buffer-size" v-model="form.webhdfsBufferSize" type="number" min="1" />
+                </div>
+              </div>
+              <label class="flex items-center gap-2 text-xs text-muted-foreground">
+                <input v-model="form.webhdfsDisableListBatch" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+                <span>{{ text.webhdfsDisableListBatch }}</span>
+              </label>
+            </template>
           </template>
           <template v-else>
             <div class="grid gap-1.5">
@@ -1354,7 +1619,7 @@ onBeforeUnmount(() => {
           <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
           <span>{{ remoteOperationRisk() }}</span>
         </div>
-        <label class="flex items-center gap-2 text-sm">
+        <label v-if="remoteReplaceSupported" class="flex items-center gap-2 text-sm">
           <input v-model="replaceDestination" type="checkbox" class="h-4 w-4 accent-primary" />
           <span>{{ text.replaceDestination }}</span>
         </label>

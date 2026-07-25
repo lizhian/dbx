@@ -222,7 +222,33 @@ export interface HdfsNativeFileConnectionConfig {
   } | null;
 }
 
-export type FileConnectionConfig = FtpFileConnectionConfig | SftpFileConnectionConfig | S3FileConnectionConfig | WebdavFileConnectionConfig | HdfsNativeFileConnectionConfig;
+export interface WebhdfsFileConnectionConfig {
+  type: "hdfs";
+  implementation: "webhdfs";
+  endpoint: string;
+  root: string;
+  authentication: "simple" | "delegation";
+  userName: string;
+  disableListBatch: boolean;
+  allowedDataNodeOrigins: string[];
+  dataNodeHostnameMapping: Record<string, string>;
+  tlsCaCertificatePath?: string | null;
+  proxyUrl?: string | null;
+  proxyBypass?: string | null;
+  allowTlsDowngrade: boolean;
+  connectTimeoutSeconds: number;
+  controlTimeoutSeconds: number;
+  idleTimeoutSeconds: number;
+  chunkSizeMib: number;
+  writeOptions: {
+    permission?: string | null;
+    replication?: number | null;
+    blockSize?: number | null;
+    bufferSize?: number | null;
+  };
+}
+
+export type FileConnectionConfig = FtpFileConnectionConfig | SftpFileConnectionConfig | S3FileConnectionConfig | WebdavFileConnectionConfig | HdfsNativeFileConnectionConfig | WebhdfsFileConnectionConfig;
 
 export interface FileConnectionInput {
   id?: string | null;
@@ -241,6 +267,8 @@ export interface FileConnectionInput {
     sftpPrivateKey?: string | null;
     sftpPrivateKeyPassphrase?: string | null;
     clearSftpCredentials?: boolean;
+    webhdfsDelegationToken?: string | null;
+    clearWebhdfsCredentials?: boolean;
   } | null;
 }
 
@@ -269,7 +297,7 @@ export interface FileConnection {
 }
 
 export interface FileConnectionTestStage {
-  stage: "configuration" | "dns" | "tcp" | "authentication" | "bucket" | "root";
+  stage: "configuration" | "dns" | "tcp" | "authentication" | "host_key" | "bucket" | "root" | "namenode" | "namenode_rpc" | "datanode" | "datanode_write" | "datanode_read";
   status: "passed" | "failed" | "skipped";
   message?: string | null;
 }

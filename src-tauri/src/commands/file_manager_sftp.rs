@@ -975,12 +975,11 @@ pub(super) use supported::{
 
 #[cfg(test)]
 #[allow(dead_code)]
-fn assert_sftp_path_guard_api(
-    guard: &Arc<SftpPathGuard>,
-) -> (
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>,
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>,
-) {
+type SftpPathGuardFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>;
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn assert_sftp_path_guard_api(guard: &Arc<SftpPathGuard>) -> (SftpPathGuardFuture, SftpPathGuardFuture) {
     (guard.require_existing(String::new()), guard.require_destination(String::new()))
 }
 

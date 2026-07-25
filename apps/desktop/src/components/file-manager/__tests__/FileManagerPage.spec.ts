@@ -44,7 +44,7 @@ function passthrough(tag: string): Component {
 function modelInput(): Component {
   return defineComponent({
     inheritAttrs: false,
-    props: { modelValue: { type: String, default: "" } },
+    props: { modelValue: { type: [String, Number], default: "" } },
     emits: ["update:modelValue"],
     setup(props, { attrs, emit }) {
       return () =>
@@ -299,6 +299,249 @@ describe("FileManagerPage transfer lifecycle", () => {
         },
       }),
     );
+  });
+
+  it("serializes a new WebHDFS delegation token only in the secrets payload", async () => {
+    mocks.saveFileConnection.mockResolvedValue({
+      ...connection,
+      id: "webhdfs-1",
+      name: "WebHDFS files",
+      config: {
+        type: "hdfs",
+        implementation: "webhdfs",
+        endpoint: "http://localhost:9870",
+        root: "/",
+        authentication: "delegation",
+        userName: "",
+        disableListBatch: false,
+        allowedDataNodeOrigins: ["http://localhost:9864"],
+        dataNodeHostnameMapping: {},
+        tlsCaCertificatePath: null,
+        proxyUrl: null,
+        proxyBypass: null,
+        allowTlsDowngrade: false,
+        connectTimeoutSeconds: 10,
+        controlTimeoutSeconds: 30,
+        idleTimeoutSeconds: 30,
+        chunkSizeMib: 4,
+        writeOptions: {
+          permission: null,
+          replication: null,
+          blockSize: null,
+          bufferSize: null,
+        },
+      },
+    });
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.add"]')?.click();
+    await nextTick();
+    setSelect("#file-connection-type", "hdfs");
+    await nextTick();
+    setSelect("#file-connection-hdfs-implementation", "webhdfs");
+    await nextTick();
+    setSelect("#file-connection-webhdfs-auth", "delegation");
+    await nextTick();
+    setInput("#file-connection-name", "WebHDFS files");
+    setInput("#file-connection-webhdfs-token", "delegation-secret");
+    await nextTick();
+
+    const save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    expect(save?.disabled).toBe(false);
+    save?.click();
+
+    await vi.waitFor(() => expect(mocks.saveFileConnection).toHaveBeenCalledOnce());
+    const input = mocks.saveFileConnection.mock.calls[0]?.[0];
+    expect(input).toEqual({
+      id: null,
+      expectedRevision: undefined,
+      name: "WebHDFS files",
+      config: {
+        type: "hdfs",
+        implementation: "webhdfs",
+        endpoint: "http://localhost:9870",
+        root: "/",
+        authentication: "delegation",
+        userName: "",
+        disableListBatch: false,
+        allowedDataNodeOrigins: ["http://localhost:9864"],
+        dataNodeHostnameMapping: {},
+        tlsCaCertificatePath: null,
+        proxyUrl: null,
+        proxyBypass: null,
+        allowTlsDowngrade: false,
+        connectTimeoutSeconds: 10,
+        controlTimeoutSeconds: 30,
+        idleTimeoutSeconds: 30,
+        chunkSizeMib: 4,
+        writeOptions: {
+          permission: null,
+          replication: null,
+          blockSize: null,
+          bufferSize: null,
+        },
+      },
+      secrets: {
+        webhdfsDelegationToken: "delegation-secret",
+      },
+    });
+    expect(JSON.stringify(input?.config)).not.toContain("delegation-secret");
+  });
+
+  it("preserves or explicitly clears an existing WebHDFS delegation token during edit", async () => {
+    const webhdfsConnection: FileConnection = {
+      ...connection,
+      id: "webhdfs-existing",
+      name: "Existing WebHDFS",
+      revision: 12,
+      config: {
+        type: "hdfs",
+        implementation: "webhdfs",
+        endpoint: "https://namenode.example:9871",
+        root: "/tenant/dbx",
+        authentication: "delegation",
+        userName: "",
+        disableListBatch: true,
+        allowedDataNodeOrigins: ["https://datanode.example:9865"],
+        dataNodeHostnameMapping: {
+          "datanode.example": "10.0.0.12:9865",
+        },
+        tlsCaCertificatePath: "/etc/ssl/hadoop-ca.pem",
+        proxyUrl: null,
+        proxyBypass: "localhost",
+        allowTlsDowngrade: false,
+        connectTimeoutSeconds: 11,
+        controlTimeoutSeconds: 31,
+        idleTimeoutSeconds: 41,
+        chunkSizeMib: 8,
+        writeOptions: {
+          permission: "640",
+          replication: 2,
+          blockSize: 134217728,
+          bufferSize: 65536,
+        },
+      },
+      hasPassword: false,
+      hasCredentials: true,
+    };
+    mocks.listFileConnections.mockResolvedValue([webhdfsConnection]);
+    mocks.saveFileConnection.mockResolvedValue(webhdfsConnection);
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.edit"]')?.click();
+    await nextTick();
+    expect(root?.querySelector<HTMLInputElement>("#file-connection-webhdfs-token")?.value).toBe("");
+    expect(root?.querySelector<HTMLInputElement>("#file-connection-webhdfs-token")?.placeholder).toBe("fileManager.keepPassword");
+
+    let save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    save?.click();
+    await vi.waitFor(() => expect(mocks.saveFileConnection).toHaveBeenCalledTimes(1));
+    expect(mocks.saveFileConnection.mock.calls[0]?.[0]).toEqual({
+      id: "webhdfs-existing",
+      expectedRevision: 12,
+      name: "Existing WebHDFS",
+      config: webhdfsConnection.config,
+      secrets: undefined,
+    });
+
+    await vi.waitFor(() => expect(mocks.listFileConnections).toHaveBeenCalledTimes(2));
+    await nextTick();
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.edit"]')?.click();
+    await nextTick();
+    const clearLabel = Array.from(root?.querySelectorAll<HTMLLabelElement>("label") ?? []).find((label) => label.textContent?.includes("fileManager.clearWebhdfsCredentials"));
+    const clear = clearLabel?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    expect(clear).toBeTruthy();
+    clear?.click();
+    await nextTick();
+    expect(clear?.checked).toBe(true);
+
+    save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    expect(save?.disabled).toBe(true);
+    setSelect("#file-connection-webhdfs-auth", "simple");
+    await nextTick();
+    setInput("#file-connection-webhdfs-user", "dbx");
+    await nextTick();
+    await vi.waitFor(() => expect(save?.disabled).toBe(false));
+    save?.click();
+    await vi.waitFor(() => expect(mocks.saveFileConnection).toHaveBeenCalledTimes(2));
+    expect(mocks.saveFileConnection.mock.calls[1]?.[0]).toEqual({
+      id: "webhdfs-existing",
+      expectedRevision: 12,
+      name: "Existing WebHDFS",
+      config: {
+        ...webhdfsConnection.config,
+        authentication: "simple",
+        userName: "dbx",
+      },
+      secrets: {
+        clearWebhdfsCredentials: true,
+      },
+    });
+  });
+
+  it("requires a token when changing an existing simple WebHDFS connection to delegation", async () => {
+    const webhdfsConnection: FileConnection = {
+      ...connection,
+      id: "webhdfs-simple",
+      revision: 7,
+      hasPassword: false,
+      hasCredentials: false,
+      config: {
+        type: "hdfs",
+        implementation: "webhdfs",
+        endpoint: "https://namenode.example:9871",
+        root: "/tenant/dbx",
+        authentication: "simple",
+        userName: "dbx",
+        disableListBatch: false,
+        allowedDataNodeOrigins: ["https://datanode.example:9865"],
+        dataNodeHostnameMapping: {},
+        tlsCaCertificatePath: null,
+        proxyUrl: null,
+        proxyBypass: null,
+        allowTlsDowngrade: false,
+        connectTimeoutSeconds: 10,
+        controlTimeoutSeconds: 30,
+        idleTimeoutSeconds: 30,
+        chunkSizeMib: 4,
+        writeOptions: {
+          permission: null,
+          replication: null,
+          blockSize: null,
+          bufferSize: null,
+        },
+      },
+    };
+    mocks.listFileConnections.mockResolvedValue([webhdfsConnection]);
+    mocks.saveFileConnection.mockResolvedValue(webhdfsConnection);
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.edit"]')?.click();
+    await nextTick();
+    setSelect("#file-connection-webhdfs-auth", "delegation");
+    await nextTick();
+    let save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    expect(save?.disabled).toBe(true);
+    save?.click();
+    expect(mocks.saveFileConnection).not.toHaveBeenCalled();
+
+    setInput("#file-connection-webhdfs-token", "new-delegation-token");
+    await nextTick();
+    save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    expect(save?.disabled).toBe(false);
+    save?.click();
+    await vi.waitFor(() => expect(mocks.saveFileConnection).toHaveBeenCalledTimes(1));
+    expect(mocks.saveFileConnection.mock.calls[0]?.[0]).toMatchObject({
+      id: "webhdfs-simple",
+      expectedRevision: 7,
+      config: {
+        authentication: "delegation",
+        userName: "",
+      },
+      secrets: {
+        webhdfsDelegationToken: "new-delegation-token",
+      },
+    });
   });
 
   it("submits inline SFTP private-key authentication without password-only support", async () => {
@@ -760,6 +1003,72 @@ describe("FileManagerPage transfer lifecycle", () => {
       }),
     );
     await vi.waitFor(() => expect(root?.textContent).toContain("fileManager.transferCopying"));
+  });
+
+  it("hides replace for WebHDFS and always submits remote copy as no-clobber", async () => {
+    const webhdfsConnection: FileConnection = {
+      ...connection,
+      id: "webhdfs-copy",
+      hasPassword: false,
+      hasCredentials: false,
+      config: {
+        type: "hdfs",
+        implementation: "webhdfs",
+        endpoint: "http://localhost:9870",
+        root: "/",
+        authentication: "simple",
+        userName: "dbx",
+        disableListBatch: false,
+        allowedDataNodeOrigins: ["http://localhost:9864"],
+        dataNodeHostnameMapping: {},
+        tlsCaCertificatePath: null,
+        proxyUrl: null,
+        proxyBypass: null,
+        allowTlsDowngrade: false,
+        connectTimeoutSeconds: 10,
+        controlTimeoutSeconds: 30,
+        idleTimeoutSeconds: 30,
+        chunkSizeMib: 4,
+        writeOptions: {
+          permission: null,
+          replication: null,
+          blockSize: null,
+          bufferSize: null,
+        },
+      },
+    };
+    const running = transfer("webhdfs-copy", "running", {
+      connectionId: webhdfsConnection.id,
+      direction: "copy",
+      remotePath: remoteEntry.path,
+      localPath: "a%2Fb copy",
+    });
+    mocks.listFileConnections.mockResolvedValue([webhdfsConnection]);
+    mocks.startFileCopy.mockResolvedValue({ transferId: running.id });
+    mocks.getFileTransfer.mockResolvedValue(running);
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.copy: remote.bin"]')?.click();
+    await nextTick();
+    const replaceLabel = Array.from(root?.querySelectorAll<HTMLLabelElement>("label") ?? []).find((label) => label.textContent?.trim() === "fileManager.replaceDestination");
+    expect(replaceLabel).toBeUndefined();
+
+    const submit = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+      .filter((button) => button.textContent?.trim() === "fileManager.copy")
+      .at(-1);
+    submit?.click();
+    await vi.waitFor(() =>
+      expect(mocks.startFileCopy).toHaveBeenCalledWith({
+        connectionId: webhdfsConnection.id,
+        sourcePath: remoteEntry.path,
+        destinationPath: "a%2Fb copy",
+        policy: {
+          mode: "best_effort_no_clobber",
+          atomicNoClobber: false,
+          externalToctouRisk: true,
+        },
+      }),
+    );
   });
 
   it("requires a second explicit confirmation before replace", async () => {

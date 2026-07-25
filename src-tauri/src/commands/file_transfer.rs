@@ -30,8 +30,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::file_manager::{
-    validate_remote_relative_path, CancellationSignal, FileManagerRuntime, NativeRenameError, PreparedFileMutation,
-    PreparedFileOperation, RemoteFileFingerprint, UploadPolicy, UploadPublishResolution, UploadPublishState,
+    parse_storage_config, validate_remote_relative_path, CancellationSignal, FileConnectionConfig, FileManagerRuntime,
+    HdfsConnectionConfig, NativeRenameError, PreparedFileMutation, PreparedFileOperation, RemoteFileFingerprint,
+    UploadPolicy, UploadPublishResolution, UploadPublishState,
 };
 use super::file_manager_webdav::WebdavMutationErrorKind;
 
@@ -49,6 +50,7 @@ const IO_PROGRESS_WATCHDOG: Duration = Duration::from_secs(30);
 const CREATE_TEMP_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_OPERATION_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const TRANSFER_EVENT: &str = "file-transfer-progress";
+const WEBHDFS_REPLACE_UNSUPPORTED: &str = "WebHDFS copy and rename do not support Replace policy in v1";
 
 #[cfg(test)]
 #[derive(Clone)]
@@ -679,6 +681,11 @@ async fn start_remote_transfer_inner<R: Runtime>(
         .load_file_connection(&input.connection_id)
         .await?
         .ok_or_else(|| "File connection not found".to_string())?;
+    if input.policy.replace()
+        && matches!(parse_storage_config(&connection)?, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(_)))
+    {
+        return Err(WEBHDFS_REPLACE_UNSUPPORTED.to_string());
+    }
     let transfer_id = Uuid::new_v4().to_string();
     let cancellation = CancellationToken::new();
     runtime.register(transfer_id.clone(), input.connection_id.clone(), cancellation.clone());
@@ -1182,13 +1189,14 @@ async fn verify_remote_content(
         result
     } else {
         let configured = prepared.configured_path(&relative_path).map_err(local_failure)?;
-        let reader = tokio::time::timeout(
-            IO_PROGRESS_WATCHDOG,
-            prepared.operator.reader_with(&configured).concurrent(1).chunk(REMOTE_COPY_BUFFER_SIZE),
-        )
-        .await
-        .map_err(|_| remote_failure("Opening the remote verification reader timed out"))?
-        .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
+        let mut reader_builder = prepared.operator.reader_with(&configured).concurrent(1);
+        if !prepared.uses_streaming_webhdfs_upload() {
+            reader_builder = reader_builder.chunk(REMOTE_COPY_BUFFER_SIZE);
+        }
+        let reader = tokio::time::timeout(IO_PROGRESS_WATCHDOG, reader_builder)
+            .await
+            .map_err(|_| remote_failure("Opening the remote verification reader timed out"))?
+            .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
         let mut reader = reader
             .into_futures_async_read(..)
             .await
@@ -1279,12 +1287,68 @@ where
     Ok((bytes_read, format!("{:x}", hasher.finalize())))
 }
 
+enum StreamingDestinationWriter {
+    OpenDal(opendal::Writer),
+    Webhdfs(super::file_manager_webhdfs::WebhdfsStreamingWriter),
+}
+
+impl StreamingDestinationWriter {
+    async fn write(&mut self, bytes: Bytes, prepared: &PreparedFileMutation<'_>) -> Result<(), String> {
+        match self {
+            Self::OpenDal(writer) => writer.write(bytes).await.map_err(|error| prepared.redact_operator_error(error)),
+            Self::Webhdfs(writer) => writer.write(bytes).await.map_err(|error| prepared.redact_remote_error(error)),
+        }
+    }
+
+    async fn close(&mut self, prepared: &PreparedFileMutation<'_>) -> Result<(), String> {
+        match self {
+            Self::OpenDal(writer) => {
+                writer.close().await.map(|_| ()).map_err(|error| prepared.redact_operator_error(error))
+            }
+            Self::Webhdfs(writer) => writer.close().await.map_err(|error| prepared.redact_remote_error(error)),
+        }
+    }
+}
+
+impl AbortableUpload for StreamingDestinationWriter {
+    fn abort(&mut self) -> Pin<Box<dyn Future<Output = Result<(), UploadAbortError>> + Send + '_>> {
+        Box::pin(async move {
+            match self {
+                Self::OpenDal(writer) => opendal::Writer::abort(writer).await.map_err(|error| {
+                    if error.kind() == opendal::ErrorKind::Unsupported {
+                        UploadAbortError::Unsupported
+                    } else {
+                        UploadAbortError::Failed(error.to_string())
+                    }
+                }),
+                Self::Webhdfs(writer) => {
+                    writer.abort_and_wait().await.map_err(UploadAbortError::Failed)?;
+                    Err(UploadAbortError::Unsupported)
+                }
+            }
+        })
+    }
+}
+
 async fn open_remote_copy_writer(
     prepared: &PreparedFileMutation<'_>,
+    partial_relative: &str,
     partial_configured: &str,
-) -> Result<opendal::Writer, TransferFailure> {
+    expected_size: u64,
+) -> Result<StreamingDestinationWriter, TransferFailure> {
+    let idle_timeout = prepared.transfer_idle_timeout(IO_PROGRESS_WATCHDOG);
+    if prepared.uses_streaming_webhdfs_upload() {
+        return tokio::time::timeout(
+            idle_timeout,
+            prepared.open_webhdfs_streaming_writer(partial_relative, expected_size, Arc::new(AtomicBool::new(false))),
+        )
+        .await
+        .map_err(|_| remote_failure("Opening the WebHDFS remote copy destination timed out"))?
+        .map(StreamingDestinationWriter::Webhdfs)
+        .map_err(remote_failure);
+    }
     let writer = tokio::time::timeout(
-        IO_PROGRESS_WATCHDOG,
+        idle_timeout,
         prepared
             .operator
             .writer_with(partial_configured)
@@ -1307,7 +1371,31 @@ async fn open_remote_copy_writer(
             "Injected remote copy writer-open failure after creating its operation-owned partial",
         ));
     }
-    Ok(writer)
+    Ok(StreamingDestinationWriter::OpenDal(writer))
+}
+
+async fn open_upload_writer(
+    prepared: &PreparedFileMutation<'_>,
+    partial_relative: &str,
+    partial_configured: &str,
+    expected_size: u64,
+    chunk_size: usize,
+) -> Result<StreamingDestinationWriter, String> {
+    if prepared.uses_streaming_webhdfs_upload() {
+        return prepared
+            .open_webhdfs_streaming_writer(partial_relative, expected_size, Arc::new(AtomicBool::new(false)))
+            .await
+            .map(StreamingDestinationWriter::Webhdfs);
+    }
+    prepared
+        .operator
+        .writer_with(partial_configured)
+        .append(prepared.requires_append_streaming_write())
+        .chunk(chunk_size)
+        .concurrent(1)
+        .await
+        .map(StreamingDestinationWriter::OpenDal)
+        .map_err(|error| prepared.redact_operator_error(error))
 }
 
 fn injected_remote_copy_persistence_error() -> Option<String> {
@@ -1332,8 +1420,14 @@ async fn execute_remote_transfer<R: Runtime>(
     cancellation: &CancellationToken,
     progress: Arc<TransferProgressSnapshot>,
 ) -> Result<RemoteTransferOutcome, RemoteTransferFailure> {
+    if policy.replace() && prepared.uses_streaming_webhdfs_upload() {
+        return Err(remote_transfer_before_copy(remote_failure(WEBHDFS_REPLACE_UNSUPPORTED)));
+    }
     if prepared.uses_server_side_copy()
-        || (operation == "rename" && (prepared.uses_native_sftp_rename() || prepared.uses_direct_hdfs_native_rename()))
+        || (operation == "rename"
+            && (prepared.uses_native_sftp_rename()
+                || prepared.uses_direct_hdfs_native_rename()
+                || prepared.uses_direct_webhdfs_rename()))
     {
         return execute_server_side_remote_transfer(
             app,
@@ -1424,32 +1518,36 @@ async fn execute_remote_transfer<R: Runtime>(
         return Err(remote_transfer_before_copy(cancelled_failure()));
     }
 
-    let reader = tokio::time::timeout(
-        IO_PROGRESS_WATCHDOG,
-        prepared.operator.reader_with(&source_configured).concurrent(1).chunk(REMOTE_COPY_BUFFER_SIZE),
-    )
-    .await
-    .map_err(|_| remote_failure("Opening the remote copy source timed out"))
-    .and_then(|result| result.map_err(|error| remote_failure(prepared.redact_operator_error(error))))
-    .map_err(remote_transfer_before_copy)?;
+    let relay_buffer_size = prepared.transfer_chunk_size(REMOTE_COPY_BUFFER_SIZE);
+    let idle_timeout = prepared.transfer_idle_timeout(IO_PROGRESS_WATCHDOG);
+    let mut reader_builder = prepared.operator.reader_with(&source_configured).concurrent(1);
+    if !prepared.uses_streaming_webhdfs_upload() {
+        reader_builder = reader_builder.chunk(relay_buffer_size);
+    }
+    let reader = tokio::time::timeout(idle_timeout, reader_builder)
+        .await
+        .map_err(|_| remote_failure("Opening the remote copy source timed out"))
+        .and_then(|result| result.map_err(|error| remote_failure(prepared.redact_operator_error(error))))
+        .map_err(remote_transfer_before_copy)?;
     let mut reader = reader
         .into_futures_async_read(..)
         .await
         .map_err(|error| remote_transfer_before_copy(remote_failure(prepared.redact_operator_error(error))))?;
-    let mut writer = match open_remote_copy_writer(prepared, &partial_configured).await {
-        Ok(writer) => writer,
-        Err(failure) => {
-            return Err(cleanup_remote_copy_partial(
-                prepared,
-                &partial_relative,
-                None,
-                failure,
-                Some(source_before.encode()),
-            )
-            .await)
-        }
-    };
-    let mut buffer = vec![0_u8; REMOTE_COPY_BUFFER_SIZE];
+    let mut writer =
+        match open_remote_copy_writer(prepared, &partial_relative, &partial_configured, source_before.size).await {
+            Ok(writer) => writer,
+            Err(failure) => {
+                return Err(cleanup_remote_copy_partial(
+                    prepared,
+                    &partial_relative,
+                    None,
+                    failure,
+                    Some(source_before.encode()),
+                )
+                .await)
+            }
+        };
+    let mut buffer = vec![0_u8; relay_buffer_size];
     let mut bytes_transferred = 0_i64;
     let mut hasher = Sha256::new();
     let mut last_progress = Instant::now();
@@ -1464,7 +1562,7 @@ async fn execute_remote_transfer<R: Runtime>(
                         invalidate_operator: true,
                     })
                 },
-                result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, reader.read(&mut buffer)) => {
+                result = tokio::time::timeout(idle_timeout, reader.read(&mut buffer)) => {
                     result
                         .map_err(|_| remote_failure("Remote copy read made no progress before the I/O watchdog expired"))?
                         .map_err(|error| remote_failure(prepared.redact_remote_error(error.to_string())))?
@@ -1486,12 +1584,12 @@ async fn execute_remote_transfer<R: Runtime>(
                     })
                 },
                 result = tokio::time::timeout(
-                    IO_PROGRESS_WATCHDOG,
-                    writer.write(Bytes::copy_from_slice(&buffer[..count])),
+                    idle_timeout,
+                    writer.write(Bytes::copy_from_slice(&buffer[..count]), prepared),
                 ) => {
                     result
                         .map_err(|_| remote_failure("Remote copy write made no progress before the I/O watchdog expired"))?
-                        .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
+                        .map_err(remote_failure)?;
                 }
             }
             bytes_transferred =
@@ -1524,14 +1622,35 @@ async fn execute_remote_transfer<R: Runtime>(
                 "Remote source size changed during copy: expected {total_bytes}, copied {bytes_transferred}"
             )));
         }
-        tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.close())
+        tokio::time::timeout(idle_timeout, writer.close(prepared))
             .await
             .map_err(|_| remote_failure("Closing the remote copy destination timed out"))?
-            .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
+            .map_err(remote_failure)?;
         Ok(())
     }
     .await;
-    if let Err(failure) = body {
+    if let Err(mut failure) = body {
+        match tokio::time::timeout(idle_timeout, writer.abort()).await {
+            Ok(Ok(())) | Ok(Err(UploadAbortError::Unsupported)) => {}
+            Ok(Err(UploadAbortError::Failed(error))) => {
+                failure.message.push_str(&format!(
+                    "; remote copy writer abort failed: {}",
+                    prepared.redact_remote_error(sanitize_error(&error))
+                ));
+                failure.invalidate_operator = true;
+            }
+            Err(_) => {
+                failure.message.push_str("; remote copy writer abort timed out");
+                failure.invalidate_operator = true;
+                return Err(remote_partial_failure(
+                    failure.message,
+                    partial_relative.clone(),
+                    Some(source_before.encode()),
+                    None,
+                ));
+            }
+        }
+        drop(writer);
         return Err(cleanup_remote_copy_partial(prepared, &partial_relative, None, failure, None).await);
     }
     wait_at_test_remote_copy_after_close_barrier().await;
@@ -1873,15 +1992,13 @@ async fn reconcile_uncertain_native_move(
     detail: String,
     cancelled: bool,
 ) -> RemoteTransferFailure {
-    let (source, destination) = if prepared.uses_direct_hdfs_native_rename() {
+    let (source, destination) = if prepared.uses_direct_hdfs_native_rename() || prepared.uses_direct_webhdfs_rename() {
         // The direct RPC future has been cancelled or returned an uncertain
         // transport result. Remove its cache entry before any observation so
         // no later operation can reuse that client, then reconcile through a
         // separately constructed and bounded OpenDAL client.
-        prepared.evict_uncertain_hdfs_native_rename();
-        match prepared
-            .observe_uncertain_hdfs_native_rename_fresh(source_path, destination_path, IO_PROGRESS_WATCHDOG)
-            .await
+        prepared.evict_uncertain_direct_rename();
+        match prepared.observe_uncertain_direct_rename_fresh(source_path, destination_path, IO_PROGRESS_WATCHDOG).await
         {
             Ok(observation) => observation,
             Err(error) => (Err(error.clone()), Err(error)),
@@ -1947,7 +2064,7 @@ fn invalidate_hdfs_native_after_uncertain_move(
     prepared: &PreparedFileMutation<'_>,
     mut failure: RemoteTransferFailure,
 ) -> RemoteTransferFailure {
-    if prepared.uses_direct_hdfs_native_rename() {
+    if prepared.uses_direct_hdfs_native_rename() || prepared.uses_direct_webhdfs_rename() {
         failure.failure.invalidate_operator = true;
     }
     failure
@@ -2728,7 +2845,12 @@ async fn execute_upload<R: Runtime>(
         )
         .await;
     }
-    let upload_buffer_size = if prepared.uses_server_side_copy() { S3_UPLOAD_BUFFER_SIZE } else { UPLOAD_BUFFER_SIZE };
+    let upload_buffer_size = prepared.transfer_chunk_size(if prepared.uses_server_side_copy() {
+        S3_UPLOAD_BUFFER_SIZE
+    } else {
+        UPLOAD_BUFFER_SIZE
+    });
+    let idle_timeout = prepared.transfer_idle_timeout(IO_PROGRESS_WATCHDOG);
     let mut writer = tokio::select! {
         _ = cancellation.cancelled() => return Err(UploadFailure::from(upload_cancelled_failure())),
         _ = prepared.cancellation.cancelled() => {
@@ -2739,18 +2861,19 @@ async fn execute_upload<R: Runtime>(
             }))
         },
         result = tokio::time::timeout(
-            IO_PROGRESS_WATCHDOG,
-            prepared
-                .operator
-                .writer_with(partial_configured)
-                .append(prepared.requires_append_streaming_write())
-                .chunk(upload_buffer_size)
-                .concurrent(1),
+            idle_timeout,
+            open_upload_writer(
+                prepared,
+                partial_relative,
+                partial_configured,
+                u64::try_from(local.total_bytes).unwrap_or(u64::MAX),
+                upload_buffer_size,
+            ),
         ) => {
             result
                 .map_err(|_| remote_failure("Opening the remote upload timed out"))
                 .and_then(|result| {
-                    result.map_err(|error| remote_failure(prepared.redact_operator_error(error)))
+                    result.map_err(remote_failure)
                 })
                 .map_err(UploadFailure::from)?
         }
@@ -2797,10 +2920,10 @@ async fn execute_upload<R: Runtime>(
                         invalidate_operator: true,
                     })
                 },
-                result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.write(chunk)) => {
+                result = tokio::time::timeout(idle_timeout, writer.write(chunk, prepared)) => {
                     result
                         .map_err(|_| remote_failure("Remote upload write made no progress before the I/O watchdog expired"))?
-                        .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
+                        .map_err(remote_failure)?;
                 }
             }
             bytes_transferred =
@@ -2839,16 +2962,10 @@ async fn execute_upload<R: Runtime>(
         return Err(abort_upload(writer, prepared, partial_relative, failure).await);
     }
 
-    match tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.close()).await {
+    match tokio::time::timeout(idle_timeout, writer.close(prepared)).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
-            return Err(abort_upload(
-                writer,
-                prepared,
-                partial_relative,
-                remote_failure(prepared.redact_operator_error(error)),
-            )
-            .await);
+            return Err(abort_upload(writer, prepared, partial_relative, remote_failure(error)).await);
         }
         Err(_) => {
             return Err(abort_upload(
@@ -3239,12 +3356,13 @@ async fn ensure_remote_target_absent(prepared: &PreparedFileMutation<'_>, path: 
 }
 
 async fn abort_upload(
-    writer: opendal::Writer,
+    writer: StreamingDestinationWriter,
     prepared: &PreparedFileMutation<'_>,
     partial_relative: &str,
     failure: TransferFailure,
 ) -> UploadFailure {
-    let mut outcome = abort_upload_control_flow(writer, partial_relative, failure, IO_PROGRESS_WATCHDOG, || {
+    let watchdog = prepared.transfer_idle_timeout(IO_PROGRESS_WATCHDOG);
+    let mut outcome = abort_upload_control_flow(writer, partial_relative, failure, watchdog, || {
         prepared.delete_owned_upload_partial(partial_relative)
     })
     .await;
@@ -3297,7 +3415,14 @@ where
         Ok(Err(UploadAbortError::Failed(error))) => format!("failed: {}", sanitize_error(&error)),
         Err(_) => {
             failure.invalidate_operator = true;
-            "timed_out".to_string()
+            failure.status = "partial";
+            failure.message.push_str("; writer abort timed out; operation-owned partial was preserved");
+            return UploadFailure {
+                failure,
+                partial_destination: Some(partial_relative.to_string()),
+                abort_outcome: Some("timed_out".to_string()),
+                publish_outcome: None,
+            };
         }
     };
     drop(writer);
@@ -3791,7 +3916,10 @@ async fn execute_download<R: Runtime>(
     }
 
     let mut output = tokio::fs::File::from_std(std_file);
-    let reader_future = prepared.operator.reader_with(&prepared.remote_path).concurrent(1).chunk(DOWNLOAD_BUFFER_SIZE);
+    let mut reader_future = prepared.operator.reader_with(&prepared.remote_path).concurrent(1);
+    if !prepared.uses_streaming_webhdfs_read() {
+        reader_future = reader_future.chunk(DOWNLOAD_BUFFER_SIZE);
+    }
     let reader = watched_remote(prepared, async { reader_future.await }, "Opening the remote file timed out").await?;
     let mut reader =
         watched_remote(prepared, reader.into_futures_async_read(..), "Preparing the remote stream timed out").await?;
@@ -5358,6 +5486,76 @@ mod tests {
         serde_json::from_value::<StartRemoteTransferInput>(replace).unwrap().policy.validate().unwrap();
     }
 
+    #[tokio::test]
+    async fn webhdfs_replace_is_rejected_before_creating_or_starting_a_transfer() {
+        use super::super::file_manager::{
+            save_file_connection, FileConnectionInput, FileConnectionSecrets, HdfsConnectionConfig,
+        };
+        use super::super::file_manager_webhdfs::{WebhdfsAuthentication, WebhdfsConnectionConfig, WebhdfsWriteOptions};
+
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let connection = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            FileConnectionInput {
+                id: Some("webhdfs-replace-guard".to_string()),
+                expected_revision: None,
+                name: "WebHDFS replace guard".to_string(),
+                config: FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(WebhdfsConnectionConfig {
+                    endpoint: "http://127.0.0.1:9870".to_string(),
+                    root: "/".to_string(),
+                    authentication: WebhdfsAuthentication::Simple,
+                    user_name: "dbx".to_string(),
+                    disable_list_batch: false,
+                    allowed_data_node_origins: vec!["http://localhost:9864".to_string()],
+                    data_node_hostname_mapping: Default::default(),
+                    tls_ca_certificate_path: None,
+                    proxy_url: None,
+                    proxy_bypass: None,
+                    allow_tls_downgrade: false,
+                    connect_timeout_seconds: 10,
+                    control_timeout_seconds: 30,
+                    idle_timeout_seconds: 30,
+                    chunk_size_mib: 4,
+                    write_options: WebhdfsWriteOptions::default(),
+                })),
+                secrets: Some(FileConnectionSecrets {
+                    clear_webhdfs_credentials: Some(true),
+                    ..FileConnectionSecrets::default()
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = start_remote_transfer_inner(
+            app.handle().clone(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            StartRemoteTransferInput {
+                connection_id: connection.id.clone(),
+                source_path: "source.bin".to_string(),
+                destination_path: "destination.bin".to_string(),
+                policy: RemoteMutationPolicy::Replace { confirmed: true },
+            },
+            "copy",
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("WebHDFS Replace must fail before the worker starts");
+        };
+        assert_eq!(error, WEBHDFS_REPLACE_UNSUPPORTED);
+        assert!(state.storage.list_file_transfers(Some(&connection.id), 100).await.unwrap().is_empty());
+    }
+
     #[test]
     fn persisted_remote_fingerprint_accepts_s3_fields_and_validates_optional_ftp_relay_hash() {
         let observed =
@@ -5692,11 +5890,12 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(timed_out.failure.status, "failed");
-        assert_eq!(timed_out.partial_destination, None);
-        assert_eq!(timed_out.abort_outcome.as_deref(), Some("timed_out; operation_owned_partial_cleaned"));
+        assert_eq!(timed_out.failure.status, "partial");
+        assert_eq!(timed_out.partial_destination.as_deref(), Some("dir/.dbx-upload-transfer-random.part"));
+        assert_eq!(timed_out.abort_outcome.as_deref(), Some("timed_out"));
         assert!(timed_out.failure.invalidate_operator);
-        assert!(cleanup_called.load(Ordering::Acquire));
+        assert!(timed_out.failure.message.contains("partial was preserved"));
+        assert!(!cleanup_called.load(Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -6984,6 +7183,349 @@ mod tests {
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
         (app, state, operator, bucket_operator, directory)
+    }
+
+    fn webhdfs_data_node_hostname_mapping() -> std::collections::BTreeMap<String, String> {
+        let Some(raw) =
+            std::env::var("DBX_TEST_WEBHDFS_DATANODE_MAPPING").ok().filter(|value| !value.trim().is_empty())
+        else {
+            return std::collections::BTreeMap::new();
+        };
+        raw.split([',', '\n'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let (host, socket) = entry
+                    .split_once('=')
+                    .unwrap_or_else(|| panic!("DBX_TEST_WEBHDFS_DATANODE_MAPPING entry must be host=socket: {entry}"));
+                let host = host.trim();
+                let socket = socket.trim();
+                assert!(!host.is_empty(), "DBX_TEST_WEBHDFS_DATANODE_MAPPING host must not be empty");
+                assert!(!socket.is_empty(), "DBX_TEST_WEBHDFS_DATANODE_MAPPING socket must not be empty");
+                (host.to_string(), socket.to_string())
+            })
+            .collect()
+    }
+
+    async fn build_webhdfs_contract_app_for(
+        connection_id: &str,
+        root: String,
+    ) -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, tempfile::TempDir) {
+        use super::super::file_manager::{
+            save_file_connection, FileConnectionConfig, FileConnectionInput, FileConnectionSecrets,
+            HdfsConnectionConfig,
+        };
+        use super::super::file_manager_webhdfs::{WebhdfsAuthentication, WebhdfsConnectionConfig, WebhdfsWriteOptions};
+
+        let config = WebhdfsConnectionConfig {
+            endpoint: std::env::var("DBX_TEST_WEBHDFS_ENDPOINT").expect("DBX_TEST_WEBHDFS_ENDPOINT is required"),
+            root,
+            authentication: WebhdfsAuthentication::Simple,
+            user_name: std::env::var("DBX_TEST_WEBHDFS_USER").unwrap_or_else(|_| "hadoop".to_string()),
+            disable_list_batch: false,
+            allowed_data_node_origins: vec![std::env::var("DBX_TEST_WEBHDFS_DATANODE_ORIGIN")
+                .expect("DBX_TEST_WEBHDFS_DATANODE_ORIGIN is required")],
+            data_node_hostname_mapping: webhdfs_data_node_hostname_mapping(),
+            tls_ca_certificate_path: None,
+            proxy_url: None,
+            proxy_bypass: None,
+            allow_tls_downgrade: false,
+            connect_timeout_seconds: 10,
+            control_timeout_seconds: 30,
+            idle_timeout_seconds: 30,
+            chunk_size_mib: 4,
+            write_options: WebhdfsWriteOptions::default(),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_fs::init())
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let saved = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            FileConnectionInput {
+                id: Some(connection_id.to_string()),
+                expected_revision: None,
+                name: format!("WebHDFS contract {connection_id}"),
+                config: FileConnectionConfig::Hdfs(HdfsConnectionConfig::Webhdfs(config)),
+                secrets: Some(FileConnectionSecrets {
+                    clear_webhdfs_credentials: Some(true),
+                    ..FileConnectionSecrets::default()
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.id, connection_id);
+        (app, state, directory)
+    }
+
+    fn webhdfs_rss_size_bytes() -> u64 {
+        let size = std::env::var("DBX_TEST_WEBHDFS_RSS_SIZE_BYTES")
+            .expect("DBX_TEST_WEBHDFS_RSS_SIZE_BYTES is required")
+            .parse::<u64>()
+            .expect("DBX_TEST_WEBHDFS_RSS_SIZE_BYTES must be an integer");
+        assert!(size >= 3, "DBX_TEST_WEBHDFS_RSS_SIZE_BYTES must be at least 3");
+        assert!(i64::try_from(size).is_ok(), "DBX_TEST_WEBHDFS_RSS_SIZE_BYTES exceeds the transfer counter range");
+        size
+    }
+
+    fn create_webhdfs_rss_sparse_source(size: u64) -> PathBuf {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let local_dir = PathBuf::from(
+            std::env::var("DBX_TEST_WEBHDFS_RSS_LOCAL_DIR").expect("DBX_TEST_WEBHDFS_RSS_LOCAL_DIR is required"),
+        )
+        .canonicalize()
+        .expect("DBX_TEST_WEBHDFS_RSS_LOCAL_DIR must exist");
+        let source = local_dir.join(format!("dbx-webhdfs-rss-{}-{}.bin", std::process::id(), Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new().create_new(true).read(true).write(true).open(&source).unwrap();
+        file.set_len(size).unwrap();
+        for (offset, byte) in [(0, 0x11_u8), (size / 2, 0x22_u8), (size - 1, 0x33_u8)] {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&[byte]).unwrap();
+        }
+        file.sync_all().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let allocated = file.metadata().unwrap().blocks().saturating_mul(512);
+            assert!(
+                allocated <= 16 * 1024 * 1024,
+                "RSS source must remain sparse: allocated {allocated} bytes for logical size {size}"
+            );
+        }
+        drop(file);
+        source
+    }
+
+    async fn wait_for_webhdfs_rss_terminal(storage: &Storage, transfer_id: &str) -> FileTransferStorageRecord {
+        tokio::time::timeout(Duration::from_secs(26 * 60 * 60), async {
+            loop {
+                let record = storage.get_file_transfer(transfer_id).await.unwrap().unwrap();
+                if matches!(record.status.as_str(), "completed" | "failed" | "partial" | "cancelled") {
+                    return record;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("WebHDFS RSS transfer {transfer_id} did not terminate within 26 hours"))
+    }
+
+    async fn build_webhdfs_rss_contract_app() -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, tempfile::TempDir)
+    {
+        build_webhdfs_contract_app_for(
+            "webhdfs-rss-contract",
+            std::env::var("DBX_TEST_WEBHDFS_ROOT").expect("DBX_TEST_WEBHDFS_ROOT is required"),
+        )
+        .await
+    }
+
+    async fn start_webhdfs_rss_upload(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        state: &Arc<AppState>,
+        source: &Path,
+        destination: &str,
+    ) -> StartTransferResult {
+        let window = tauri::WebviewWindowBuilder::new(app, "main", Default::default()).build().unwrap();
+        window.fs_scope().allow_file(source).unwrap();
+        start_upload_inner(
+            app.handle().clone(),
+            window,
+            state,
+            app.state::<FileTransferRuntime>().inner(),
+            StartUploadInput {
+                connection_id: "webhdfs-rss-contract".to_string(),
+                local_path: source.to_string_lossy().into_owned(),
+                remote_path: destination.to_string(),
+                policy: UploadPolicy::best_effort_no_clobber(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/webhdfs-contract.sh with DBX_TEST_WEBHDFS_RSS_SIZES_GIB"]
+    async fn fixed_webhdfs_production_rss_seed_contract() {
+        use super::super::file_manager_webhdfs::{reset_test_open_request_count, test_open_request_count};
+
+        let size = webhdfs_rss_size_bytes();
+        let (app, state, _directory) = build_webhdfs_rss_contract_app().await;
+        let source = create_webhdfs_rss_sparse_source(size);
+        reset_test_open_request_count();
+        let started = start_webhdfs_rss_upload(&app, &state, &source, "rss-source.bin").await;
+        let transfer = wait_for_webhdfs_rss_terminal(&state.storage, &started.transfer_id).await;
+        assert_eq!(transfer.status, "completed", "{transfer:?}");
+        assert_eq!(transfer.bytes_transferred, i64::try_from(size).unwrap(), "{transfer:?}");
+        assert_eq!(test_open_request_count(), 0, "WebHDFS upload must not issue OPEN requests");
+        std::fs::remove_file(source).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/webhdfs-contract.sh with DBX_TEST_WEBHDFS_RSS_SIZES_GIB"]
+    async fn fixed_webhdfs_production_worker_rss_contract() {
+        use super::super::file_manager_webhdfs::{reset_test_open_request_count, test_open_request_count};
+
+        let operation =
+            std::env::var("DBX_TEST_WEBHDFS_RSS_OPERATION").expect("DBX_TEST_WEBHDFS_RSS_OPERATION is required");
+        assert!(matches!(operation.as_str(), "upload" | "copy"), "RSS operation must be upload or copy");
+        let size = webhdfs_rss_size_bytes();
+        let (app, state, _directory) = build_webhdfs_rss_contract_app().await;
+        reset_test_open_request_count();
+        let (started, local_source) = if operation == "upload" {
+            let source = create_webhdfs_rss_sparse_source(size);
+            let started = start_webhdfs_rss_upload(&app, &state, &source, "rss-upload.bin").await;
+            (started, Some(source))
+        } else {
+            let started = start_remote_transfer_inner(
+                app.handle().clone(),
+                &state,
+                app.state::<FileTransferRuntime>().inner(),
+                StartRemoteTransferInput {
+                    connection_id: "webhdfs-rss-contract".to_string(),
+                    source_path: "rss-source.bin".to_string(),
+                    destination_path: "rss-copy.bin".to_string(),
+                    policy: RemoteMutationPolicy::BestEffortNoClobber {
+                        atomic_no_clobber: false,
+                        external_toctou_risk: true,
+                    },
+                },
+                "copy",
+            )
+            .await
+            .unwrap();
+            (started, None)
+        };
+        let transfer = wait_for_webhdfs_rss_terminal(&state.storage, &started.transfer_id).await;
+        assert_eq!(transfer.status, "completed", "{transfer:?}");
+        assert_eq!(transfer.bytes_transferred, i64::try_from(size).unwrap(), "{transfer:?}");
+        assert!(transfer.partial_destination.is_none(), "{transfer:?}");
+        let open_requests = test_open_request_count();
+        let open_limit = if operation == "upload" { 1 } else { 4 };
+        assert!(
+            open_requests <= open_limit,
+            "WebHDFS {operation} issued {open_requests} OPEN requests, expected at most {open_limit}"
+        );
+        if let Some(source) = local_source {
+            std::fs::remove_file(source).unwrap();
+        }
+        println!(
+            "DBX_WEBHDFS_RSS operation={operation} size_bytes={size} bytes_transferred={} namenode_open_requests={open_requests}",
+            transfer.bytes_transferred
+        );
+    }
+
+    async fn build_webhdfs_contract_app() -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, tempfile::TempDir) {
+        build_webhdfs_contract_app_for(
+            "webhdfs-contract",
+            std::env::var("DBX_TEST_WEBHDFS_ROOT").expect("DBX_TEST_WEBHDFS_ROOT is required"),
+        )
+        .await
+    }
+
+    async fn assert_webhdfs_upload_artifacts_absent(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        connection_id: &str,
+        parent: &str,
+        transfer_id: &str,
+        destination: &str,
+    ) {
+        let upload_prefix = format!(".dbx-upload-{transfer_id}-");
+        for _ in 0..8 {
+            let page = super::super::file_manager::list_file_entries(
+                app.state::<Arc<AppState>>(),
+                app.state::<FileManagerRuntime>(),
+                connection_id.to_string(),
+                parent.to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+            let residuals = page
+                .entries
+                .iter()
+                .filter(|entry| {
+                    let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                    entry.path == destination || (name.starts_with(&upload_prefix) && name.ends_with(".part"))
+                })
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            assert!(
+                residuals.is_empty(),
+                "WebHDFS transfer left destination or operation-owned partials: {residuals:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    fn webhdfs_fault_control(control: &str, method: &str, route: &str) -> serde_json::Value {
+        let output = Command::new("curl")
+            .args(["--silent", "--show-error", "--fail", "--request", method])
+            .arg(format!("{control}{route}"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "WebHDFS fault control request failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("WebHDFS fault control returned invalid JSON")
+    }
+
+    async fn wait_for_webhdfs_fault_trigger(trace: &Path, label: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let trace = tokio::fs::read_to_string(trace).await.unwrap_or_default();
+                let trigger = trace
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|event| {
+                        event.get("event").and_then(serde_json::Value::as_str) == Some("trigger")
+                            && event.get("label").and_then(serde_json::Value::as_str) == Some(label)
+                    });
+                if let Some(trigger) = trigger {
+                    assert_eq!(trigger.get("action").and_then(serde_json::Value::as_str), Some("reset"));
+                    assert_eq!(trigger.get("direction").and_then(serde_json::Value::as_str), Some("upstream"));
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("WebHDFS DataNode fault did not trigger");
+    }
+
+    async fn assert_webhdfs_fault_proxy_idle(control: &str) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let health = webhdfs_fault_control(control, "GET", "/health");
+                if health.get("activeConnections").and_then(serde_json::Value::as_u64) == Some(0) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("WebHDFS DataNode fault proxy retained active connections");
+        for _ in 0..8 {
+            let health = webhdfs_fault_control(control, "GET", "/health");
+            assert_eq!(
+                health.get("activeConnections").and_then(serde_json::Value::as_u64),
+                Some(0),
+                "WebHDFS DataNode fault proxy reopened a connection after worker termination"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
     }
 
     async fn build_webdav_contract_app(
@@ -8602,6 +9144,408 @@ mod tests {
         tokio::spawn(async move {
             run_remote_transfer_worker(app_handle, transfer_id, connection_id, cancellation, operation, policy).await;
         })
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/webhdfs-contract.sh with the fixed Hadoop service"]
+    async fn fixed_webhdfs_file_transfer_worker_contract() {
+        use super::super::file_manager::{
+            create_file_directory, delete_file_entry, list_file_entries, stat_file_entry,
+        };
+        use super::super::file_manager_webhdfs::{reset_test_open_request_count, test_open_request_count};
+
+        async fn assert_cancelled_webhdfs_artifacts_absent(
+            app: &tauri::App<tauri::test::MockRuntime>,
+            transfer_id: &str,
+            destination: &str,
+        ) {
+            let upload_prefix = format!(".dbx-upload-{transfer_id}-");
+            let copy_prefix = format!(".dbx-copy-{transfer_id}-");
+            for _ in 0..8 {
+                let page = list_file_entries(
+                    app.state::<Arc<AppState>>(),
+                    app.state::<FileManagerRuntime>(),
+                    "webhdfs-contract".to_string(),
+                    "worker".to_string(),
+                    None,
+                )
+                .await
+                .unwrap();
+                let residuals = page
+                    .entries
+                    .iter()
+                    .filter(|entry| {
+                        let name = entry.path.rsplit('/').next().unwrap_or(&entry.path);
+                        entry.path == destination
+                            || ((name.starts_with(&upload_prefix) || name.starts_with(&copy_prefix))
+                                && name.ends_with(".part"))
+                    })
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>();
+                assert!(
+                    residuals.is_empty(),
+                    "cancelled WebHDFS transfer left destination or operation-owned partials: {residuals:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        let (app, state, directory) = build_webhdfs_contract_app().await;
+        app.state::<FileTransferRuntime>()
+            .ensure_recovered(&state, app.state::<FileManagerRuntime>().inner())
+            .await
+            .unwrap();
+        create_file_directory(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "webhdfs-contract".to_string(),
+            "worker".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let local_root = directory.path().canonicalize().unwrap();
+        let source_path = local_root.join("webhdfs-upload-source.bin");
+        let mut payload = vec![0x5a; 9 * 1024 * 1024 + 17];
+        payload[0] = 0x11;
+        payload[9 * 1024 * 1024] = 0x22;
+        tokio::fs::write(&source_path, &payload).await.unwrap();
+
+        let (_, upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "webhdfs-contract",
+            "webhdfs-upload-success",
+            "worker/source 100%+#?&=.bin",
+            &source_path,
+        )
+        .await;
+        upload_worker.await.unwrap();
+        let upload = state.storage.get_file_transfer("webhdfs-upload-success").await.unwrap().unwrap();
+        assert_eq!(upload.status, "completed", "{upload:?}");
+        assert_eq!(upload.publish_outcome.as_deref(), Some("completed"), "{upload:?}");
+        assert!(upload.partial_destination.is_none(), "{upload:?}");
+
+        let upload_cancel_barrier = install_test_upload_after_chunk_barrier();
+        let (_, cancelled_upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "webhdfs-contract",
+            "webhdfs-upload-cancelled",
+            "worker/upload-cancelled.bin",
+            &source_path,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(15), upload_cancel_barrier.opened.notified())
+            .await
+            .expect("WebHDFS upload did not complete its first configured chunk");
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "webhdfs-upload-cancelled",
+        )
+        .await
+        .unwrap();
+        upload_cancel_barrier.release.notify_one();
+        cancelled_upload_worker.await.unwrap();
+        let cancelled_upload = state.storage.get_file_transfer("webhdfs-upload-cancelled").await.unwrap().unwrap();
+        assert_cancelled_webhdfs_artifacts_absent(&app, "webhdfs-upload-cancelled", "worker/upload-cancelled.bin")
+            .await;
+        assert_eq!(cancelled_upload.status, "cancelled", "{cancelled_upload:?}");
+        assert!((1..=4 * 1024 * 1024).contains(&cancelled_upload.bytes_transferred), "{cancelled_upload:?}");
+        assert_eq!(cancelled_upload.partial_destination, None, "{cancelled_upload:?}");
+        assert_eq!(
+            cancelled_upload.abort_outcome.as_deref(),
+            Some("unsupported; operation_owned_partial_cleaned"),
+            "{cancelled_upload:?}"
+        );
+        assert_eq!(cancelled_upload.publish_outcome, None, "{cancelled_upload:?}");
+
+        let download_path = local_root.join("webhdfs-download.bin");
+        reset_test_open_request_count();
+        let (_, download_worker) = create_worker_transfer_for_connection(
+            &app,
+            "webhdfs-contract",
+            "webhdfs-download-success",
+            "worker/source 100%+#?&=.bin",
+            &download_path,
+        )
+        .await;
+        download_worker.await.unwrap();
+        assert_eq!(test_open_request_count(), 1, "WebHDFS download must use one OPEN request");
+        let download = state.storage.get_file_transfer("webhdfs-download-success").await.unwrap().unwrap();
+        assert_eq!(download.status, "completed", "{download:?}");
+        assert_eq!(tokio::fs::read(&download_path).await.unwrap(), payload);
+        assert_no_owned_temp(&local_root, "webhdfs-download-success");
+
+        reset_test_remote_copy_high_water();
+        reset_test_open_request_count();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "webhdfs-contract",
+            "webhdfs-copy-success",
+            "copy",
+            "worker/source 100%+#?&=.bin",
+            "worker/copy 100%+#?&=.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let copy = state.storage.get_file_transfer("webhdfs-copy-success").await.unwrap().unwrap();
+        assert_eq!(copy.status, "completed", "{copy:?}");
+        assert_eq!(copy.operation_outcome.as_deref(), Some("completed"), "{copy:?}");
+        assert!(copy.partial_destination.is_none(), "{copy:?}");
+        assert_eq!(
+            test_open_request_count(),
+            3,
+            "WebHDFS copy must use one source, one partial-verification, and one destination-verification OPEN"
+        );
+        let configured_chunk = 4 * 1024 * 1024;
+        let (max_read_chunk, max_write_chunk, max_relay_payload) = test_remote_copy_high_water();
+        assert!((1..=configured_chunk).contains(&max_read_chunk), "{max_read_chunk}");
+        assert!((1..=configured_chunk).contains(&max_write_chunk), "{max_write_chunk}");
+        assert!((1..=configured_chunk).contains(&max_relay_payload), "{max_relay_payload}");
+
+        reset_test_remote_copy_high_water();
+        let copy_cancel_barrier = install_test_remote_copy_after_chunk_barrier();
+        let cancelled_copy_worker = create_remote_worker_transfer_for_connection(
+            &app,
+            "webhdfs-contract",
+            "webhdfs-copy-cancelled",
+            "copy",
+            "worker/source 100%+#?&=.bin",
+            "worker/copy-cancelled.bin",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(15), copy_cancel_barrier.opened.notified())
+            .await
+            .expect("WebHDFS copy did not complete its first relay chunk");
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "webhdfs-copy-cancelled",
+        )
+        .await
+        .unwrap();
+        copy_cancel_barrier.release.notify_one();
+        cancelled_copy_worker.await.unwrap();
+        let cancelled_copy = state.storage.get_file_transfer("webhdfs-copy-cancelled").await.unwrap().unwrap();
+        assert_eq!(cancelled_copy.status, "cancelled", "{cancelled_copy:?}");
+        assert!((1..=configured_chunk as i64).contains(&cancelled_copy.bytes_transferred), "{cancelled_copy:?}");
+        assert_eq!(cancelled_copy.partial_destination, None, "{cancelled_copy:?}");
+        assert_eq!(cancelled_copy.operation_outcome.as_deref(), Some("failed_before_copy"), "{cancelled_copy:?}");
+        assert_eq!(cancelled_copy.operation_phase.as_deref(), Some("copying"), "{cancelled_copy:?}");
+        assert_eq!(cancelled_copy.destination_fingerprint, None, "{cancelled_copy:?}");
+        let (max_read_chunk, max_write_chunk, max_relay_payload) = test_remote_copy_high_water();
+        assert!((1..=configured_chunk).contains(&max_read_chunk), "{max_read_chunk}");
+        assert!((1..=configured_chunk).contains(&max_write_chunk), "{max_write_chunk}");
+        assert!((1..=configured_chunk).contains(&max_relay_payload), "{max_relay_payload}");
+        assert_cancelled_webhdfs_artifacts_absent(&app, "webhdfs-copy-cancelled", "worker/copy-cancelled.bin").await;
+
+        create_remote_worker_transfer_with_policy(
+            &app,
+            "webhdfs-contract",
+            "webhdfs-rename-success",
+            "rename",
+            "worker/copy 100%+#?&=.bin",
+            "worker/renamed 100%+#?&=.bin",
+            RemoteMutationPolicy::BestEffortNoClobber { atomic_no_clobber: false, external_toctou_risk: true },
+        )
+        .await
+        .await
+        .unwrap();
+        let renamed = state.storage.get_file_transfer("webhdfs-rename-success").await.unwrap().unwrap();
+        assert_eq!(renamed.status, "completed", "{renamed:?}");
+        assert_eq!(renamed.operation_outcome.as_deref(), Some("completed"), "{renamed:?}");
+
+        reset_test_remote_copy_high_water();
+        reset_test_open_request_count();
+        create_remote_worker_transfer_with_policy(
+            &app,
+            "webhdfs-contract",
+            "webhdfs-rename-replace-existing",
+            "rename",
+            "worker/source 100%+#?&=.bin",
+            "worker/renamed 100%+#?&=.bin",
+            RemoteMutationPolicy::Replace { confirmed: true },
+        )
+        .await
+        .await
+        .unwrap();
+        let rejected = state.storage.get_file_transfer("webhdfs-rename-replace-existing").await.unwrap().unwrap();
+        assert_eq!(rejected.status, "failed", "{rejected:?}");
+        assert!(rejected.error.as_deref().is_some_and(|error| error.contains(WEBHDFS_REPLACE_UNSUPPORTED)));
+        assert_eq!(rejected.bytes_transferred, 0, "{rejected:?}");
+        assert_eq!(rejected.partial_destination, None, "{rejected:?}");
+        assert_eq!(test_open_request_count(), 0, "WebHDFS Replace must fail before opening the source");
+        assert_eq!(test_remote_copy_high_water(), (0, 0, 0));
+
+        let page = list_file_entries(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "webhdfs-contract".to_string(),
+            "worker".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(page.entries.iter().any(|entry| entry.path == "worker/source 100%+#?&=.bin"));
+        assert!(page.entries.iter().any(|entry| entry.path == "worker/renamed 100%+#?&=.bin"));
+        let stat = stat_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "webhdfs-contract".to_string(),
+            "worker/renamed 100%+#?&=.bin".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stat.size, payload.len() as u64);
+
+        for path in ["worker/source 100%+#?&=.bin", "worker/renamed 100%+#?&=.bin"] {
+            delete_file_entry(
+                app.state::<Arc<AppState>>(),
+                app.state::<FileManagerRuntime>(),
+                "webhdfs-contract".to_string(),
+                path.to_string(),
+                Some(false),
+                Some("file".to_string()),
+            )
+            .await
+            .unwrap();
+        }
+        delete_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "webhdfs-contract".to_string(),
+            "worker".to_string(),
+            Some(false),
+            Some("directory".to_string()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/webhdfs-contract.sh with the fixed Hadoop service"]
+    async fn fixed_webhdfs_permission_failure_contract() {
+        let connection_id = "webhdfs-permission-contract";
+        let root =
+            std::env::var("DBX_TEST_WEBHDFS_PERMISSION_ROOT").expect("DBX_TEST_WEBHDFS_PERMISSION_ROOT is required");
+        let (app, state, directory) = build_webhdfs_contract_app_for(connection_id, root).await;
+        app.state::<FileTransferRuntime>()
+            .ensure_recovered(&state, app.state::<FileManagerRuntime>().inner())
+            .await
+            .unwrap();
+        let source = directory.path().canonicalize().unwrap().join("permission-denied-source.bin");
+        let payload = vec![0x61_u8; 2 * 1024 * 1024 + 17];
+        tokio::fs::write(&source, &payload).await.unwrap();
+        let transfer_id = "webhdfs-upload-permission-denied";
+        let destination = "permission-denied-target.bin";
+
+        let (_, worker) =
+            create_upload_worker_transfer_for_connection(&app, connection_id, transfer_id, destination, &source).await;
+        tokio::time::timeout(Duration::from_secs(30), worker)
+            .await
+            .expect("WebHDFS permission-denied upload worker timed out")
+            .unwrap();
+        let transfer = state.storage.get_file_transfer(transfer_id).await.unwrap().unwrap();
+        assert_eq!(transfer.status, "failed", "{transfer:?}");
+        assert_ne!(transfer.status, "completed", "{transfer:?}");
+        assert_eq!(Some(transfer.bytes_transferred), transfer.total_bytes, "{transfer:?}");
+        assert_eq!(transfer.partial_destination, None, "{transfer:?}");
+        let error = transfer.error.as_deref().unwrap_or_default().to_ascii_lowercase();
+        assert!(
+            error.contains("permission") || error.contains("accesscontrol") || error.contains("forbidden"),
+            "{transfer:?}"
+        );
+        assert_webhdfs_upload_artifacts_absent(&app, connection_id, "", transfer_id, destination).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/webhdfs-contract.sh with the fixed Hadoop service"]
+    async fn fixed_webhdfs_quota_failure_contract() {
+        let connection_id = "webhdfs-quota-contract";
+        let root = std::env::var("DBX_TEST_WEBHDFS_QUOTA_ROOT").expect("DBX_TEST_WEBHDFS_QUOTA_ROOT is required");
+        let (app, state, directory) = build_webhdfs_contract_app_for(connection_id, root).await;
+        app.state::<FileTransferRuntime>()
+            .ensure_recovered(&state, app.state::<FileManagerRuntime>().inner())
+            .await
+            .unwrap();
+        let source = directory.path().canonicalize().unwrap().join("quota-source.bin");
+        let payload = vec![0x71_u8; 2 * 1024 * 1024 + 17];
+        tokio::fs::write(&source, &payload).await.unwrap();
+        let transfer_id = "webhdfs-upload-quota-exceeded";
+        let destination = "quota-target.bin";
+
+        let (_, worker) =
+            create_upload_worker_transfer_for_connection(&app, connection_id, transfer_id, destination, &source).await;
+        tokio::time::timeout(Duration::from_secs(30), worker)
+            .await
+            .expect("WebHDFS quota upload worker timed out")
+            .unwrap();
+        let transfer = state.storage.get_file_transfer(transfer_id).await.unwrap().unwrap();
+        assert_eq!(transfer.status, "failed", "{transfer:?}");
+        assert_ne!(transfer.status, "completed", "{transfer:?}");
+        assert_eq!(transfer.partial_destination, None, "{transfer:?}");
+        let error = transfer.error.as_deref().unwrap_or_default().to_ascii_lowercase();
+        assert!(error.contains("quota") || error.contains("space"), "{transfer:?}");
+        assert_webhdfs_upload_artifacts_absent(&app, connection_id, "", transfer_id, destination).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/webhdfs-contract.sh with the fixed Hadoop service and DataNode fault proxy"]
+    async fn fixed_webhdfs_datanode_disconnect_contract() {
+        let connection_id = "webhdfs-disconnect-contract";
+        let root = std::env::var("DBX_TEST_WEBHDFS_ROOT").expect("DBX_TEST_WEBHDFS_ROOT is required");
+        let fault_control =
+            std::env::var("DBX_TEST_WEBHDFS_FAULT_CONTROL").expect("DBX_TEST_WEBHDFS_FAULT_CONTROL is required");
+        let fault_trace = PathBuf::from(
+            std::env::var("DBX_TEST_WEBHDFS_FAULT_TRACE").expect("DBX_TEST_WEBHDFS_FAULT_TRACE is required"),
+        );
+        let (app, state, directory) = build_webhdfs_contract_app_for(connection_id, root).await;
+        app.state::<FileTransferRuntime>()
+            .ensure_recovered(&state, app.state::<FileManagerRuntime>().inner())
+            .await
+            .unwrap();
+        assert_webhdfs_fault_proxy_idle(&fault_control).await;
+        let source = directory.path().canonicalize().unwrap().join("datanode-disconnect-source.bin");
+        let payload = vec![0x64_u8; 8 * 1024 * 1024 + 17];
+        tokio::fs::write(&source, &payload).await.unwrap();
+        let transfer_id = "webhdfs-upload-datanode-disconnect";
+        let destination = "datanode-disconnect-target.bin";
+        let fault_label = "webhdfs-upload-reset";
+        let armed = webhdfs_fault_control(
+            &fault_control,
+            "POST",
+            &format!("/arm?action=reset&direction=upstream&bytes={}&label={fault_label}&scope=next", 256 * 1024),
+        );
+        assert_eq!(armed.pointer("/armedFault/label").and_then(serde_json::Value::as_str), Some(fault_label));
+
+        let (_, worker) =
+            create_upload_worker_transfer_for_connection(&app, connection_id, transfer_id, destination, &source).await;
+        wait_for_webhdfs_fault_trigger(&fault_trace, fault_label).await;
+        tokio::time::timeout(Duration::from_secs(30), worker)
+            .await
+            .expect("WebHDFS DataNode-disconnect upload worker timed out")
+            .unwrap();
+        let transfer = state.storage.get_file_transfer(transfer_id).await.unwrap().unwrap();
+        assert_eq!(transfer.status, "failed", "{transfer:?}");
+        assert_ne!(transfer.status, "completed", "{transfer:?}");
+        assert!(transfer.bytes_transferred > 0, "{transfer:?}");
+        assert_eq!(transfer.partial_destination, None, "{transfer:?}");
+        let abort_outcome = transfer.abort_outcome.as_deref().unwrap_or_default();
+        assert!(
+            (abort_outcome.starts_with("unsupported;") || abort_outcome.starts_with("failed:"))
+                && abort_outcome.ends_with("operation_owned_partial_cleaned"),
+            "{transfer:?}"
+        );
+        assert!(transfer.error.is_some(), "{transfer:?}");
+        let health = webhdfs_fault_control(&fault_control, "GET", "/health");
+        assert!(health.get("armedFault").is_none_or(serde_json::Value::is_null));
+        assert_webhdfs_upload_artifacts_absent(&app, connection_id, "", transfer_id, destination).await;
+        assert_webhdfs_fault_proxy_idle(&fault_control).await;
     }
 
     #[tokio::test]

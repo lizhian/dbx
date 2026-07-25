@@ -21,6 +21,7 @@ mod file_manager_paths;
 mod file_manager_s3;
 mod file_manager_sftp;
 mod file_manager_webdav;
+mod file_manager_webhdfs;
 pub mod file_transfer;
 pub mod fs_open;
 pub mod history;

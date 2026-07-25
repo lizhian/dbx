@@ -538,6 +538,8 @@ impl Storage {
             "sftp_private_key",
             "sftp_private_key_passphrase",
             "sftp_scope",
+            "webhdfs_delegation_token",
+            "webhdfs_scope",
         ];
         if secret_keys.is_empty()
             || !secret_keys.iter().all(|key| ALLOWED_SECRET_KEYS.contains(&key.as_str()))
@@ -774,7 +776,7 @@ impl Storage {
                             EXISTS(
                                 SELECT 1 FROM file_connection_secrets s
                                 WHERE s.connection_id = f.id
-                                  AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase')
+                                  AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase', 'webhdfs_delegation_token')
                             )
                      FROM file_connections f
                      ORDER BY lower(f.name), f.id",
@@ -794,7 +796,7 @@ impl Storage {
                         EXISTS(
                             SELECT 1 FROM file_connection_secrets s
                             WHERE s.connection_id = f.id
-                              AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase')
+                              AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase', 'webhdfs_delegation_token')
                         )
                  FROM file_connections f
                  WHERE f.id = ?1",
@@ -1342,7 +1344,7 @@ fn query_file_connection_record(conn: &Connection, id: &str) -> Result<FileConne
                 EXISTS(
                     SELECT 1 FROM file_connection_secrets s
                     WHERE s.connection_id = f.id
-                      AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase')
+                      AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase', 'webhdfs_delegation_token')
                 )
          FROM file_connections f
          WHERE f.id = ?1",
