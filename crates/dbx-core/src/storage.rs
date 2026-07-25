@@ -535,6 +535,9 @@ impl Storage {
             "s3_scope",
             "webdav_token",
             "webdav_scope",
+            "sftp_private_key",
+            "sftp_private_key_passphrase",
+            "sftp_scope",
         ];
         if secret_keys.is_empty()
             || !secret_keys.iter().all(|key| ALLOWED_SECRET_KEYS.contains(&key.as_str()))
@@ -771,7 +774,7 @@ impl Storage {
                             EXISTS(
                                 SELECT 1 FROM file_connection_secrets s
                                 WHERE s.connection_id = f.id
-                                  AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token')
+                                  AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase')
                             )
                      FROM file_connections f
                      ORDER BY lower(f.name), f.id",
@@ -791,7 +794,7 @@ impl Storage {
                         EXISTS(
                             SELECT 1 FROM file_connection_secrets s
                             WHERE s.connection_id = f.id
-                              AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token')
+                              AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase')
                         )
                  FROM file_connections f
                  WHERE f.id = ?1",
@@ -1339,7 +1342,7 @@ fn query_file_connection_record(conn: &Connection, id: &str) -> Result<FileConne
                 EXISTS(
                     SELECT 1 FROM file_connection_secrets s
                     WHERE s.connection_id = f.id
-                      AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token')
+                      AND s.key IN ('password', 'access_key_id', 'secret_access_key', 'session_token', 'webdav_token', 'sftp_private_key', 'sftp_private_key_passphrase')
                 )
          FROM file_connections f
          WHERE f.id = ?1",
@@ -6483,6 +6486,128 @@ mod tests {
             .unwrap();
         assert!(!cleared.has_secret);
         assert!(storage.load_file_connection_secret("webdav-1", "webdav_token").await.unwrap().is_none());
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[tokio::test]
+    async fn sftp_secret_bundle_round_trips_preserves_replaces_and_clears_without_config_leakage() {
+        let db = temp_db_path("sftp-file-connection-secrets");
+        let storage = Storage::open(&db).await.unwrap();
+        let config = r#"{"type":"sftp","endpoint":"ssh://sftp.example.test:22","root":"/srv/dbx","username":"dbx","authentication":"private_key"}"#;
+        let secret_keys = vec!["sftp_private_key".to_string(), "sftp_private_key_passphrase".to_string()];
+        let scope = "sftp\nssh://sftp.example.test:22\n/srv/dbx\ndbx\nPrivateKey";
+        let created = storage
+            .save_file_connection_with_secret_bundle(
+                "sftp-1".into(),
+                "SFTP".into(),
+                "sftp".into(),
+                config.into(),
+                vec![
+                    ("sftp_private_key".into(), "private-key-one".into()),
+                    ("sftp_private_key_passphrase".into(), "passphrase-one".into()),
+                ],
+                secret_keys.clone(),
+                "sftp_scope".into(),
+                scope.into(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(created.has_secret);
+        for secret in ["private-key-one", "passphrase-one"] {
+            assert!(!created.config_json.contains(secret));
+        }
+        assert_eq!(
+            storage.load_file_connection_secret("sftp-1", "sftp_private_key").await.unwrap().as_deref(),
+            Some("private-key-one")
+        );
+
+        let preserved = storage
+            .save_file_connection_with_secret_bundle(
+                "sftp-1".into(),
+                "SFTP renamed".into(),
+                "sftp".into(),
+                config.into(),
+                Vec::new(),
+                secret_keys.clone(),
+                "sftp_scope".into(),
+                scope.into(),
+                false,
+                Some(1),
+            )
+            .await
+            .unwrap();
+        assert!(preserved.has_secret);
+        assert_eq!(
+            storage.load_file_connection_secret("sftp-1", "sftp_private_key_passphrase").await.unwrap().as_deref(),
+            Some("passphrase-one")
+        );
+
+        let replaced = storage
+            .save_file_connection_with_secret_bundle(
+                "sftp-1".into(),
+                "SFTP rotated".into(),
+                "sftp".into(),
+                config.into(),
+                vec![
+                    ("sftp_private_key".into(), "private-key-two".into()),
+                    ("sftp_private_key_passphrase".into(), "passphrase-two".into()),
+                ],
+                secret_keys.clone(),
+                "sftp_scope".into(),
+                scope.into(),
+                true,
+                Some(2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.revision, 3);
+        assert_eq!(
+            storage.load_file_connection_secret("sftp-1", "sftp_private_key").await.unwrap().as_deref(),
+            Some("private-key-two")
+        );
+
+        let empty_rejected = storage
+            .save_file_connection_with_secret_bundle(
+                "sftp-1".into(),
+                "SFTP".into(),
+                "sftp".into(),
+                config.into(),
+                vec![("sftp_private_key".into(), String::new())],
+                secret_keys.clone(),
+                "sftp_scope".into(),
+                scope.into(),
+                true,
+                Some(3),
+            )
+            .await
+            .unwrap_err();
+        assert!(empty_rejected.contains("cannot be empty"));
+        assert_eq!(
+            storage.load_file_connection_secret("sftp-1", "sftp_private_key").await.unwrap().as_deref(),
+            Some("private-key-two")
+        );
+
+        let switched = storage
+            .save_file_connection_with_secret_bundle(
+                "sftp-1".into(),
+                "SFTP agent".into(),
+                "sftp".into(),
+                config.replace("\"private_key\"", "\"agent\""),
+                Vec::new(),
+                secret_keys,
+                "sftp_scope".into(),
+                "sftp\nssh://sftp.example.test:22\n/srv/dbx\ndbx\nAgent".into(),
+                true,
+                Some(3),
+            )
+            .await
+            .unwrap();
+        assert!(!switched.has_secret);
+        for key in ["sftp_private_key", "sftp_private_key_passphrase", "sftp_scope"] {
+            assert!(storage.load_file_connection_secret("sftp-1", key).await.unwrap().is_none());
+        }
         std::fs::remove_file(&db).ok();
     }
 

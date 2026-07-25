@@ -16,6 +16,14 @@ use super::file_manager_s3::{
     stat_directory_or_virtual as stat_s3_directory_or_virtual, test_connection as test_s3_connection,
     validate_config as validate_s3_config, write_object_exact as write_s3_object_exact,
 };
+use super::file_manager_sftp::{
+    build_operator as build_sftp_operator, capabilities as sftp_capabilities, classify_error as classify_sftp_error,
+    classify_message as classify_sftp_message, cleanup_crash_residue as cleanup_sftp_crash_residue,
+    create_directory as create_sftp_directory, delete_entry as delete_sftp_entry,
+    normalize_root as normalize_sftp_root, redact_temporary_key_paths, secret_scope as sftp_secret_scope,
+    test_connection as test_sftp_connection, validate_config as validate_sftp_config, SftpKeyMaterial, SftpPathGuard,
+};
+pub use super::file_manager_sftp::{SftpAuthentication, SftpConnectionConfig};
 use super::file_manager_webdav::{
     build_operator as build_webdav_operator, capabilities as webdav_capabilities, copy_file as copy_webdav_file,
     delete_entry as delete_webdav_backend_entry, endpoint_host_port as endpoint_host_port_for_webdav,
@@ -55,11 +63,35 @@ static FTP_SESSION_ESTABLISHMENT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static TEST_S3_PUBLISH_AFTER_COMMIT_RESPONSE_LOSS: std::sync::OnceLock<Mutex<Option<String>>> =
     std::sync::OnceLock::new();
 
-#[derive(Default)]
+fn sftp_mutation_outcome_unknown(kind: ErrorKind) -> bool {
+    !matches!(
+        kind,
+        ErrorKind::NotFound
+            | ErrorKind::PermissionDenied
+            | ErrorKind::AlreadyExists
+            | ErrorKind::IsADirectory
+            | ErrorKind::NotADirectory
+            | ErrorKind::Unsupported
+            | ErrorKind::ConfigInvalid
+            | ErrorKind::ConditionNotMatch
+    )
+}
+
 pub struct FileManagerRuntime {
     operators: RwLock<HashMap<String, CachedOperator>>,
     lifecycles: Arc<Mutex<HashMap<String, Arc<ConnectionRuntime>>>>,
     list_sessions: ListSessionRegistry,
+}
+
+impl Default for FileManagerRuntime {
+    fn default() -> Self {
+        cleanup_sftp_crash_residue();
+        Self {
+            operators: RwLock::new(HashMap::new()),
+            lifecycles: Arc::new(Mutex::new(HashMap::new())),
+            list_sessions: ListSessionRegistry::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +135,14 @@ struct DeleteLease {
 struct CachedOperator {
     revision: i64,
     operator: Operator,
+    sftp_key_material: Option<Arc<SftpKeyMaterial>>,
+    sftp_path_guard: Option<Arc<SftpPathGuard>>,
+}
+
+struct BuiltOperator {
+    operator: Operator,
+    sftp_key_material: Option<Arc<SftpKeyMaterial>>,
+    sftp_path_guard: Option<Arc<SftpPathGuard>>,
 }
 
 struct CachedOperatorRetirement<'a> {
@@ -117,6 +157,8 @@ pub(super) struct PreparedFileOperation {
     pub remote_path: String,
     pub cancellation: Arc<CancellationSignal>,
     secrets: ResolvedFileSecrets,
+    is_sftp: bool,
+    _sftp_key_material: Option<Arc<SftpKeyMaterial>>,
     _lease: OperationLease,
 }
 
@@ -132,6 +174,8 @@ pub(super) struct PreparedFileMutation<'a> {
     mutation_lock: Arc<AsyncMutex<()>>,
     connection_id: String,
     runtime: &'a FileManagerRuntime,
+    sftp_path_guard: Option<Arc<SftpPathGuard>>,
+    _sftp_key_material: Option<Arc<SftpKeyMaterial>>,
     _lease: OperationLease,
 }
 
@@ -147,6 +191,18 @@ pub(super) enum UploadPublishState {
 pub(super) struct UploadPublishResolution {
     pub state: UploadPublishState,
     pub detail: String,
+}
+
+#[derive(Debug)]
+pub(super) struct NativeRenameError {
+    pub message: String,
+    outcome_unknown: bool,
+}
+
+impl NativeRenameError {
+    pub(super) fn is_outcome_unknown(&self) -> bool {
+        self.outcome_unknown
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +266,7 @@ impl UploadPolicy {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FileConnectionConfig {
     Ftp(FtpConnectionConfig),
+    Sftp(SftpConnectionConfig),
     S3(S3ConnectionConfig),
     Webdav(WebdavConnectionConfig),
 }
@@ -237,6 +294,10 @@ pub struct FileConnectionSecrets {
     pub webdav_token: Option<String>,
     #[serde(default)]
     pub clear_webdav_credentials: Option<bool>,
+    pub sftp_private_key: Option<String>,
+    pub sftp_private_key_passphrase: Option<String>,
+    #[serde(default)]
+    pub clear_sftp_credentials: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -286,6 +347,8 @@ pub(super) struct ResolvedFileSecrets {
     pub(super) secret_access_key: Option<String>,
     pub(super) session_token: Option<String>,
     pub(super) webdav_token: Option<String>,
+    pub(super) sftp_private_key: Option<String>,
+    pub(super) sftp_private_key_passphrase: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -316,7 +379,7 @@ pub struct FileStat {
     pub user_metadata: HashMap<String, String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionTestStage {
     pub stage: &'static str,
@@ -387,10 +450,57 @@ pub async fn save_file_connection(
                             "s3_scope".to_string(),
                             "webdav_token".to_string(),
                             "webdav_scope".to_string(),
+                            "sftp_private_key".to_string(),
+                            "sftp_private_key_passphrase".to_string(),
+                            "sftp_scope".to_string(),
                         ],
                         "password_scope".to_string(),
                         password_scope(&input.config)?,
                         replace_secret,
+                        input.expected_revision,
+                    )
+                    .await?
+            }
+            FileConnectionConfig::Sftp(config) => {
+                let supplied = input.secrets.as_ref();
+                let clear = supplied.is_some_and(|secrets| secrets.clear_sftp_credentials == Some(true));
+                let replace_secrets = clear
+                    || config.authentication != SftpAuthentication::PrivateKey
+                    || supplied.is_some_and(|secrets| {
+                        secrets.sftp_private_key.is_some() || secrets.sftp_private_key_passphrase.is_some()
+                    });
+                let mut values = Vec::new();
+                if !clear && config.authentication == SftpAuthentication::PrivateKey {
+                    if let Some(value) = supplied.and_then(|secrets| secrets.sftp_private_key.clone()) {
+                        values.push(("sftp_private_key".to_string(), value));
+                    }
+                    if let Some(value) = supplied.and_then(|secrets| secrets.sftp_private_key_passphrase.clone()) {
+                        values.push(("sftp_private_key_passphrase".to_string(), value));
+                    }
+                }
+                state
+                    .storage
+                    .save_file_connection_with_secret_bundle(
+                        id.clone(),
+                        input.name.trim().to_string(),
+                        config_kind(&input.config).to_string(),
+                        config_json,
+                        values,
+                        vec![
+                            "password".to_string(),
+                            "password_scope".to_string(),
+                            "access_key_id".to_string(),
+                            "secret_access_key".to_string(),
+                            "session_token".to_string(),
+                            "s3_scope".to_string(),
+                            "webdav_token".to_string(),
+                            "webdav_scope".to_string(),
+                            "sftp_private_key".to_string(),
+                            "sftp_private_key_passphrase".to_string(),
+                        ],
+                        "sftp_scope".to_string(),
+                        password_scope(&input.config)?,
+                        replace_secrets,
                         input.expected_revision,
                     )
                     .await?
@@ -435,6 +545,9 @@ pub async fn save_file_connection(
                             "session_token".to_string(),
                             "webdav_token".to_string(),
                             "webdav_scope".to_string(),
+                            "sftp_private_key".to_string(),
+                            "sftp_private_key_passphrase".to_string(),
+                            "sftp_scope".to_string(),
                         ],
                         "s3_scope".to_string(),
                         password_scope(&input.config)?,
@@ -474,6 +587,9 @@ pub async fn save_file_connection(
                             "session_token".to_string(),
                             "s3_scope".to_string(),
                             "webdav_token".to_string(),
+                            "sftp_private_key".to_string(),
+                            "sftp_private_key_passphrase".to_string(),
+                            "sftp_scope".to_string(),
                         ],
                         "webdav_scope".to_string(),
                         password_scope(&input.config)?,
@@ -577,28 +693,47 @@ pub async fn list_file_entries(
     run_list_operation(&runtime, &connection_id, revision, &cancellation, LIST_TIMEOUT, async {
         let _list_guard = lease.entry.list_lock.lock().await;
         let secrets = load_file_connection_secrets(&state.storage, &connection_id, &config).await?;
-        let operator = runtime.operator_for(&record, &config, &secrets)?;
+        let built = runtime.operator_for(&record, &config, &secrets)?;
+        if let Some(path_guard) = &built.sftp_path_guard {
+            path_guard.require_existing(path.clone()).await?;
+        }
+        let operator = built.operator;
         if path.is_empty() && matches!(config, FileConnectionConfig::Ftp(_)) {
             let password = secrets.password.as_deref();
             verify_ftp_root_read_only(&config, password).await?;
         }
         let list_path = configured_directory_path(&config, &path);
-        let lister = operator
-            .lister_with(&list_path)
-            .limit(options.page_size)
-            .await
-            .map_err(|error| redact_secrets(error.to_string(), &secrets))?;
+        let is_sftp = matches!(config, FileConnectionConfig::Sftp(_));
+        let lister = operator.lister_with(&list_path).limit(options.page_size).await.map_err(|error| {
+            let error = if is_sftp { classify_sftp_error(error) } else { error.to_string() };
+            redact_secrets(error, &secrets)
+        })?;
         let error_secrets = secrets.clone();
         let configured_root = configured_root_list_path(&config);
         let object_store = matches!(config, FileConnectionConfig::S3(_));
         let seen_entries = Arc::new(Mutex::new(HashSet::<(String, String)>::new()));
+        let sftp_key_material = built.sftp_key_material;
         let stream = lister.filter_map(move |result| {
+            let _keep_sftp_key_material_alive = &sftp_key_material;
             let seen_entries = seen_entries.clone();
             if result.as_ref().is_ok_and(|entry| entry.path() == configured_root) {
                 return futures::future::ready(None);
             }
+            if is_sftp
+                && result.as_ref().is_ok_and(|entry| {
+                    let mode = entry.metadata().mode();
+                    !mode.is_file() && !mode.is_dir()
+                })
+            {
+                // Symlinks are deliberately not exposed as navigable entries.
+                // Direct access remains guarded by remote realpath containment.
+                return futures::future::ready(None);
+            }
             let result = result
-                .map_err(|error| redact_secrets(error.to_string(), &error_secrets))
+                .map_err(|error| {
+                    let error = if is_sftp { classify_sftp_error(error) } else { error.to_string() };
+                    redact_secrets(error, &error_secrets)
+                })
                 .and_then(|entry| file_entry_from_opendal(&configured_root, entry, object_store));
             futures::future::ready(match result {
                 Ok(entry) => {
@@ -673,8 +808,11 @@ pub async fn stat_file_entry(
     let cancellation = lease.cancellation();
     run_list_operation(&runtime, &connection_id, revision, &cancellation, LIST_TIMEOUT, async {
         let secrets = load_file_connection_secrets(&state.storage, &connection_id, &config).await?;
-        let operator = runtime.operator_for(&record, &config, &secrets)?;
-        let metadata = stat_remote_metadata(&operator, &config, &path, secrets.password.as_deref())
+        let built = runtime.operator_for(&record, &config, &secrets)?;
+        if let Some(path_guard) = &built.sftp_path_guard {
+            path_guard.require_existing(path.clone()).await?;
+        }
+        let metadata = stat_remote_metadata(&built.operator, &config, &path, secrets.password.as_deref())
             .await
             .map_err(|error| redact_secrets(error, &secrets))?;
         Ok(file_stat_from_metadata(&path, &metadata))
@@ -812,14 +950,20 @@ impl FileManagerRuntime {
         let revision = record.revision;
         let config = parse_storage_config(&record).inspect_err(|_| self.evict_revision(connection_id, revision))?;
         let secrets = load_file_connection_secrets(&state.storage, connection_id, &config).await?;
-        let operator = self.operator_for(&record, &config, &secrets)?;
+        let built = self.operator_for(&record, &config, &secrets)?;
+        if let Some(path_guard) = &built.sftp_path_guard {
+            path_guard.require_existing(relative_path.clone()).await?;
+        }
+        let operator = built.operator;
         let remote_path = configured_entry_path(&config, &relative_path, false);
         Ok(PreparedFileOperation {
             operator,
             revision,
             remote_path,
             cancellation: lease.cancellation(),
+            is_sftp: matches!(config, FileConnectionConfig::Sftp(_)),
             secrets,
+            _sftp_key_material: built.sftp_key_material,
             _lease: lease,
         })
     }
@@ -852,7 +996,8 @@ impl FileManagerRuntime {
         let secrets = load_file_connection_secrets(&state.storage, connection_id, &config).await?;
         let password = secrets.password.clone();
         self.evict_revision(connection_id, revision);
-        let operator = build_operator_with_secrets(&config, &secrets)?;
+        let built = build_operator_with_secrets(&config, &secrets)?;
+        let operator = built.operator;
         let remote_path = configured_entry_path(&config, &relative_path, false);
         Ok(PreparedFileMutation {
             operator,
@@ -866,6 +1011,8 @@ impl FileManagerRuntime {
             mutation_lock,
             connection_id: connection_id.to_string(),
             runtime: self,
+            sftp_path_guard: built.sftp_path_guard,
+            _sftp_key_material: built.sftp_key_material,
             _lease: lease,
         })
     }
@@ -920,19 +1067,30 @@ impl FileManagerRuntime {
                 .await
             }
             FileConnectionConfig::S3(_) => {
-                let operator = build_operator_with_secrets(&config, &secrets)?;
+                let built = build_operator_with_secrets(&config, &secrets)?;
                 let source = configured_entry_path(&config, partial.as_str(), false);
                 let target = configured_entry_path(&config, target.as_str(), false);
-                let source_size = s3_file_size_if_exists(&operator, &source, &secrets).await?;
-                let target_size = s3_file_size_if_exists(&operator, &target, &secrets).await?;
+                let source_size = s3_file_size_if_exists(&built.operator, &source, &secrets).await?;
+                let target_size = s3_file_size_if_exists(&built.operator, &target, &secrets).await?;
+                Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
+            }
+            FileConnectionConfig::Sftp(_) => {
+                let built = build_operator_with_secrets(&config, &secrets)?;
+                let path_guard = built.sftp_path_guard.as_ref().expect("SFTP operator has a path guard");
+                path_guard.require_existing(partial.as_str().to_string()).await?;
+                path_guard.require_destination(target.as_str().to_string()).await?;
+                let source = configured_entry_path(&config, partial.as_str(), false);
+                let target = configured_entry_path(&config, target.as_str(), false);
+                let source_size = file_size_if_exists(&built.operator, &source, &secrets).await?;
+                let target_size = file_size_if_exists(&built.operator, &target, &secrets).await?;
                 Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
             }
             FileConnectionConfig::Webdav(_) => {
-                let operator = build_operator_with_secrets(&config, &secrets)?;
+                let built = build_operator_with_secrets(&config, &secrets)?;
                 let source = configured_entry_path(&config, partial.as_str(), false);
                 let target = configured_entry_path(&config, target.as_str(), false);
-                let source_size = file_size_if_exists(&operator, &source, &secrets).await?;
-                let target_size = file_size_if_exists(&operator, &target, &secrets).await?;
+                let source_size = file_size_if_exists(&built.operator, &source, &secrets).await?;
+                let target_size = file_size_if_exists(&built.operator, &target, &secrets).await?;
                 Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
             }
         }
@@ -943,7 +1101,7 @@ impl FileManagerRuntime {
         record: &FileConnectionStorageRecord,
         config: &FileConnectionConfig,
         secrets: &ResolvedFileSecrets,
-    ) -> Result<Operator, String> {
+    ) -> Result<BuiltOperator, String> {
         if let Some(cached) = self
             .operators
             .read()
@@ -951,15 +1109,24 @@ impl FileManagerRuntime {
             .get(&record.id)
             .filter(|cached| cached.revision == record.revision)
         {
-            return Ok(cached.operator.clone());
+            return Ok(BuiltOperator {
+                operator: cached.operator.clone(),
+                sftp_key_material: cached.sftp_key_material.clone(),
+                sftp_path_guard: cached.sftp_path_guard.clone(),
+            });
         }
 
-        let operator = build_operator_with_secrets(config, secrets)?;
-        self.operators
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(record.id.clone(), CachedOperator { revision: record.revision, operator: operator.clone() });
-        Ok(operator)
+        let built = build_operator_with_secrets(config, secrets)?;
+        self.operators.write().unwrap_or_else(|error| error.into_inner()).insert(
+            record.id.clone(),
+            CachedOperator {
+                revision: record.revision,
+                operator: built.operator.clone(),
+                sftp_key_material: built.sftp_key_material.clone(),
+                sftp_path_guard: built.sftp_path_guard.clone(),
+            },
+        );
+        Ok(built)
     }
 
     #[cfg(test)]
@@ -1002,13 +1169,55 @@ impl Drop for PreparedFileMutation<'_> {
 
 impl PreparedFileOperation {
     pub(super) fn redact_remote_error(&self, message: String) -> String {
-        redact_secrets(message, &self.secrets)
+        let message = redact_secrets(message, &self.secrets);
+        if self.is_sftp && !message.starts_with("Sftp") {
+            classify_sftp_message(message)
+        } else {
+            message
+        }
+    }
+
+    pub(super) fn redact_operator_error(&self, error: opendal::Error) -> String {
+        if self.is_sftp {
+            redact_secrets(classify_sftp_error(error), &self.secrets)
+        } else {
+            self.redact_remote_error(error.to_string())
+        }
     }
 }
 
 impl PreparedFileMutation<'_> {
+    pub(super) async fn guard_existing_path(&self, relative_path: &str) -> Result<(), String> {
+        if let Some(path_guard) = &self.sftp_path_guard {
+            path_guard.require_existing(relative_path.to_string()).await
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) async fn guard_destination_path(&self, relative_path: &str) -> Result<(), String> {
+        if let Some(path_guard) = &self.sftp_path_guard {
+            path_guard.require_destination(relative_path.to_string()).await
+        } else {
+            Ok(())
+        }
+    }
+
     pub(super) fn redact_remote_error(&self, message: String) -> String {
-        redact_secrets(message, &self.secrets)
+        let message = redact_secrets(message, &self.secrets);
+        if matches!(self.config, FileConnectionConfig::Sftp(_)) && !message.starts_with("Sftp") {
+            classify_sftp_message(message)
+        } else {
+            message
+        }
+    }
+
+    pub(super) fn redact_operator_error(&self, error: opendal::Error) -> String {
+        if matches!(self.config, FileConnectionConfig::Sftp(_)) {
+            redact_secrets(classify_sftp_error(error), &self.secrets)
+        } else {
+            self.redact_remote_error(error.to_string())
+        }
     }
     #[cfg(test)]
     pub(super) fn mutation_lock_is_available(&self) -> bool {
@@ -1022,6 +1231,7 @@ impl PreparedFileMutation<'_> {
     pub(super) async fn delete_owned_remote_partial(&self, path: &str) -> Result<(), String> {
         let path = RemotePath::parse(path)?;
         let _mutation_guard = self.mutation_lock.lock().await;
+        self.guard_destination_path(path.as_str()).await?;
         match &self.config {
             FileConnectionConfig::Ftp(_) => {
                 delete_ftp_file_if_exists(&self.config, &path, self.password.as_deref()).await
@@ -1033,20 +1243,18 @@ impl PreparedFileMutation<'_> {
                         delete_s3_current(&self.operator, &configured, Some(&metadata), &self.secrets).await
                     }
                     Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(self.redact_remote_error(error.to_string())),
+                    Err(error) => Err(self.redact_operator_error(error)),
                 }
             }
-            FileConnectionConfig::Webdav(_) => {
+            FileConnectionConfig::Sftp(_) | FileConnectionConfig::Webdav(_) => {
                 let configured = self.configured_path(path.as_str())?;
                 match self.operator.stat(&configured).await {
-                    Ok(metadata) if metadata.mode().is_file() => self
-                        .operator
-                        .delete(&configured)
-                        .await
-                        .map_err(|error| self.redact_remote_error(error.to_string())),
-                    Ok(_) => Err("Operation-owned WebDAV partial is not a file".to_string()),
+                    Ok(metadata) if metadata.mode().is_file() => {
+                        self.operator.delete(&configured).await.map_err(|error| self.redact_operator_error(error))
+                    }
+                    Ok(_) => Err("Operation-owned upload partial is not a file".to_string()),
                     Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(self.redact_remote_error(error.to_string())),
+                    Err(error) => Err(self.redact_operator_error(error)),
                 }
             }
         }
@@ -1055,40 +1263,31 @@ impl PreparedFileMutation<'_> {
     pub(super) async fn create_empty_owned_upload_partial(&self, path: &str) -> Result<(), String> {
         let path = RemotePath::parse(path)?;
         let _mutation_guard = self.mutation_lock.lock().await;
+        self.guard_destination_path(path.as_str()).await?;
         match &self.config {
             FileConnectionConfig::Ftp(_) => {
                 create_empty_ftp_file_exact(&self.config, &path, self.password.as_deref()).await
             }
-            FileConnectionConfig::S3(_) => {
+            FileConnectionConfig::Sftp(_) | FileConnectionConfig::S3(_) => {
                 let configured = self.configured_path(path.as_str())?;
-                if self
-                    .operator
-                    .exists(&configured)
-                    .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?
-                {
+                if self.operator.exists(&configured).await.map_err(|error| self.redact_operator_error(error))? {
                     return Err("Operation-owned empty upload partial already exists".to_string());
                 }
                 self.operator
                     .write(&configured, Vec::<u8>::new())
                     .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                    .map_err(|error| self.redact_operator_error(error))?;
                 Ok(())
             }
             FileConnectionConfig::Webdav(_) => {
                 let configured = self.configured_path(path.as_str())?;
-                if self
-                    .operator
-                    .exists(&configured)
-                    .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?
-                {
+                if self.operator.exists(&configured).await.map_err(|error| self.redact_operator_error(error))? {
                     return Err("Operation-owned empty upload partial already exists".to_string());
                 }
                 self.operator
                     .write(&configured, Vec::<u8>::new())
                     .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                    .map_err(|error| self.redact_operator_error(error))?;
                 Ok(())
             }
         }
@@ -1166,6 +1365,18 @@ impl PreparedFileMutation<'_> {
                 )
                 .await;
         }
+        if matches!(self.config, FileConnectionConfig::Sftp(_)) {
+            return self
+                .publish_sftp_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    false,
+                    "Upload publish",
+                    transfer_cancellation,
+                )
+                .await;
+        }
         let mutation = tokio::time::timeout(
             MUTATION_TIMEOUT,
             rename_ftp_file_exact(&self.config, &partial, &target, expected_size, self.password.as_deref()),
@@ -1208,6 +1419,7 @@ impl PreparedFileMutation<'_> {
 
     pub(super) async fn stat_remote_file(&self, relative_path: &str) -> Result<RemoteFileFingerprint, String> {
         let relative_path = validate_remote_relative_path(relative_path)?;
+        self.guard_existing_path(relative_path.as_str()).await?;
         let metadata = stat_remote_metadata(&self.operator, &self.config, &relative_path, self.password.as_deref())
             .await
             .map_err(|error| self.redact_remote_error(error))?;
@@ -1219,15 +1431,20 @@ impl PreparedFileMutation<'_> {
 
     pub(super) async fn remote_entry_exists(&self, relative_path: &str) -> Result<bool, String> {
         let relative_path = validate_remote_relative_path(relative_path)?;
+        self.guard_destination_path(relative_path.as_str()).await?;
         match stat_remote_metadata_once(&self.operator, &self.config, &relative_path).await {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(self.redact_remote_error(error.to_string())),
+            Err(error) => Err(self.redact_operator_error(error)),
         }
     }
 
     pub(super) async fn fingerprint_remote_file(&self, relative_path: &str) -> Result<RemoteFileFingerprint, String> {
         let path = RemotePath::parse(relative_path)?;
+        // A missing leaf is a meaningful structured observation during
+        // post-rename reconciliation. Existing entries are still canonicalized
+        // and rejected if a symlink resolves outside the configured root.
+        self.guard_destination_path(path.as_str()).await?;
         match &self.config {
             FileConnectionConfig::Ftp(config) => {
                 let mut ftp = open_ftp_root_session(config, self.password.as_deref()).await?;
@@ -1235,7 +1452,7 @@ impl PreparedFileMutation<'_> {
                 let _ = ftp.quit().await;
                 fingerprint.ok_or_else(|| "Remote file no longer exists".to_string())
             }
-            FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => {
+            FileConnectionConfig::Sftp(_) | FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => {
                 let configured = self.configured_path(path.as_str())?;
                 match self.operator.stat(&configured).await {
                     Ok(metadata) if metadata.mode().is_file() => Ok(remote_fingerprint_from_metadata(&metadata)),
@@ -1243,7 +1460,7 @@ impl PreparedFileMutation<'_> {
                     Err(error) if error.kind() == ErrorKind::NotFound => {
                         Err("Remote file no longer exists".to_string())
                     }
-                    Err(error) => Err(self.redact_remote_error(error.to_string())),
+                    Err(error) => Err(self.redact_operator_error(error)),
                 }
             }
         }
@@ -1260,8 +1477,32 @@ impl PreparedFileMutation<'_> {
         matches!(self.config, FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_))
     }
 
+    pub(super) fn uses_exact_ftp_relay(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::Ftp(_))
+    }
+
+    pub(super) fn requires_append_streaming_write(&self) -> bool {
+        protocol_requires_append_streaming_write(&self.config)
+    }
+
     pub(super) fn uses_native_rename(&self) -> bool {
-        matches!(self.config, FileConnectionConfig::Webdav(_))
+        matches!(self.config, FileConnectionConfig::Sftp(_) | FileConnectionConfig::Webdav(_))
+    }
+
+    pub(super) fn uses_native_sftp_rename(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::Sftp(_))
+    }
+
+    pub(super) fn native_rename_destination_matches(
+        &self,
+        source: &RemoteFileFingerprint,
+        destination: &RemoteFileFingerprint,
+    ) -> bool {
+        if self.uses_native_sftp_rename() {
+            source == destination
+        } else {
+            source.size == destination.size
+        }
     }
 
     pub(super) fn uses_native_webdav_copy(&self) -> bool {
@@ -1270,6 +1511,83 @@ impl PreparedFileMutation<'_> {
 
     pub(super) async fn acquire_mutation_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.mutation_lock.clone().lock_owned().await
+    }
+
+    pub(super) async fn preflight_native_sftp_rename(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        replace: bool,
+    ) -> Result<RemoteFileFingerprint, String> {
+        if !self.uses_native_sftp_rename() {
+            return Err("Native SFTP rename received a non-SFTP connection".to_string());
+        }
+        self.guard_existing_path(source_path).await?;
+        self.guard_destination_path(destination_path).await?;
+        let source = self.configured_path(source_path)?;
+        let destination = self.configured_path(destination_path)?;
+        let metadata = self.operator.stat(&source).await.map_err(|error| self.redact_operator_error(error))?;
+        if !metadata.mode().is_file() {
+            return Err("Unsupported: directory copy and rename are not available in v1".to_string());
+        }
+        if !replace {
+            match self.operator.stat(&destination).await {
+                Ok(_) => {
+                    return Err(
+                        "Remote destination already exists; best_effort_no_clobber does not replace it".to_string()
+                    )
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(self.redact_operator_error(error)),
+            }
+        }
+        Ok(remote_fingerprint_from_metadata(&metadata))
+    }
+
+    pub(super) async fn preflight_native_rename(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        replace: bool,
+    ) -> Result<(), String> {
+        if self.uses_native_sftp_rename() {
+            self.preflight_native_sftp_rename(source_path, destination_path, replace).await.map(|_| ())
+        } else {
+            self.preflight_native_webdav_mutation(source_path, destination_path, replace).await
+        }
+    }
+
+    pub(super) async fn dispatch_native_rename(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        dispatch_started: Arc<AtomicBool>,
+    ) -> Result<(), NativeRenameError> {
+        if self.uses_native_sftp_rename() {
+            self.guard_existing_path(source_path)
+                .await
+                .map_err(|message| NativeRenameError { message, outcome_unknown: false })?;
+            self.guard_destination_path(destination_path)
+                .await
+                .map_err(|message| NativeRenameError { message, outcome_unknown: false })?;
+            let source = self
+                .configured_path(source_path)
+                .map_err(|message| NativeRenameError { message, outcome_unknown: false })?;
+            let destination = self
+                .configured_path(destination_path)
+                .map_err(|message| NativeRenameError { message, outcome_unknown: false })?;
+            #[cfg(test)]
+            super::file_transfer::wait_at_test_sftp_rename_before_dispatch_barrier().await;
+            dispatch_started.store(true, Ordering::Release);
+            self.operator.rename(&source, &destination).await.map_err(|error| {
+                let outcome_unknown = sftp_mutation_outcome_unknown(error.kind());
+                NativeRenameError { message: self.redact_operator_error(error), outcome_unknown }
+            })
+        } else {
+            self.dispatch_native_webdav_rename(source_path, destination_path, dispatch_started).await.map_err(|error| {
+                NativeRenameError { outcome_unknown: error.is_outcome_unknown(), message: error.message }
+            })
+        }
     }
 
     pub(super) async fn preflight_native_webdav_mutation(
@@ -1283,14 +1601,11 @@ impl PreparedFileMutation<'_> {
         }
         let source = self.configured_path(source_path)?;
         let destination = self.configured_path(destination_path)?;
-        let source_metadata =
-            self.operator.stat(&source).await.map_err(|error| self.redact_remote_error(error.to_string()))?;
+        let source_metadata = self.operator.stat(&source).await.map_err(|error| self.redact_operator_error(error))?;
         if !source_metadata.mode().is_file() {
             return Err("Unsupported: directory copy and rename are not available in v1".to_string());
         }
-        if !replace
-            && self.operator.exists(&destination).await.map_err(|error| self.redact_remote_error(error.to_string()))?
-        {
+        if !replace && self.operator.exists(&destination).await.map_err(|error| self.redact_operator_error(error))? {
             return Err("Remote destination already exists; best_effort_no_clobber does not replace it".to_string());
         }
         Ok(())
@@ -1387,6 +1702,18 @@ impl PreparedFileMutation<'_> {
                 )
                 .await;
         }
+        if matches!(self.config, FileConnectionConfig::Sftp(_)) {
+            return self
+                .publish_sftp_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    replace,
+                    "Remote copy publish",
+                    transfer_cancellation,
+                )
+                .await;
+        }
         let mutation = tokio::time::timeout(
             MUTATION_TIMEOUT,
             rename_ftp_file_exact_with_replace(
@@ -1474,16 +1801,10 @@ impl PreparedFileMutation<'_> {
             FileConnectionConfig::S3(_) => {
                 let source_path = self.configured_path(source.as_str())?;
                 let destination_path = self.configured_path(destination.as_str())?;
-                let source_metadata = self
-                    .operator
-                    .stat(&source_path)
-                    .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
-                let destination_metadata = self
-                    .operator
-                    .stat(&destination_path)
-                    .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                let source_metadata =
+                    self.operator.stat(&source_path).await.map_err(|error| self.redact_operator_error(error))?;
+                let destination_metadata =
+                    self.operator.stat(&destination_path).await.map_err(|error| self.redact_operator_error(error))?;
                 if remote_fingerprint_from_metadata(&source_metadata) != *expected_source
                     || remote_fingerprint_from_metadata(&destination_metadata) != *expected_destination
                 {
@@ -1495,19 +1816,15 @@ impl PreparedFileMutation<'_> {
                     .await
                     .map_err(|error| format!("Copied source could not be deleted: {error}"))
             }
-            FileConnectionConfig::Webdav(_) => {
+            FileConnectionConfig::Sftp(_) | FileConnectionConfig::Webdav(_) => {
+                self.guard_existing_path(source.as_str()).await?;
+                self.guard_existing_path(destination.as_str()).await?;
                 let source_path = self.configured_path(source.as_str())?;
                 let destination_path = self.configured_path(destination.as_str())?;
-                let source_metadata = self
-                    .operator
-                    .stat(&source_path)
-                    .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
-                let destination_metadata = self
-                    .operator
-                    .stat(&destination_path)
-                    .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                let source_metadata =
+                    self.operator.stat(&source_path).await.map_err(|error| self.redact_operator_error(error))?;
+                let destination_metadata =
+                    self.operator.stat(&destination_path).await.map_err(|error| self.redact_operator_error(error))?;
                 if remote_fingerprint_from_metadata(&source_metadata) != *expected_source
                     || remote_fingerprint_from_metadata(&destination_metadata) != *expected_destination
                 {
@@ -1516,7 +1833,7 @@ impl PreparedFileMutation<'_> {
                     );
                 }
                 self.operator.delete(&source_path).await.map_err(|error| {
-                    format!("Copied source could not be deleted: {}", self.redact_remote_error(error.to_string()))
+                    format!("Copied source could not be deleted: {}", self.redact_operator_error(error))
                 })
             }
         }
@@ -1534,16 +1851,14 @@ impl PreparedFileMutation<'_> {
         let partial_path = self.configured_path(partial.as_str())?;
         let target_path = self.configured_path(target.as_str())?;
         let partial_metadata =
-            self.operator.stat(&partial_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?;
+            self.operator.stat(&partial_path).await.map_err(|error| self.redact_operator_error(error))?;
         if !partial_metadata.mode().is_file() || partial_metadata.content_length() != expected_size as u64 {
             return Ok(UploadPublishResolution {
                 state: UploadPublishState::PartialSource,
                 detail: format!("{operation} WebDAV partial is missing or changed"),
             });
         }
-        if !replace
-            && self.operator.exists(&target_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?
-        {
+        if !replace && self.operator.exists(&target_path).await.map_err(|error| self.redact_operator_error(error))? {
             return Err(format!("{operation} destination already exists"));
         }
         if transfer_cancellation.is_cancelled() {
@@ -1589,11 +1904,8 @@ impl PreparedFileMutation<'_> {
         };
         match result {
             Ok(Ok(())) => {
-                let target_metadata = self
-                    .operator
-                    .stat(&target_path)
-                    .await
-                    .map_err(|error| self.redact_remote_error(error.to_string()))?;
+                let target_metadata =
+                    self.operator.stat(&target_path).await.map_err(|error| self.redact_operator_error(error))?;
                 if !target_metadata.mode().is_file() || target_metadata.content_length() != expected_size as u64 {
                     return Ok(UploadPublishResolution {
                         state: UploadPublishState::PartialTarget,
@@ -1619,6 +1931,148 @@ impl PreparedFileMutation<'_> {
                 .await
             }
         }
+    }
+
+    async fn publish_sftp_owned_partial(
+        &self,
+        partial: &RemotePath,
+        target: &RemotePath,
+        expected_size: usize,
+        replace: bool,
+        operation: &str,
+        transfer_cancellation: &CancellationToken,
+    ) -> Result<UploadPublishResolution, String> {
+        self.guard_existing_path(partial.as_str()).await?;
+        self.guard_destination_path(target.as_str()).await?;
+        let partial_path = self.configured_path(partial.as_str())?;
+        let target_path = self.configured_path(target.as_str())?;
+        let partial_metadata =
+            self.operator.stat(&partial_path).await.map_err(|error| self.redact_operator_error(error))?;
+        if !partial_metadata.mode().is_file() || partial_metadata.content_length() != expected_size as u64 {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} source partial does not match the expected file size"),
+            });
+        }
+        if !replace {
+            match self.operator.stat(&target_path).await {
+                Ok(_) => {
+                    return Err(
+                        "Remote destination already exists; best_effort_no_clobber does not replace it".to_string()
+                    )
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(self.redact_operator_error(error)),
+            }
+        }
+        if transfer_cancellation.is_cancelled() {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} was cancelled before SFTP rename dispatch"),
+            });
+        }
+        if self.cancellation.is_cancelled() {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} connection was removed before SFTP rename dispatch"),
+            });
+        }
+        let dispatch_started = Arc::new(AtomicBool::new(false));
+        let dispatch_for_request = dispatch_started.clone();
+        let rename = async {
+            dispatch_for_request.store(true, Ordering::Release);
+            self.operator.rename(&partial_path, &target_path).await
+        };
+        let result = tokio::select! {
+            biased;
+            result = tokio::time::timeout(MUTATION_TIMEOUT, rename) => result,
+            _ = transfer_cancellation.cancelled() => {
+                if dispatch_started.load(Ordering::Acquire) {
+                    return self.reconcile_sftp_publish(
+                        &partial_path, &target_path, expected_size,
+                        format!("{operation} was cancelled after SFTP rename dispatch"),
+                        true,
+                    ).await;
+                }
+                return Ok(UploadPublishResolution {
+                    state: UploadPublishState::PartialSource,
+                    detail: format!("{operation} was cancelled before SFTP rename dispatch"),
+                });
+            }
+            _ = self.cancellation.cancelled() => {
+                if dispatch_started.load(Ordering::Acquire) {
+                    return self.reconcile_sftp_publish(
+                        &partial_path, &target_path, expected_size,
+                        format!("{operation} connection was removed after SFTP rename dispatch"),
+                        true,
+                    ).await;
+                }
+                return Ok(UploadPublishResolution {
+                    state: UploadPublishState::PartialSource,
+                    detail: format!("{operation} connection was removed before SFTP rename dispatch"),
+                });
+            }
+        };
+        match result {
+            Ok(Ok(())) => {
+                let target_metadata =
+                    self.operator.stat(&target_path).await.map_err(|error| self.redact_operator_error(error))?;
+                if target_metadata.mode().is_file() && target_metadata.content_length() == expected_size as u64 {
+                    Ok(UploadPublishResolution {
+                        state: UploadPublishState::Completed,
+                        detail: format!("{operation} completed with native SFTP rename"),
+                    })
+                } else {
+                    Ok(UploadPublishResolution {
+                        state: UploadPublishState::PartialTarget,
+                        detail: format!("{operation} returned success but destination verification failed"),
+                    })
+                }
+            }
+            Ok(Err(error)) => {
+                if !sftp_mutation_outcome_unknown(error.kind()) {
+                    return Err(self.redact_operator_error(error));
+                }
+                self.reconcile_sftp_publish(
+                    &partial_path,
+                    &target_path,
+                    expected_size,
+                    format!("{operation} failed after dispatch: {}", self.redact_operator_error(error)),
+                    true,
+                )
+                .await
+            }
+            Err(_) => {
+                self.reconcile_sftp_publish(
+                    &partial_path,
+                    &target_path,
+                    expected_size,
+                    format!("{operation} timed out after SFTP rename dispatch"),
+                    true,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reconcile_sftp_publish(
+        &self,
+        partial_path: &str,
+        target_path: &str,
+        expected_size: usize,
+        detail: String,
+        outcome_unknown: bool,
+    ) -> Result<UploadPublishResolution, String> {
+        let source_size = file_size_if_exists(&self.operator, partial_path, &self.secrets).await?;
+        let target_size = file_size_if_exists(&self.operator, target_path, &self.secrets).await?;
+        let mut resolution = resolve_upload_publish_observation(source_size, target_size, expected_size, detail);
+        if outcome_unknown && resolution.state == UploadPublishState::PartialSource {
+            resolution.state = UploadPublishState::Unknown;
+            resolution
+                .detail
+                .push_str("; the dispatched SFTP rename may still commit, so the operation-owned source was preserved");
+        }
+        Ok(resolution)
     }
 
     async fn reconcile_uncertain_webdav_move(
@@ -1664,7 +2118,7 @@ impl PreparedFileMutation<'_> {
         let partial_path = self.configured_path(partial.as_str())?;
         let target_path = self.configured_path(target.as_str())?;
         let partial_metadata =
-            self.operator.stat(&partial_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?;
+            self.operator.stat(&partial_path).await.map_err(|error| self.redact_operator_error(error))?;
         if partial_metadata.content_length() != expected_size as u64 {
             return Ok(UploadPublishResolution {
                 state: UploadPublishState::PartialSource,
@@ -1674,9 +2128,7 @@ impl PreparedFileMutation<'_> {
                 ),
             });
         }
-        if !replace
-            && self.operator.exists(&target_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?
-        {
+        if !replace && self.operator.exists(&target_path).await.map_err(|error| self.redact_operator_error(error))? {
             return Err(format!("{operation} destination already exists"));
         }
         let mut copier = self
@@ -1686,7 +2138,7 @@ impl PreparedFileMutation<'_> {
             .source_content_length_hint(partial_metadata.content_length())
             .concurrent(1)
             .await
-            .map_err(|error| self.redact_remote_error(error.to_string()))?;
+            .map_err(|error| self.redact_operator_error(error))?;
         loop {
             let step = tokio::select! {
                 _ = transfer_cancellation.cancelled() => {
@@ -1748,7 +2200,7 @@ impl PreparedFileMutation<'_> {
                 .await;
         }
         let target_metadata =
-            self.operator.stat(&target_path).await.map_err(|error| self.redact_remote_error(error.to_string()))?;
+            self.operator.stat(&target_path).await.map_err(|error| self.redact_operator_error(error))?;
         if target_metadata.content_length() != expected_size as u64 {
             return Ok(UploadPublishResolution {
                 state: UploadPublishState::PartialTarget,
@@ -1926,6 +2378,23 @@ async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) ->
                 return Ok(ResolvedFileSecrets { password: Some(password), ..ResolvedFileSecrets::default() });
             }
         }
+        FileConnectionConfig::Sftp(config) => {
+            if config.authentication != SftpAuthentication::PrivateKey
+                || input.secrets.as_ref().is_some_and(|secrets| secrets.clear_sftp_credentials == Some(true))
+            {
+                return Ok(ResolvedFileSecrets::default());
+            }
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.sftp_private_key.is_some() || secrets.sftp_private_key_passphrase.is_some()
+            }) {
+                let secrets = input.secrets.as_ref().expect("checked");
+                return Ok(ResolvedFileSecrets {
+                    sftp_private_key: secrets.sftp_private_key.clone(),
+                    sftp_private_key_passphrase: secrets.sftp_private_key_passphrase.clone(),
+                    ..ResolvedFileSecrets::default()
+                });
+            }
+        }
         FileConnectionConfig::S3(config) => {
             if config.anonymous {
                 return Ok(ResolvedFileSecrets::default());
@@ -1993,6 +2462,21 @@ async fn load_file_connection_secrets(
             password: storage.load_file_connection_password(id, &password_scope(config)?).await?,
             ..ResolvedFileSecrets::default()
         }),
+        FileConnectionConfig::Sftp(_) => {
+            let stored_scope = storage.load_file_connection_secret(id, "sftp_scope").await?;
+            let sftp_private_key = storage.load_file_connection_secret(id, "sftp_private_key").await?;
+            let sftp_private_key_passphrase =
+                storage.load_file_connection_secret(id, "sftp_private_key_passphrase").await?;
+            if (sftp_private_key.is_some() || sftp_private_key_passphrase.is_some())
+                && stored_scope.as_deref() != Some(password_scope(config)?.as_str())
+            {
+                return Err(
+                    "Stored SFTP private-key credentials do not match this endpoint and identity; re-enter them"
+                        .to_string(),
+                );
+            }
+            Ok(ResolvedFileSecrets { sftp_private_key, sftp_private_key_passphrase, ..ResolvedFileSecrets::default() })
+        }
         FileConnectionConfig::S3(_) => {
             let stored_scope = storage.load_file_connection_secret(id, "s3_scope").await?;
             let access_key_id = storage.load_file_connection_secret(id, "access_key_id").await?;
@@ -2009,6 +2493,8 @@ async fn load_file_connection_secrets(
                 secret_access_key,
                 session_token,
                 webdav_token: None,
+                sftp_private_key: None,
+                sftp_private_key_passphrase: None,
             })
         }
         FileConnectionConfig::Webdav(_) => {
@@ -2152,6 +2638,7 @@ async fn delete_entry(
             delete_ftp_entry_in_session(ftp, ftp_config, path, kind, password).await?;
             Ok(FileMutationResult { outcome: FileMutationOutcome::Completed })
         }
+        FileConnectionConfig::Sftp(config) => delete_sftp_entry(config, path, expected_kind, secrets).await,
         FileConnectionConfig::S3(config) => delete_s3_backend_entry(config, path, expected_kind, secrets).await,
         FileConnectionConfig::Webdav(config) => {
             let operator = build_webdav_operator(config, secrets)?;
@@ -2180,6 +2667,7 @@ async fn create_directory_entry(
 ) -> Result<(), String> {
     match config {
         FileConnectionConfig::Ftp(_) => create_ftp_directory_exact(config, path, secrets.password.as_deref()).await,
+        FileConnectionConfig::Sftp(config) => create_sftp_directory(config, path, secrets).await,
         FileConnectionConfig::S3(config) => {
             let operator = build_s3_operator(config, secrets)?;
             let marker = format!("{}/", path.as_str().trim_end_matches('/'));
@@ -2930,6 +3418,7 @@ async fn test_connection_for_input(
 ) -> FileConnectionTestResult {
     match &input.config {
         FileConnectionConfig::Ftp(_) => test_ftp_connection(input, secrets.password.as_deref()).await,
+        FileConnectionConfig::Sftp(config) => test_sftp_connection(config, &secrets).await,
         FileConnectionConfig::S3(config) => match validate_input(input) {
             Ok(()) => test_s3_connection(config, &secrets).await,
             Err(error) => FileConnectionTestResult {
@@ -2984,12 +3473,14 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
             if input.secrets.as_ref().is_some_and(|secrets| secrets.clear_s3_credentials.is_some()) {
                 return Err("FTP connections cannot include clearS3Credentials".to_string());
             }
-            if input
-                .secrets
-                .as_ref()
-                .is_some_and(|secrets| secrets.webdav_token.is_some() || secrets.clear_webdav_credentials.is_some())
-            {
-                return Err("FTP connections cannot include WebDAV credentials".to_string());
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.webdav_token.is_some()
+                    || secrets.clear_webdav_credentials.is_some()
+                    || secrets.sftp_private_key.is_some()
+                    || secrets.sftp_private_key_passphrase.is_some()
+                    || secrets.clear_sftp_credentials.is_some()
+            }) {
+                return Err("FTP connections cannot include WebDAV or SFTP credentials".to_string());
             }
             endpoint_host_port(&config.endpoint)?;
             normalize_ftp_root(&config.root)?;
@@ -2999,12 +3490,70 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
             }
             Ok(())
         }
+        FileConnectionConfig::Sftp(config) => {
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.password.is_some()
+                    || secrets.clear_password.is_some()
+                    || secrets.access_key_id.is_some()
+                    || secrets.secret_access_key.is_some()
+                    || secrets.session_token.is_some()
+                    || secrets.clear_s3_credentials.is_some()
+                    || secrets.webdav_token.is_some()
+                    || secrets.clear_webdav_credentials.is_some()
+            }) {
+                return Err("SFTP connections only accept private-key secret fields".to_string());
+            }
+            let clear = input.secrets.as_ref().is_some_and(|secrets| secrets.clear_sftp_credentials == Some(true));
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.clear_sftp_credentials == Some(true)
+                    && (secrets.sftp_private_key.is_some() || secrets.sftp_private_key_passphrase.is_some())
+            }) {
+                return Err(
+                    "clearSftpCredentials=true cannot be combined with SFTP private-key material or passphrase"
+                        .to_string(),
+                );
+            }
+            if input.secrets.as_ref().is_some_and(|secrets| {
+                secrets.sftp_private_key_passphrase.is_some() && secrets.sftp_private_key.is_none()
+            }) {
+                return Err("An SFTP private-key passphrase can only be submitted together with private-key material"
+                    .to_string());
+            }
+            if clear && config.authentication == SftpAuthentication::PrivateKey {
+                return Err("Switch away from private-key authentication before clearing SFTP credentials".to_string());
+            }
+            if config.authentication != SftpAuthentication::PrivateKey
+                && input.secrets.as_ref().is_some_and(|secrets| {
+                    secrets.sftp_private_key.is_some()
+                        || secrets.sftp_private_key_passphrase.is_some()
+                        || matches!(secrets.clear_sftp_credentials, Some(false))
+                })
+            {
+                return Err("SSH config and agent authentication cannot include private-key secrets".to_string());
+            }
+            let resolved = if clear {
+                ResolvedFileSecrets::default()
+            } else {
+                ResolvedFileSecrets {
+                    sftp_private_key: input.secrets.as_ref().and_then(|secrets| secrets.sftp_private_key.clone()),
+                    sftp_private_key_passphrase: input
+                        .secrets
+                        .as_ref()
+                        .and_then(|secrets| secrets.sftp_private_key_passphrase.clone()),
+                    ..ResolvedFileSecrets::default()
+                }
+            };
+            validate_sftp_config(config, input.id.is_none(), &resolved)
+        }
         FileConnectionConfig::S3(config) => {
             if input.secrets.as_ref().is_some_and(|secrets| {
                 secrets.password.is_some()
                     || secrets.clear_password.is_some()
                     || secrets.webdav_token.is_some()
                     || secrets.clear_webdav_credentials.is_some()
+                    || secrets.sftp_private_key.is_some()
+                    || secrets.sftp_private_key_passphrase.is_some()
+                    || secrets.clear_sftp_credentials.is_some()
             }) {
                 return Err("S3 connections cannot include an FTP password or clearPassword".to_string());
             }
@@ -3025,6 +3574,9 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
                     || secrets.session_token.is_some()
                     || secrets.clear_s3_credentials.is_some()
                     || secrets.clear_password.is_some()
+                    || secrets.sftp_private_key.is_some()
+                    || secrets.sftp_private_key_passphrase.is_some()
+                    || secrets.clear_sftp_credentials.is_some()
             }) {
                 return Err("WebDAV connections cannot include FTP or S3 secret fields".to_string());
             }
@@ -3099,13 +3651,13 @@ fn endpoint_host_port(endpoint: &str) -> Result<(String, u16), String> {
 #[cfg(test)]
 pub(super) fn build_operator(config: &FileConnectionConfig, password: Option<&str>) -> Result<Operator, String> {
     let secrets = ResolvedFileSecrets { password: password.map(ToString::to_string), ..ResolvedFileSecrets::default() };
-    build_operator_with_secrets(config, &secrets)
+    build_operator_with_secrets(config, &secrets).map(|built| built.operator)
 }
 
 fn build_operator_with_secrets(
     config: &FileConnectionConfig,
     secrets: &ResolvedFileSecrets,
-) -> Result<Operator, String> {
+) -> Result<BuiltOperator, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
             let password = secrets.password.as_deref();
@@ -3116,9 +3668,22 @@ fn build_operator_with_secrets(
             Operator::new(builder)
                 .map(|builder| builder.finish())
                 .map_err(|error| redact_error(error.to_string(), password))
+                .map(|operator| BuiltOperator { operator, sftp_key_material: None, sftp_path_guard: None })
         }
-        FileConnectionConfig::S3(config) => build_s3_operator(config, secrets),
-        FileConnectionConfig::Webdav(config) => build_webdav_operator(config, secrets),
+        FileConnectionConfig::Sftp(config) => {
+            let (operator, sftp_key_material, sftp_path_guard) = build_sftp_operator(config, secrets)?;
+            Ok(BuiltOperator { operator, sftp_key_material, sftp_path_guard: Some(sftp_path_guard) })
+        }
+        FileConnectionConfig::S3(config) => build_s3_operator(config, secrets).map(|operator| BuiltOperator {
+            operator,
+            sftp_key_material: None,
+            sftp_path_guard: None,
+        }),
+        FileConnectionConfig::Webdav(config) => build_webdav_operator(config, secrets).map(|operator| BuiltOperator {
+            operator,
+            sftp_key_material: None,
+            sftp_path_guard: None,
+        }),
     }
 }
 
@@ -3128,6 +3693,11 @@ fn normalize_input(input: &mut FileConnectionInput) -> Result<(), String> {
             config.endpoint = config.endpoint.trim().trim_end_matches('/').to_string();
             config.root = normalize_ftp_root(&config.root)?;
             reject_ftp_command_injection(&config.username, "FTP username")?;
+            config.username = config.username.trim().to_string();
+        }
+        FileConnectionConfig::Sftp(config) => {
+            config.endpoint = config.endpoint.trim().to_string();
+            config.root = normalize_sftp_root(&config.root)?;
             config.username = config.username.trim().to_string();
         }
         FileConnectionConfig::S3(config) => {
@@ -3176,6 +3746,14 @@ fn configured_root_list_path(config: &FileConnectionConfig) -> String {
                 format!("{relative}/")
             }
         }
+        FileConnectionConfig::Sftp(config) => {
+            let relative = config.root.trim_matches('/');
+            if relative.is_empty() {
+                "/".to_string()
+            } else {
+                format!("{relative}/")
+            }
+        }
         FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => "/".to_string(),
     }
 }
@@ -3184,17 +3762,27 @@ fn configured_directory_path(config: &FileConnectionConfig, path: &str) -> Strin
     configured_entry_path(config, path, true)
 }
 
+fn protocol_requires_append_streaming_write(config: &FileConnectionConfig) -> bool {
+    matches!(config, FileConnectionConfig::Ftp(_))
+}
+
 fn configured_entry_path(config: &FileConnectionConfig, path: &str, is_directory: bool) -> String {
-    let root = configured_root_list_path(config);
+    let root = configured_root_list_path(config).trim_matches('/').to_string();
     let path = path.trim_matches('/');
-    if path.is_empty() {
-        return root;
-    }
-    let joined = if root == "/" { path.to_string() } else { format!("{}{path}", root.trim_start_matches('/')) };
+    let joined = match (root.is_empty(), path.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => path.to_string(),
+        (false, true) => root,
+        (false, false) => format!("{root}/{path}"),
+    };
     if is_directory {
-        format!("{}/", joined.trim_end_matches('/'))
+        if joined.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{joined}/")
+        }
     } else {
-        joined.trim_end_matches('/').to_string()
+        joined
     }
 }
 
@@ -3301,10 +3889,20 @@ async fn stat_remote_metadata(
                 last_error = Some(error);
                 tokio::time::sleep(FTP_SESSION_RETRY_DELAY * (attempt as u32 + 1)).await;
             }
-            Err(error) => return Err(redact_error(error.to_string(), password)),
+            Err(error) => {
+                let error = if matches!(config, FileConnectionConfig::Sftp(_)) {
+                    classify_sftp_error(error)
+                } else {
+                    error.to_string()
+                };
+                return Err(redact_error(error, password));
+            }
         }
     }
-    Err(redact_error(last_error.expect("a transient stat failure is recorded before retry").to_string(), password))
+    let error = last_error.expect("a transient stat failure is recorded before retry");
+    let error =
+        if matches!(config, FileConnectionConfig::Sftp(_)) { classify_sftp_error(error) } else { error.to_string() };
+    Err(redact_error(error, password))
 }
 
 fn should_retry_ftp_stat(error: &opendal::Error) -> bool {
@@ -3329,7 +3927,9 @@ async fn stat_remote_metadata_once(
             let directory_path = configured_entry_path(config, path, true);
             match config {
                 FileConnectionConfig::S3(_) => stat_s3_directory_or_virtual(operator, &directory_path).await,
-                FileConnectionConfig::Ftp(_) | FileConnectionConfig::Webdav(_) => operator.stat(&directory_path).await,
+                FileConnectionConfig::Ftp(_) | FileConnectionConfig::Sftp(_) | FileConnectionConfig::Webdav(_) => {
+                    operator.stat(&directory_path).await
+                }
             }
         }
         Err(error) => Err(error),
@@ -3382,6 +3982,7 @@ pub(super) fn password_scope(config: &FileConnectionConfig) -> Result<String, St
             reject_ftp_command_injection(&config.username, "FTP username")?;
             Ok(format!("ftp\n{}\n{port}\n{}", host.to_ascii_lowercase(), config.username))
         }
+        FileConnectionConfig::Sftp(config) => sftp_secret_scope(config),
         FileConnectionConfig::S3(config) => {
             let (host, port) = endpoint_host_port_for_s3(&config.endpoint)?;
             Ok(format!("s3\n{}\n{port}\n{}\n{}", host.to_ascii_lowercase(), config.region, config.bucket))
@@ -3464,6 +4065,7 @@ fn file_connection_from_storage(record: FileConnectionStorageRecord) -> Result<F
 fn config_kind(config: &FileConnectionConfig) -> &'static str {
     match config {
         FileConnectionConfig::Ftp(_) => "ftp",
+        FileConnectionConfig::Sftp(_) => "sftp",
         FileConnectionConfig::S3(_) => "s3",
         FileConnectionConfig::Webdav(_) => "webdav",
     }
@@ -3471,6 +4073,7 @@ fn config_kind(config: &FileConnectionConfig) -> &'static str {
 
 fn file_connection_capabilities(config: &FileConnectionConfig) -> FileConnectionCapabilities {
     match config {
+        FileConnectionConfig::Sftp(_) => sftp_capabilities(),
         FileConnectionConfig::S3(_) => s3_capabilities(),
         FileConnectionConfig::Webdav(_) => webdav_capabilities(),
         FileConnectionConfig::Ftp(_) => FileConnectionCapabilities {
@@ -3497,12 +4100,15 @@ fn redact_error(mut message: String, password: Option<&str>) -> String {
 }
 
 fn redact_secrets(mut message: String, secrets: &ResolvedFileSecrets) -> String {
+    message = redact_temporary_key_paths(&message);
     for secret in [
         secrets.password.as_deref(),
         secrets.access_key_id.as_deref(),
         secrets.secret_access_key.as_deref(),
         secrets.session_token.as_deref(),
         secrets.webdav_token.as_deref(),
+        secrets.sftp_private_key.as_deref(),
+        secrets.sftp_private_key_passphrase.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -3518,15 +4124,15 @@ fn redact_secrets(mut message: String, secrets: &ResolvedFileSecrets) -> String 
     message
 }
 
-fn passed_stage(stage: &'static str) -> ConnectionTestStage {
+pub(super) fn passed_stage(stage: &'static str) -> ConnectionTestStage {
     ConnectionTestStage { stage, status: "passed", message: None }
 }
 
-fn failed_stage(stage: &'static str, message: String) -> ConnectionTestStage {
+pub(super) fn failed_stage(stage: &'static str, message: String) -> ConnectionTestStage {
     ConnectionTestStage { stage, status: "failed", message: Some(message) }
 }
 
-fn skipped_stage(stage: &'static str) -> ConnectionTestStage {
+pub(super) fn skipped_stage(stage: &'static str) -> ConnectionTestStage {
     ConnectionTestStage { stage, status: "skipped", message: None }
 }
 
@@ -3538,6 +4144,7 @@ fn append_skipped_stages(stages: &mut Vec<ConnectionTestStage>, remaining: &[&'s
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use tauri::Manager;
     use tokio::io::AsyncWriteExt;
 
     fn input(endpoint: &str, root: &str) -> FileConnectionInput {
@@ -3826,7 +4433,7 @@ mod tests {
             session_token: session_token.clone(),
             ..ResolvedFileSecrets::default()
         };
-        let operator = build_operator_with_secrets(&config, &secrets).unwrap();
+        let operator = build_operator_with_secrets(&config, &secrets).unwrap().operator;
 
         let entries = operator.list("/").await.unwrap();
         let canonical = entries
@@ -3969,7 +4576,7 @@ mod tests {
             virtual_host_style: false,
             anonymous: false,
         });
-        let bucket_operator = build_operator_with_secrets(&bucket_config, &secrets).unwrap();
+        let bucket_operator = build_operator_with_secrets(&bucket_config, &secrets).unwrap().operator;
         assert_eq!(bucket_operator.read(&outside_key).await.unwrap().to_vec(), b"tenant-canary");
         assert_eq!(bucket_operator.read(&bucket_canary_key).await.unwrap().to_vec(), b"bucket-canary");
     }
@@ -4331,6 +4938,27 @@ mod tests {
     }
 
     #[test]
+    fn configured_paths_join_sftp_root_and_entry_as_distinct_segments() {
+        let mut config = FileConnectionConfig::Sftp(SftpConnectionConfig {
+            endpoint: "example".to_string(),
+            root: "/".to_string(),
+            username: "dbx".to_string(),
+            authentication: SftpAuthentication::Agent,
+        });
+        assert_eq!(configured_entry_path(&config, "child.txt", false), "child.txt");
+        assert_eq!(configured_entry_path(&config, "nested/child", true), "nested/child/");
+        assert_eq!(configured_entry_path(&config, "", true), "/");
+
+        let FileConnectionConfig::Sftp(sftp) = &mut config else { unreachable!() };
+        sftp.root = "/srv/dbx".to_string();
+        assert_eq!(configured_entry_path(&config, "child.txt", false), "srv/dbx/child.txt");
+        assert_eq!(configured_entry_path(&config, "nested/child", true), "srv/dbx/nested/child/");
+        assert_eq!(configured_entry_path(&config, "", true), "srv/dbx/");
+        assert!(!protocol_requires_append_streaming_write(&config));
+        assert!(protocol_requires_append_streaming_write(&input("ftp://localhost:21", "/").config));
+    }
+
+    #[test]
     fn remote_paths_reject_opendal_trim_ambiguity_but_preserve_inner_spaces() {
         assert!(normalize_relative_remote_path(" leading/trailing", false).is_err());
         assert!(normalize_relative_remote_path("leading/trailing ", false).is_err());
@@ -4358,6 +4986,391 @@ mod tests {
         for path in ["/absolute", "../escape", "safe/../escape", "safe\\escape", "safe/%2e%2e/escape", "safe//file"] {
             assert!(validate_remote_relative_path(path).is_err(), "{path} should be rejected");
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/sftp-contract.sh with a digest-pinned OpenSSH server"]
+    async fn fixed_sftp_service_contract() {
+        let endpoint = std::env::var("DBX_TEST_SFTP_ENDPOINT").expect("DBX_TEST_SFTP_ENDPOINT is required");
+        let host_alias = std::env::var("DBX_TEST_SFTP_HOST_ALIAS").expect("DBX_TEST_SFTP_HOST_ALIAS is required");
+        let username = std::env::var("DBX_TEST_SFTP_USERNAME").expect("DBX_TEST_SFTP_USERNAME is required");
+        let root = std::env::var("DBX_TEST_SFTP_ROOT").expect("DBX_TEST_SFTP_ROOT is required");
+        let private_key_file =
+            std::env::var("DBX_TEST_SFTP_PRIVATE_KEY_FILE").expect("DBX_TEST_SFTP_PRIVATE_KEY_FILE is required");
+        let private_key = std::fs::read_to_string(private_key_file).unwrap();
+        let private_key_passphrase = std::env::var("DBX_TEST_SFTP_PRIVATE_KEY_PASSPHRASE")
+            .expect("DBX_TEST_SFTP_PRIVATE_KEY_PASSPHRASE is required");
+
+        let authentication_cases = [
+            (
+                "ssh-config",
+                FileConnectionConfig::Sftp(SftpConnectionConfig {
+                    endpoint: host_alias,
+                    root: root.clone(),
+                    username: String::new(),
+                    authentication: SftpAuthentication::SshConfig,
+                }),
+                ResolvedFileSecrets::default(),
+            ),
+            (
+                "agent",
+                FileConnectionConfig::Sftp(SftpConnectionConfig {
+                    endpoint: endpoint.clone(),
+                    root: root.clone(),
+                    username: username.clone(),
+                    authentication: SftpAuthentication::Agent,
+                }),
+                ResolvedFileSecrets::default(),
+            ),
+            (
+                "encrypted-inline-key",
+                FileConnectionConfig::Sftp(SftpConnectionConfig {
+                    endpoint: endpoint.clone(),
+                    root: root.clone(),
+                    username: username.clone(),
+                    authentication: SftpAuthentication::PrivateKey,
+                }),
+                ResolvedFileSecrets {
+                    sftp_private_key: Some(private_key.clone()),
+                    sftp_private_key_passphrase: Some(private_key_passphrase.clone()),
+                    ..ResolvedFileSecrets::default()
+                },
+            ),
+        ];
+
+        for (name, config, secrets) in authentication_cases {
+            let FileConnectionConfig::Sftp(sftp) = &config else { unreachable!() };
+            let connection_test = test_sftp_connection(sftp, &secrets).await;
+            assert!(connection_test.success, "{name}: {:?}", connection_test.stages);
+            let built = build_operator_with_secrets(&config, &secrets).unwrap();
+            let fixture_path = configured_entry_path(&config, "fixture.txt", false);
+            assert_eq!(fixture_path, "home/dbx/files/fixture.txt");
+            assert_eq!(built.operator.read(&fixture_path).await.unwrap().to_vec(), b"dbx sftp fixture\n");
+            let root_path = configured_root_list_path(&config);
+            let entries = built.operator.list(&root_path).await.unwrap();
+            assert!(entries.iter().any(|entry| entry.path() == fixture_path), "{name}: {entries:?}");
+            assert_eq!(built.operator.stat(&fixture_path).await.unwrap().content_length(), 17);
+        }
+
+        let config = FileConnectionConfig::Sftp(SftpConnectionConfig {
+            endpoint: endpoint.clone(),
+            root: root.clone(),
+            username: username.clone(),
+            authentication: SftpAuthentication::PrivateKey,
+        });
+        let secrets = ResolvedFileSecrets {
+            sftp_private_key: Some(private_key.clone()),
+            sftp_private_key_passphrase: Some(private_key_passphrase.clone()),
+            ..ResolvedFileSecrets::default()
+        };
+        let built = build_operator_with_secrets(&config, &secrets).unwrap();
+        let operator = &built.operator;
+
+        let contract_directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open(&contract_directory.path().join("dbx.sqlite")).await.unwrap();
+        storage
+            .save_file_connection_with_secret_bundle(
+                "sftp-service-contract".to_string(),
+                "SFTP service contract".to_string(),
+                "sftp".to_string(),
+                serde_json::to_string(&config).unwrap(),
+                vec![
+                    ("sftp_private_key".to_string(), private_key.clone()),
+                    ("sftp_private_key_passphrase".to_string(), private_key_passphrase.clone()),
+                ],
+                vec!["sftp_private_key".to_string(), "sftp_private_key_passphrase".to_string()],
+                "sftp_scope".to_string(),
+                password_scope(&config).unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+
+        let write_path = configured_entry_path(&config, "service-write.bin", false);
+        operator.write(&write_path, Bytes::from_static(b"sftp write")).await.unwrap();
+        assert_eq!(operator.read(&write_path).await.unwrap().to_vec(), b"sftp write");
+        assert_eq!(operator.stat(&write_path).await.unwrap().content_length(), 10);
+
+        let directory = RemotePath::parse("service-directory/").unwrap();
+        let created_directory = create_file_directory(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            directory.as_str().to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(created_directory.outcome, FileMutationOutcome::Completed));
+        let directory_path = configured_entry_path(&config, directory.as_str(), true);
+        assert!(operator.stat(&directory_path).await.unwrap().mode().is_dir());
+        let deleted_directory = delete_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            directory.as_str().to_string(),
+            Some(false),
+            Some("directory".to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(deleted_directory.outcome, FileMutationOutcome::Completed));
+        assert_eq!(operator.stat(&directory_path).await.unwrap_err().kind(), ErrorKind::NotFound);
+
+        let options = FileListOptions { page_size: Some(50) };
+        let mut page = list_file_entries(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            String::new(),
+            Some(options.clone()),
+        )
+        .await
+        .unwrap();
+        let first_cursor = page.cursor.clone().expect("the 211-entry fixture must paginate");
+        let mut paged_paths = page.entries.into_iter().map(|entry| entry.path).collect::<Vec<_>>();
+        while let Some(cursor) = page.cursor {
+            page = list_file_entries_next(
+                app.state::<Arc<AppState>>(),
+                app.state::<FileManagerRuntime>(),
+                "sftp-service-contract".to_string(),
+                cursor,
+                String::new(),
+                Some(options.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(page.entries.len() <= 50);
+            paged_paths.extend(page.entries.iter().map(|entry| entry.path.clone()));
+        }
+        assert!(paged_paths.len() > 205, "expected the paginated SFTP fixture, got {}", paged_paths.len());
+        let unique_paths = paged_paths.iter().collect::<HashSet<_>>();
+        assert_eq!(unique_paths.len(), paged_paths.len());
+        let mismatch_page = list_file_entries(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            String::new(),
+            Some(options.clone()),
+        )
+        .await
+        .unwrap();
+        let mismatch_cursor = mismatch_page.cursor.expect("the mismatch fixture must paginate");
+        let mismatched = list_file_entries_next(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            mismatch_cursor,
+            "nested".to_string(),
+            Some(options.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatched, CURSOR_EXPIRED);
+        let expired = list_file_entries_next(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            first_cursor,
+            String::new(),
+            Some(options),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(expired, CURSOR_EXPIRED);
+
+        let fixture_stat = stat_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            "fixture.txt".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture_stat.size, 17);
+
+        let assert_escape = |error: String| {
+            assert!(error.starts_with("SftpPathEscape:"), "unexpected escape error: {error}");
+            assert!(!error.contains("dbx-sftp-keys-"), "temporary key path leaked: {error}");
+        };
+        let escaped_read = app
+            .state::<FileManagerRuntime>()
+            .prepare_file_operation(&state, "sftp-service-contract", "escape/read-secret")
+            .await
+            .err()
+            .unwrap();
+        assert_escape(escaped_read);
+        let escaped_stat = stat_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            "escape/read-secret".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_escape(escaped_stat);
+        let escaped_list = list_file_entries(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            "escape".to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_escape(escaped_list);
+        let escaped_delete = delete_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            "sftp-service-contract".to_string(),
+            "escape/delete-victim".to_string(),
+            Some(false),
+            Some("file".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert_escape(escaped_delete);
+
+        let connection = state.storage.load_file_connection("sftp-service-contract").await.unwrap().unwrap();
+        let file_manager = app.state::<FileManagerRuntime>();
+        let prepared_escape = file_manager
+            .prepare_file_mutation_operation(&state, "sftp-service-contract", "escape/copy-source", connection.revision)
+            .await
+            .unwrap();
+        assert_escape(prepared_escape.guard_destination_path("escape/write-created").await.unwrap_err());
+        assert_escape(prepared_escape.stat_remote_file("escape/copy-source").await.unwrap_err());
+        assert_escape(
+            prepared_escape
+                .preflight_native_sftp_rename("escape/rename-source", "symlink-rename-result", false)
+                .await
+                .unwrap_err(),
+        );
+        assert!(!operator.exists(&configured_entry_path(&config, "symlink-copy-result", false)).await.unwrap());
+        assert!(!operator.exists(&configured_entry_path(&config, "symlink-rename-result", false)).await.unwrap());
+
+        let missing_root = test_sftp_connection(
+            &SftpConnectionConfig {
+                endpoint: endpoint.clone(),
+                root: format!("{}/missing-root", root.trim_end_matches('/')),
+                username: username.clone(),
+                authentication: SftpAuthentication::PrivateKey,
+            },
+            &secrets,
+        )
+        .await;
+        assert!(!missing_root.success, "{:?}", missing_root.stages);
+        let root_stage = missing_root.stages.iter().find(|stage| stage.stage == "root").unwrap();
+        assert_eq!(root_stage.status, "failed", "{:?}", missing_root.stages);
+        assert!(root_stage.message.as_deref().is_some_and(|message| message.starts_with("SftpRoot:")));
+        assert!(missing_root
+            .stages
+            .iter()
+            .filter(|stage| matches!(stage.stage, "configuration" | "host_key" | "authentication"))
+            .all(|stage| stage.status == "passed"));
+
+        let regular_file_root = test_sftp_connection(
+            &SftpConnectionConfig {
+                endpoint: endpoint.clone(),
+                root: "/home/dbx/root-file".to_string(),
+                username: username.clone(),
+                authentication: SftpAuthentication::PrivateKey,
+            },
+            &secrets,
+        )
+        .await;
+        assert!(!regular_file_root.success, "{:?}", regular_file_root.stages);
+        let root_stage = regular_file_root.stages.iter().find(|stage| stage.stage == "root").unwrap();
+        assert_eq!(root_stage.status, "failed", "{:?}", regular_file_root.stages);
+        assert!(
+            root_stage.message.as_deref().is_some_and(|message| message.starts_with("SftpRoot:")),
+            "{:?}",
+            regular_file_root.stages
+        );
+        assert!(regular_file_root
+            .stages
+            .iter()
+            .filter(|stage| matches!(stage.stage, "configuration" | "host_key" | "authentication"))
+            .all(|stage| stage.status == "passed"));
+
+        let denied = configured_entry_path(&config, "denied/", true);
+        let denied_error = operator.list(&denied).await.unwrap_err();
+        assert_eq!(denied_error.kind(), ErrorKind::PermissionDenied);
+        assert!(classify_sftp_error(denied_error).starts_with("SftpPermission:"));
+
+        let bad_secrets = ResolvedFileSecrets {
+            sftp_private_key: Some(private_key.clone()),
+            sftp_private_key_passphrase: Some("definitely-wrong".to_string()),
+            ..ResolvedFileSecrets::default()
+        };
+        assert!(build_operator_with_secrets(&config, &bad_secrets).err().unwrap().starts_with("SftpAuthentication:"));
+
+        let original_ssh_config =
+            std::env::var("DBX_TEST_SFTP_SSH_CONFIG").expect("DBX_TEST_SFTP_SSH_CONFIG is required");
+        let mismatch_ssh_config =
+            std::env::var("DBX_TEST_SFTP_MISMATCH_SSH_CONFIG").expect("DBX_TEST_SFTP_MISMATCH_SSH_CONFIG is required");
+        std::env::set_var("DBX_TEST_SFTP_SSH_CONFIG", mismatch_ssh_config);
+        let mismatch_config = SftpConnectionConfig {
+            endpoint: std::env::var("DBX_TEST_SFTP_HOST_ALIAS").unwrap(),
+            root: root.clone(),
+            username: String::new(),
+            authentication: SftpAuthentication::SshConfig,
+        };
+        let mismatch = test_sftp_connection(&mismatch_config, &ResolvedFileSecrets::default()).await;
+        std::env::set_var("DBX_TEST_SFTP_SSH_CONFIG", original_ssh_config);
+        assert!(!mismatch.success, "{:?}", mismatch.stages);
+        assert!(mismatch.stages.iter().any(|stage| stage.stage == "host_key"
+            && stage.status == "failed"
+            && stage.message.as_deref().is_some_and(|message| message.starts_with("SftpHostKey:"))));
+
+        let timeout = test_sftp_connection(
+            &SftpConnectionConfig {
+                endpoint: std::env::var("DBX_TEST_SFTP_TIMEOUT_ENDPOINT").unwrap(),
+                root: root.clone(),
+                username: username.clone(),
+                authentication: SftpAuthentication::Agent,
+            },
+            &ResolvedFileSecrets::default(),
+        )
+        .await;
+        assert!(!timeout.success);
+        assert!(timeout
+            .stages
+            .iter()
+            .any(|stage| { stage.message.as_deref().is_some_and(|message| message.starts_with("SftpTimeout:")) }));
+
+        let disconnect_config = FileConnectionConfig::Sftp(SftpConnectionConfig {
+            endpoint: std::env::var("DBX_TEST_SFTP_DISCONNECT_ENDPOINT")
+                .expect("DBX_TEST_SFTP_DISCONNECT_ENDPOINT is required"),
+            root,
+            username,
+            authentication: SftpAuthentication::PrivateKey,
+        });
+        let disconnect_secrets = ResolvedFileSecrets {
+            sftp_private_key: Some(private_key),
+            sftp_private_key_passphrase: Some(private_key_passphrase),
+            ..ResolvedFileSecrets::default()
+        };
+        let disconnect_operator = build_operator_with_secrets(&disconnect_config, &disconnect_secrets).unwrap();
+        let disconnect_path = configured_entry_path(&disconnect_config, "large.bin", false);
+        disconnect_operator.operator.stat(&disconnect_path).await.unwrap();
+        let control =
+            std::env::var("DBX_TEST_SFTP_DISCONNECT_CONTROL").expect("DBX_TEST_SFTP_DISCONNECT_CONTROL is required");
+        reqwest::Client::new()
+            .post(format!("{control}/arm?bytes=65536"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let disconnected = disconnect_operator.operator.read(&disconnect_path).await.unwrap_err();
+        let disconnected = classify_sftp_error(disconnected);
+        assert!(disconnected.starts_with("SftpDisconnected:"), "{disconnected}");
     }
 
     #[tokio::test]
@@ -4705,12 +5718,16 @@ mod tests {
         let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.endpoint.clone(),
-                FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => unreachable!(),
+                FileConnectionConfig::Sftp(_) | FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => {
+                    unreachable!()
+                }
             },
             root: "/ftp/dbx/must-not-be-created".to_string(),
             username: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.username.clone(),
-                FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => unreachable!(),
+                FileConnectionConfig::Sftp(_) | FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => {
+                    unreachable!()
+                }
             },
         });
         direct = direct_ftp(&input, &password).await;

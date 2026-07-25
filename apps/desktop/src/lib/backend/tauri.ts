@@ -184,6 +184,14 @@ export interface FtpFileConnectionConfig {
   username: string;
 }
 
+export interface SftpFileConnectionConfig {
+  type: "sftp";
+  endpoint: string;
+  root: string;
+  username: string;
+  authentication: "ssh_config" | "agent" | "private_key";
+}
+
 export interface S3FileConnectionConfig {
   type: "s3";
   endpoint: string;
@@ -202,7 +210,7 @@ export interface WebdavFileConnectionConfig {
   username: string;
 }
 
-export type FileConnectionConfig = FtpFileConnectionConfig | S3FileConnectionConfig | WebdavFileConnectionConfig;
+export type FileConnectionConfig = FtpFileConnectionConfig | SftpFileConnectionConfig | S3FileConnectionConfig | WebdavFileConnectionConfig;
 
 export interface FileConnectionInput {
   id?: string | null;
@@ -218,6 +226,9 @@ export interface FileConnectionInput {
     clearS3Credentials?: boolean;
     webdavToken?: string | null;
     clearWebdavCredentials?: boolean;
+    sftpPrivateKey?: string | null;
+    sftpPrivateKeyPassphrase?: string | null;
+    clearSftpCredentials?: boolean;
   } | null;
 }
 

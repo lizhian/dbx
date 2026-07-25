@@ -11,6 +11,7 @@ import { Label } from "@/components/ui/label";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
 import { useToast } from "@/composables/useToast";
 import * as api from "@/lib/backend/api";
+import { getPlatform } from "@/lib/backend/platform";
 import type { FileConnection, FileConnectionInput, FileConnectionTestResult, FileEntryStat, FileManagerEntry, FileTransfer, FileTransferStatus } from "@/lib/backend/tauri";
 
 const LIST_PAGE_SIZE = 200;
@@ -26,6 +27,7 @@ const text = computed(() => ({
   endpoint: t("fileManager.endpoint"),
   connectionType: t("fileManager.connectionType"),
   ftp: "FTP",
+  sftp: "SFTP",
   s3: "S3",
   webdav: "WebDAV",
   region: t("fileManager.region"),
@@ -44,6 +46,15 @@ const text = computed(() => ({
   ftpSecurity: t("fileManager.ftpSecurity"),
   s3Security: t("fileManager.s3Security"),
   webdavSecurity: t("fileManager.webdavSecurity"),
+  sftpSecurity: t("fileManager.sftpSecurity"),
+  sftpUnsupported: t("fileManager.sftpUnsupported"),
+  sshConfig: t("fileManager.sshConfig"),
+  sshAgent: t("fileManager.sshAgent"),
+  sshPrivateKey: t("fileManager.sshPrivateKey"),
+  privateKeyMaterial: t("fileManager.privateKeyMaterial"),
+  privateKeyPassphrase: t("fileManager.privateKeyPassphrase"),
+  keepPrivateKey: t("fileManager.keepPrivateKey"),
+  clearSftpCredentials: t("fileManager.clearSftpCredentials"),
   authentication: t("fileManager.authentication"),
   authNone: t("fileManager.authNone"),
   authBasic: t("fileManager.authBasic"),
@@ -70,6 +81,7 @@ const text = computed(() => ({
     dns: "DNS",
     tcp: "TCP",
     authentication: t("fileManager.stageAuthentication"),
+    host_key: t("fileManager.stageHostKey"),
     bucket: t("fileManager.bucket"),
     root: t("fileManager.root"),
   },
@@ -100,6 +112,9 @@ const text = computed(() => ({
   s3RenameRisk: t("fileManager.s3RenameRisk"),
   webdavCopyRisk: t("fileManager.webdavCopyRisk"),
   webdavRenameRisk: t("fileManager.webdavRenameRisk"),
+  sftpCopyRisk: t("fileManager.sftpCopyRisk"),
+  sftpRenameRisk: t("fileManager.sftpRenameRisk"),
+  sftpUploadRiskConfirm: (path: string) => t("fileManager.sftpUploadRiskConfirm", { path }),
   replaceDestination: t("fileManager.replaceDestination"),
   replaceConfirm: (path: string) => t("fileManager.replaceConfirm", { path }),
   retrySourceDelete: t("fileManager.retrySourceDelete"),
@@ -159,8 +174,9 @@ const directoryPath = ref("");
 const clearPassword = ref(false);
 const clearS3Credentials = ref(false);
 const clearWebdavCredentials = ref(false);
+const sftpSupported = ["macos", "linux"].includes(getPlatform());
 const form = ref({
-  type: "ftp" as "ftp" | "s3" | "webdav",
+  type: "ftp" as "ftp" | "sftp" | "s3" | "webdav",
   name: "",
   endpoint: "ftp://localhost:21",
   root: "/",
@@ -175,6 +191,9 @@ const form = ref({
   anonymous: false,
   webdavAuthentication: "basic" as "none" | "basic" | "bearer",
   webdavToken: "",
+  sftpAuthentication: "ssh_config" as "ssh_config" | "agent" | "private_key",
+  sftpPrivateKey: "",
+  sftpPrivateKeyPassphrase: "",
 });
 let connectionsGeneration = 0;
 let rootGeneration = 0;
@@ -184,13 +203,14 @@ let unlistenTransfers: UnlistenFn | null = null;
 let transferPoll: ReturnType<typeof setInterval> | null = null;
 
 const selectedConnection = computed(() => connections.value.find((connection) => connection.id === selectedId.value));
-const connectionSecurityText = computed(() => (form.value.type === "ftp" ? text.value.ftpSecurity : form.value.type === "s3" ? text.value.s3Security : text.value.webdavSecurity));
+const connectionSecurityText = computed(() => (form.value.type === "ftp" ? text.value.ftpSecurity : form.value.type === "sftp" ? (sftpSupported ? text.value.sftpSecurity : text.value.sftpUnsupported) : form.value.type === "s3" ? text.value.s3Security : text.value.webdavSecurity));
 const canSubmit = computed(
   () =>
     !!form.value.name.trim() &&
     !!form.value.endpoint.trim() &&
     form.value.root.startsWith("/") &&
     (form.value.type !== "s3" || (!!form.value.region.trim() && !!form.value.bucket.trim())) &&
+    (form.value.type !== "sftp" || (sftpSupported && (form.value.sftpAuthentication !== "private_key" || !!form.value.sftpPrivateKey.trim() || (!!editingId.value && !form.value.sftpPrivateKeyPassphrase)))) &&
     (form.value.type !== "webdav" || form.value.webdavAuthentication !== "basic" || !!form.value.username.trim()),
 );
 const breadcrumbs = computed(() => {
@@ -205,6 +225,30 @@ const breadcrumbs = computed(() => {
 });
 
 function inputFromForm(): FileConnectionInput {
+  if (form.value.type === "sftp") {
+    const hasPrivateKey = !!form.value.sftpPrivateKey.trim();
+    return {
+      id: editingId.value,
+      expectedRevision: editingId.value ? selectedConnection.value?.revision : undefined,
+      name: form.value.name.trim(),
+      config: {
+        type: "sftp",
+        endpoint: form.value.endpoint.trim(),
+        root: form.value.root.trim(),
+        username: form.value.username.trim(),
+        authentication: form.value.sftpAuthentication,
+      },
+      secrets:
+        form.value.sftpAuthentication !== "private_key"
+          ? { clearSftpCredentials: true }
+          : hasPrivateKey
+            ? {
+                sftpPrivateKey: form.value.sftpPrivateKey,
+                sftpPrivateKeyPassphrase: form.value.sftpPrivateKeyPassphrase || undefined,
+              }
+            : undefined,
+    };
+  }
   if (form.value.type === "s3") {
     const hasCredentials = !!form.value.accessKeyId || !!form.value.secretAccessKey || !!form.value.sessionToken;
     return {
@@ -267,6 +311,9 @@ function remoteOperationRisk(): string {
   }
   if (selectedConnection.value?.config.type === "webdav") {
     return remoteOperation.value === "copy" ? text.value.webdavCopyRisk : text.value.webdavRenameRisk;
+  }
+  if (selectedConnection.value?.config.type === "sftp") {
+    return remoteOperation.value === "copy" ? text.value.sftpCopyRisk : text.value.sftpRenameRisk;
   }
   return text.value.copyRenameRisk;
 }
@@ -443,6 +490,9 @@ function openCreate() {
     anonymous: false,
     webdavAuthentication: "basic",
     webdavToken: "",
+    sftpAuthentication: "ssh_config",
+    sftpPrivateKey: "",
+    sftpPrivateKeyPassphrase: "",
   };
   testResult.value = null;
   clearPassword.value = false;
@@ -460,7 +510,7 @@ function openEdit() {
     name: connection.name,
     endpoint: connection.config.endpoint,
     root: connection.config.root,
-    username: connection.config.type === "ftp" || connection.config.type === "webdav" ? connection.config.username : "",
+    username: connection.config.type === "ftp" || connection.config.type === "sftp" || connection.config.type === "webdav" ? connection.config.username : "",
     password: "",
     region: connection.config.type === "s3" ? connection.config.region : "us-east-1",
     bucket: connection.config.type === "s3" ? connection.config.bucket : "",
@@ -471,6 +521,9 @@ function openEdit() {
     anonymous: connection.config.type === "s3" && connection.config.anonymous,
     webdavAuthentication: connection.config.type === "webdav" ? connection.config.authentication : "basic",
     webdavToken: "",
+    sftpAuthentication: connection.config.type === "sftp" ? connection.config.authentication : "ssh_config",
+    sftpPrivateKey: "",
+    sftpPrivateKeyPassphrase: "",
   };
   testResult.value = null;
   clearPassword.value = false;
@@ -630,7 +683,7 @@ async function uploadFile() {
   if (typeof selected !== "string") return;
   const name = localFileName(selected);
   const remotePath = targetDirectory ? `${targetDirectory}/${name}` : name;
-  const uploadConfirmation = selectedConnection.value?.config.type === "s3" ? text.value.s3UploadRiskConfirm(remotePath) : text.value.uploadRiskConfirm(remotePath);
+  const uploadConfirmation = selectedConnection.value?.config.type === "s3" ? text.value.s3UploadRiskConfirm(remotePath) : selectedConnection.value?.config.type === "sftp" ? text.value.sftpUploadRiskConfirm(remotePath) : text.value.uploadRiskConfirm(remotePath);
   if (!globalThis.confirm(uploadConfirmation)) return;
   try {
     const started = await api.startFileUpload({
@@ -964,165 +1017,204 @@ onBeforeUnmount(() => {
   </div>
 
   <Dialog v-model:open="editorOpen">
-    <DialogContent class="sm:max-w-lg">
-      <DialogHeader
+    <DialogContent class="flex max-h-[calc(100dvh-2rem)] flex-col overflow-hidden sm:max-w-lg">
+      <DialogHeader class="shrink-0"
         ><DialogTitle>{{ editingId ? text.edit : text.add }}</DialogTitle></DialogHeader
       >
-      <div class="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
-        <div class="flex gap-2">
-          <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
-          <span>{{ connectionSecurityText }}</span>
+      <div data-testid="connection-editor-scroll-region" class="min-h-0 flex-1 overflow-y-auto pr-1">
+        <div class="rounded border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">
+          <div class="flex gap-2">
+            <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+            <span>{{ connectionSecurityText }}</span>
+          </div>
         </div>
-      </div>
-      <div class="grid gap-3 py-1">
-        <div class="grid gap-1.5">
-          <Label for="file-connection-type">{{ text.connectionType }}</Label>
-          <select
-            id="file-connection-type"
-            v-model="form.type"
-            class="h-9 rounded-md border border-input bg-background px-3 text-sm"
-            @change="
-              form.endpoint = form.type === 'ftp' ? 'ftp://localhost:21' : form.type === 's3' ? 'http://localhost:9000' : 'http://localhost:8080';
-              testResult = null;
-            "
-          >
-            <option value="ftp">{{ text.ftp }}</option>
-            <option value="s3">{{ text.s3 }}</option>
-            <option value="webdav">{{ text.webdav }}</option>
-          </select>
-        </div>
-        <div class="grid gap-1.5">
-          <Label for="file-connection-name">{{ text.name }}</Label
-          ><Input id="file-connection-name" v-model="form.name" />
-        </div>
-        <div class="grid gap-1.5">
-          <Label for="file-connection-endpoint">{{ text.endpoint }}</Label
-          ><Input id="file-connection-endpoint" v-model="form.endpoint" :placeholder="form.type === 'ftp' ? 'ftp://host:21' : form.type === 's3' ? 'https://s3.example.com' : 'https://dav.example.com/webdav'" />
-        </div>
-        <div v-if="form.type === 'ftp'" class="grid grid-cols-2 gap-3">
+        <div class="grid gap-3 py-1">
           <div class="grid gap-1.5">
-            <Label for="file-connection-root">{{ text.root }}</Label
-            ><Input id="file-connection-root" v-model="form.root" placeholder="/" />
+            <Label for="file-connection-type">{{ text.connectionType }}</Label>
+            <select
+              id="file-connection-type"
+              v-model="form.type"
+              class="h-9 rounded-md border border-input bg-background px-3 text-sm"
+              @change="
+                form.endpoint = form.type === 'ftp' ? 'ftp://localhost:21' : form.type === 'sftp' ? 'localhost' : form.type === 's3' ? 'http://localhost:9000' : 'http://localhost:8080';
+                testResult = null;
+              "
+            >
+              <option value="ftp">{{ text.ftp }}</option>
+              <option value="sftp" :disabled="!sftpSupported">{{ text.sftp }}{{ sftpSupported ? "" : ` - ${text.sftpUnsupported}` }}</option>
+              <option value="s3">{{ text.s3 }}</option>
+              <option value="webdav">{{ text.webdav }}</option>
+            </select>
           </div>
           <div class="grid gap-1.5">
-            <Label for="file-connection-username">{{ text.username }}</Label
-            ><Input id="file-connection-username" v-model="form.username" />
-          </div>
-        </div>
-        <div v-if="form.type === 'ftp'" class="grid gap-1.5">
-          <Label for="file-connection-password">{{ text.password }}</Label>
-          <PasswordInput id="file-connection-password" v-model="form.password" :disabled="clearPassword" :placeholder="editingId ? text.keepPassword : ''" />
-          <label v-if="editingId && selectedConnection?.hasPassword" class="flex items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="clearPassword" type="checkbox" class="h-3.5 w-3.5 accent-primary" @change="clearPassword && (form.password = '')" />
-            <span>{{ text.clearPassword }}</span>
-          </label>
-        </div>
-        <template v-else-if="form.type === 's3'">
-          <div class="grid grid-cols-2 gap-3">
-            <div class="grid gap-1.5">
-              <Label for="file-connection-region">{{ text.region }}</Label>
-              <Input id="file-connection-region" v-model="form.region" placeholder="us-east-1" />
-            </div>
-            <div class="grid gap-1.5">
-              <Label for="file-connection-bucket">{{ text.bucket }}</Label>
-              <Input id="file-connection-bucket" v-model="form.bucket" />
-            </div>
+            <Label for="file-connection-name">{{ text.name }}</Label
+            ><Input id="file-connection-name" v-model="form.name" />
           </div>
           <div class="grid gap-1.5">
-            <Label for="file-connection-s3-root">{{ text.root }}</Label>
-            <Input id="file-connection-s3-root" v-model="form.root" placeholder="/" />
+            <Label for="file-connection-endpoint">{{ text.endpoint }}</Label
+            ><Input id="file-connection-endpoint" v-model="form.endpoint" :placeholder="form.type === 'ftp' ? 'ftp://host:21' : form.type === 'sftp' ? 'host-alias or ssh://host:22' : form.type === 's3' ? 'https://s3.example.com' : 'https://dav.example.com/webdav'" />
           </div>
-          <label class="flex items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="form.virtualHostStyle" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
-            <span>{{ text.virtualHostStyle }}</span>
-          </label>
-          <label class="flex items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="form.anonymous" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
-            <span>{{ text.anonymous }}</span>
-          </label>
-          <div v-if="!form.anonymous" class="grid gap-3">
+          <div v-if="form.type === 'ftp'" class="grid grid-cols-2 gap-3">
             <div class="grid gap-1.5">
-              <Label for="file-connection-access-key">{{ text.accessKeyId }}</Label>
-              <PasswordInput id="file-connection-access-key" v-model="form.accessKeyId" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+              <Label for="file-connection-root">{{ text.root }}</Label
+              ><Input id="file-connection-root" v-model="form.root" placeholder="/" />
             </div>
             <div class="grid gap-1.5">
-              <Label for="file-connection-secret-key">{{ text.secretAccessKey }}</Label>
-              <PasswordInput id="file-connection-secret-key" v-model="form.secretAccessKey" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+              <Label for="file-connection-username">{{ text.username }}</Label
+              ><Input id="file-connection-username" v-model="form.username" />
+            </div>
+          </div>
+          <div v-if="form.type === 'ftp'" class="grid gap-1.5">
+            <Label for="file-connection-password">{{ text.password }}</Label>
+            <PasswordInput id="file-connection-password" v-model="form.password" :disabled="clearPassword" :placeholder="editingId ? text.keepPassword : ''" />
+            <label v-if="editingId && selectedConnection?.hasPassword" class="flex items-center gap-2 text-xs text-muted-foreground">
+              <input v-model="clearPassword" type="checkbox" class="h-3.5 w-3.5 accent-primary" @change="clearPassword && (form.password = '')" />
+              <span>{{ text.clearPassword }}</span>
+            </label>
+          </div>
+          <template v-else-if="form.type === 'sftp'">
+            <div class="grid grid-cols-2 gap-3">
+              <div class="grid gap-1.5">
+                <Label for="file-connection-sftp-root">{{ text.root }}</Label>
+                <Input id="file-connection-sftp-root" v-model="form.root" placeholder="/" />
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-sftp-username">{{ text.username }}</Label>
+                <Input id="file-connection-sftp-username" v-model="form.username" />
+              </div>
             </div>
             <div class="grid gap-1.5">
-              <Label for="file-connection-session-token">{{ text.sessionToken }}</Label>
-              <PasswordInput id="file-connection-session-token" v-model="form.sessionToken" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+              <Label for="file-connection-sftp-auth">{{ text.authentication }}</Label>
+              <select id="file-connection-sftp-auth" v-model="form.sftpAuthentication" class="h-9 rounded-md border border-input bg-background px-3 text-sm">
+                <option value="ssh_config">{{ text.sshConfig }}</option>
+                <option value="agent">{{ text.sshAgent }}</option>
+                <option value="private_key">{{ text.sshPrivateKey }}</option>
+              </select>
             </div>
-            <label v-if="editingId && selectedConnection?.hasCredentials" class="flex items-center gap-2 text-xs text-muted-foreground">
+            <div v-if="form.sftpAuthentication === 'private_key'" class="grid gap-3">
+              <div class="grid gap-1.5">
+                <Label for="file-connection-sftp-private-key">{{ text.privateKeyMaterial }}</Label>
+                <textarea
+                  id="file-connection-sftp-private-key"
+                  v-model="form.sftpPrivateKey"
+                  :placeholder="editingId ? text.keepPrivateKey : '-----BEGIN OPENSSH PRIVATE KEY-----'"
+                  class="min-h-28 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs"
+                  spellcheck="false"
+                />
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-sftp-passphrase">{{ text.privateKeyPassphrase }}</Label>
+                <PasswordInput id="file-connection-sftp-passphrase" v-model="form.sftpPrivateKeyPassphrase" :placeholder="editingId ? text.keepPassword : ''" />
+              </div>
+            </div>
+          </template>
+          <template v-else-if="form.type === 's3'">
+            <div class="grid grid-cols-2 gap-3">
+              <div class="grid gap-1.5">
+                <Label for="file-connection-region">{{ text.region }}</Label>
+                <Input id="file-connection-region" v-model="form.region" placeholder="us-east-1" />
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-bucket">{{ text.bucket }}</Label>
+                <Input id="file-connection-bucket" v-model="form.bucket" />
+              </div>
+            </div>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-s3-root">{{ text.root }}</Label>
+              <Input id="file-connection-s3-root" v-model="form.root" placeholder="/" />
+            </div>
+            <label class="flex items-center gap-2 text-xs text-muted-foreground">
+              <input v-model="form.virtualHostStyle" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+              <span>{{ text.virtualHostStyle }}</span>
+            </label>
+            <label class="flex items-center gap-2 text-xs text-muted-foreground">
+              <input v-model="form.anonymous" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+              <span>{{ text.anonymous }}</span>
+            </label>
+            <div v-if="!form.anonymous" class="grid gap-3">
+              <div class="grid gap-1.5">
+                <Label for="file-connection-access-key">{{ text.accessKeyId }}</Label>
+                <PasswordInput id="file-connection-access-key" v-model="form.accessKeyId" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-secret-key">{{ text.secretAccessKey }}</Label>
+                <PasswordInput id="file-connection-secret-key" v-model="form.secretAccessKey" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-session-token">{{ text.sessionToken }}</Label>
+                <PasswordInput id="file-connection-session-token" v-model="form.sessionToken" :disabled="clearS3Credentials" :placeholder="editingId ? text.keepPassword : ''" />
+              </div>
+              <label v-if="editingId && selectedConnection?.hasCredentials" class="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  v-model="clearS3Credentials"
+                  type="checkbox"
+                  class="h-3.5 w-3.5 accent-primary"
+                  @change="
+                    if (clearS3Credentials) {
+                      form.accessKeyId = '';
+                      form.secretAccessKey = '';
+                      form.sessionToken = '';
+                    }
+                  "
+                />
+                <span>{{ text.clearS3Credentials }}</span>
+              </label>
+            </div>
+          </template>
+          <template v-else>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-webdav-root">{{ text.root }}</Label>
+              <Input id="file-connection-webdav-root" v-model="form.root" placeholder="/" />
+            </div>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-webdav-auth">{{ text.authentication }}</Label>
+              <select id="file-connection-webdav-auth" v-model="form.webdavAuthentication" class="h-9 rounded-md border border-input bg-background px-3 text-sm">
+                <option value="none">{{ text.authNone }}</option>
+                <option value="basic">{{ text.authBasic }}</option>
+                <option value="bearer">{{ text.authBearer }}</option>
+              </select>
+            </div>
+            <div v-if="form.webdavAuthentication === 'basic'" class="grid gap-3">
+              <div class="grid gap-1.5">
+                <Label for="file-connection-webdav-username">{{ text.username }}</Label>
+                <Input id="file-connection-webdav-username" v-model="form.username" />
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-webdav-password">{{ text.password }}</Label>
+                <PasswordInput id="file-connection-webdav-password" v-model="form.password" :disabled="clearWebdavCredentials" :placeholder="editingId ? text.keepPassword : ''" />
+              </div>
+            </div>
+            <div v-else-if="form.webdavAuthentication === 'bearer'" class="grid gap-1.5">
+              <Label for="file-connection-webdav-token">{{ text.bearerToken }}</Label>
+              <PasswordInput id="file-connection-webdav-token" v-model="form.webdavToken" :disabled="clearWebdavCredentials" :placeholder="editingId ? text.keepPassword : ''" />
+            </div>
+            <label v-if="editingId && selectedConnection?.hasCredentials && form.webdavAuthentication !== 'none'" class="flex items-center gap-2 text-xs text-muted-foreground">
               <input
-                v-model="clearS3Credentials"
+                v-model="clearWebdavCredentials"
                 type="checkbox"
                 class="h-3.5 w-3.5 accent-primary"
                 @change="
-                  if (clearS3Credentials) {
-                    form.accessKeyId = '';
-                    form.secretAccessKey = '';
-                    form.sessionToken = '';
+                  if (clearWebdavCredentials) {
+                    form.password = '';
+                    form.webdavToken = '';
                   }
                 "
               />
-              <span>{{ text.clearS3Credentials }}</span>
+              <span>{{ text.clearWebdavCredentials }}</span>
             </label>
+          </template>
+        </div>
+        <div v-if="testResult" class="space-y-1 rounded border p-2">
+          <div v-for="stage in testResult.stages" :key="stage.stage" class="flex min-w-0 items-start gap-2 text-xs">
+            <CheckCircle2 v-if="stage.status === 'passed'" class="h-3.5 w-3.5 shrink-0 text-green-600" />
+            <XCircle v-else-if="stage.status === 'failed'" class="h-3.5 w-3.5 shrink-0 text-destructive" />
+            <span v-else class="h-3.5 w-3.5 shrink-0 rounded-full border" />
+            <span class="w-24 shrink-0 font-medium">{{ text.stage[stage.stage] }}</span>
+            <span class="min-w-0 break-words text-muted-foreground">{{ stage.message }}</span>
           </div>
-        </template>
-        <template v-else>
-          <div class="grid gap-1.5">
-            <Label for="file-connection-webdav-root">{{ text.root }}</Label>
-            <Input id="file-connection-webdav-root" v-model="form.root" placeholder="/" />
-          </div>
-          <div class="grid gap-1.5">
-            <Label for="file-connection-webdav-auth">{{ text.authentication }}</Label>
-            <select id="file-connection-webdav-auth" v-model="form.webdavAuthentication" class="h-9 rounded-md border border-input bg-background px-3 text-sm">
-              <option value="none">{{ text.authNone }}</option>
-              <option value="basic">{{ text.authBasic }}</option>
-              <option value="bearer">{{ text.authBearer }}</option>
-            </select>
-          </div>
-          <div v-if="form.webdavAuthentication === 'basic'" class="grid gap-3">
-            <div class="grid gap-1.5">
-              <Label for="file-connection-webdav-username">{{ text.username }}</Label>
-              <Input id="file-connection-webdav-username" v-model="form.username" />
-            </div>
-            <div class="grid gap-1.5">
-              <Label for="file-connection-webdav-password">{{ text.password }}</Label>
-              <PasswordInput id="file-connection-webdav-password" v-model="form.password" :disabled="clearWebdavCredentials" :placeholder="editingId ? text.keepPassword : ''" />
-            </div>
-          </div>
-          <div v-else-if="form.webdavAuthentication === 'bearer'" class="grid gap-1.5">
-            <Label for="file-connection-webdav-token">{{ text.bearerToken }}</Label>
-            <PasswordInput id="file-connection-webdav-token" v-model="form.webdavToken" :disabled="clearWebdavCredentials" :placeholder="editingId ? text.keepPassword : ''" />
-          </div>
-          <label v-if="editingId && selectedConnection?.hasCredentials && form.webdavAuthentication !== 'none'" class="flex items-center gap-2 text-xs text-muted-foreground">
-            <input
-              v-model="clearWebdavCredentials"
-              type="checkbox"
-              class="h-3.5 w-3.5 accent-primary"
-              @change="
-                if (clearWebdavCredentials) {
-                  form.password = '';
-                  form.webdavToken = '';
-                }
-              "
-            />
-            <span>{{ text.clearWebdavCredentials }}</span>
-          </label>
-        </template>
-      </div>
-      <div v-if="testResult" class="space-y-1 rounded border p-2">
-        <div v-for="stage in testResult.stages" :key="stage.stage" class="flex min-w-0 items-start gap-2 text-xs">
-          <CheckCircle2 v-if="stage.status === 'passed'" class="h-3.5 w-3.5 shrink-0 text-green-600" />
-          <XCircle v-else-if="stage.status === 'failed'" class="h-3.5 w-3.5 shrink-0 text-destructive" />
-          <span v-else class="h-3.5 w-3.5 shrink-0 rounded-full border" />
-          <span class="w-24 shrink-0 font-medium">{{ text.stage[stage.stage] }}</span>
-          <span class="min-w-0 break-words text-muted-foreground">{{ stage.message }}</span>
         </div>
       </div>
-      <DialogFooter>
+      <DialogFooter data-testid="connection-editor-footer" class="shrink-0">
         <Button variant="outline" :disabled="saving || testing" @click="editorOpen = false">{{ text.cancel }}</Button>
         <Button variant="outline" :disabled="!canSubmit || saving || testing" @click="void testConnection()"> <Loader2 v-if="testing" class="mr-1.5 h-3.5 w-3.5 animate-spin" />{{ text.test }} </Button>
         <Button :disabled="!canSubmit || saving || testing" @click="void saveConnection()"> <Loader2 v-if="saving" class="mr-1.5 h-3.5 w-3.5 animate-spin" />{{ text.save }} </Button>

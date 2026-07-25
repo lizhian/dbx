@@ -41,6 +41,22 @@ function passthrough(tag: string): Component {
   });
 }
 
+function modelInput(): Component {
+  return defineComponent({
+    inheritAttrs: false,
+    props: { modelValue: { type: String, default: "" } },
+    emits: ["update:modelValue"],
+    setup(props, { attrs, emit }) {
+      return () =>
+        h("input", {
+          ...attrs,
+          value: props.modelValue,
+          onInput: (event: Event) => emit("update:modelValue", (event.target as HTMLInputElement).value),
+        });
+    },
+  });
+}
+
 vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mocks.openDialog, save: mocks.saveDialog }));
 vi.mock("@lucide/vue", async (importOriginal) => {
@@ -74,10 +90,11 @@ vi.mock("@/components/ui/dialog", () => ({
   DialogHeader: passthrough("div"),
   DialogTitle: passthrough("div"),
 }));
-vi.mock("@/components/ui/input", () => ({ Input: passthrough("input") }));
+vi.mock("@/components/ui/input", () => ({ Input: modelInput() }));
 vi.mock("@/components/ui/label", () => ({ Label: passthrough("label") }));
-vi.mock("@/components/ui/PasswordInput.vue", () => ({ default: passthrough("input") }));
+vi.mock("@/components/ui/PasswordInput.vue", () => ({ default: modelInput() }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
+vi.mock("@/lib/backend/platform", () => ({ getPlatform: () => "linux" }));
 vi.mock("@/lib/backend/api", () => ({
   cancelFileTransfer: mocks.cancelFileTransfer,
   closeFileListCursor: mocks.closeFileListCursor,
@@ -191,6 +208,22 @@ async function mountPage() {
   await nextTick();
 }
 
+function setInput(selector: string, value: string) {
+  const input = root?.querySelector<HTMLInputElement | HTMLTextAreaElement>(selector);
+  expect(input, selector).toBeTruthy();
+  if (!input) return;
+  input.value = value;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function setSelect(selector: string, value: string) {
+  const select = root?.querySelector<HTMLSelectElement>(selector);
+  expect(select, selector).toBeTruthy();
+  if (!select) return;
+  select.value = value;
+  select.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 beforeEach(() => {
   vi.stubGlobal("confirm", mocks.confirmUploadRisk);
   mocks.confirmUploadRisk.mockReturnValue(true);
@@ -216,6 +249,147 @@ afterEach(() => {
 });
 
 describe("FileManagerPage transfer lifecycle", () => {
+  it("submits inline SFTP private-key authentication without password-only support", async () => {
+    mocks.saveFileConnection.mockResolvedValue({
+      ...connection,
+      id: "sftp-1",
+      config: {
+        type: "sftp",
+        endpoint: "ssh://sftp.example:2222",
+        root: "/srv/dbx",
+        username: "dbx",
+        authentication: "private_key",
+      },
+    });
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.add"]')?.click();
+    await nextTick();
+    setSelect("#file-connection-type", "sftp");
+    await nextTick();
+    expect(root?.textContent).toContain("fileManager.sftpSecurity");
+    expect(root?.querySelector("#file-connection-sftp-auth")).toBeTruthy();
+
+    setInput("#file-connection-name", "SFTP files");
+    setInput("#file-connection-endpoint", "ssh://sftp.example:2222");
+    setInput("#file-connection-sftp-root", "/srv/dbx");
+    setInput("#file-connection-sftp-username", "dbx");
+    setSelect("#file-connection-sftp-auth", "private_key");
+    await nextTick();
+    setInput("#file-connection-sftp-private-key", "-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----");
+    setInput("#file-connection-sftp-passphrase", "key-passphrase");
+    await nextTick();
+
+    const save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    expect(save?.disabled).toBe(false);
+    save?.click();
+
+    await vi.waitFor(() =>
+      expect(mocks.saveFileConnection).toHaveBeenCalledWith({
+        id: null,
+        expectedRevision: undefined,
+        name: "SFTP files",
+        config: {
+          type: "sftp",
+          endpoint: "ssh://sftp.example:2222",
+          root: "/srv/dbx",
+          username: "dbx",
+          authentication: "private_key",
+        },
+        secrets: {
+          sftpPrivateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\nkey\n-----END OPENSSH PRIVATE KEY-----",
+          sftpPrivateKeyPassphrase: "key-passphrase",
+        },
+      }),
+    );
+  });
+
+  it("rejects a new SFTP passphrase without new private-key material", async () => {
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.add"]')?.click();
+    await nextTick();
+    setSelect("#file-connection-type", "sftp");
+    await nextTick();
+    setInput("#file-connection-name", "SFTP files");
+    setSelect("#file-connection-sftp-auth", "private_key");
+    await nextTick();
+    setInput("#file-connection-sftp-passphrase", "passphrase-without-key");
+    await nextTick();
+
+    const save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    expect(save?.disabled).toBe(true);
+    save?.click();
+    expect(mocks.saveFileConnection).not.toHaveBeenCalled();
+  });
+
+  it("keeps the connection editor footer outside the scroll region at small viewport heights", async () => {
+    vi.stubGlobal("innerHeight", 420);
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.add"]')?.click();
+    await nextTick();
+    setSelect("#file-connection-type", "sftp");
+    await nextTick();
+    setSelect("#file-connection-sftp-auth", "private_key");
+    await nextTick();
+
+    const scrollRegion = root?.querySelector<HTMLElement>('[data-testid="connection-editor-scroll-region"]');
+    const footer = root?.querySelector<HTMLElement>('[data-testid="connection-editor-footer"]');
+    const dialog = scrollRegion?.parentElement;
+    expect(dialog?.className).toContain("max-h-[calc(100dvh-2rem)]");
+    expect(dialog?.className).toContain("overflow-hidden");
+    expect(scrollRegion?.className).toContain("min-h-0");
+    expect(scrollRegion?.className).toContain("overflow-y-auto");
+    expect(scrollRegion?.querySelector("#file-connection-sftp-private-key")).toBeTruthy();
+    expect(footer?.parentElement).toBe(dialog);
+    expect(scrollRegion?.contains(footer ?? null)).toBe(false);
+    expect(footer?.className).toContain("shrink-0");
+  });
+
+  it("preserves the stored SFTP key bundle when an edit omits both secret fields", async () => {
+    const sftpConnection: FileConnection = {
+      ...connection,
+      id: "sftp-existing",
+      name: "Existing SFTP",
+      revision: 4,
+      config: {
+        type: "sftp",
+        endpoint: "prod-sftp",
+        root: "/srv/dbx",
+        username: "dbx",
+        authentication: "private_key",
+      },
+      hasCredentials: true,
+    };
+    mocks.listFileConnections.mockResolvedValue([sftpConnection]);
+    mocks.saveFileConnection.mockResolvedValue(sftpConnection);
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.edit"]')?.click();
+    await nextTick();
+    expect(root?.querySelector<HTMLTextAreaElement>("#file-connection-sftp-private-key")?.placeholder).toBe("fileManager.keepPrivateKey");
+    const save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    expect(save?.disabled).toBe(false);
+    save?.click();
+
+    await vi.waitFor(() =>
+      expect(mocks.saveFileConnection).toHaveBeenCalledWith({
+        id: "sftp-existing",
+        expectedRevision: 4,
+        name: "Existing SFTP",
+        config: {
+          type: "sftp",
+          endpoint: "prod-sftp",
+          root: "/srv/dbx",
+          username: "dbx",
+          authentication: "private_key",
+        },
+        secrets: undefined,
+      }),
+    );
+  });
+
   it("shows protocol-specific connection security warnings", async () => {
     await mountPage();
 

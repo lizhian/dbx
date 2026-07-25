@@ -80,6 +80,7 @@ sys-locale = "0.3"
 suppaftp = { version = "8.0.3", default-features = false, features = ["tokio"] }
 url = "2"
 quick-xml = "0.39"
+zeroize = "1"
 
 [dev-dependencies]
 tauri = { version = "2.10.3", features = ["test"] }
@@ -93,6 +94,12 @@ rustix = { version = "1.1.4", features = ["fs"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"
 rustix = { version = "1.1.4", features = ["fs"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+libc = "0.2"
+opendal = { version = "=0.57.0", default-features = false, features = ["services-sftp"] }
+openssh = "0.11"
+openssh-sftp-client = { version = "0.15", features = ["openssh"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

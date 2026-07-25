@@ -76,6 +76,10 @@ static TEST_REMOTE_RENAME_AFTER_PUBLISH_BARRIER: std::sync::OnceLock<Mutex<Optio
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static TEST_SFTP_RENAME_BEFORE_DISPATCH_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
 static TEST_S3_COPY_AFTER_COMMIT_RESPONSE_LOSS: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
 
 #[cfg(test)]
@@ -1129,14 +1133,55 @@ async fn verify_remote_content(
 ) -> Result<VerifiedRemoteContent, TransferFailure> {
     let before = prepared.fingerprint_remote_file(relative_path).await.map_err(remote_failure)?;
     let relative_path = validate_remote_relative_path(relative_path).map_err(local_failure)?;
-    let mut ftp = tokio::time::timeout(IO_PROGRESS_WATCHDOG, prepared.open_exact_ftp_read_session())
-        .await
-        .map_err(|_| remote_failure("Opening the remote verification session timed out"))?
-        .map_err(remote_failure)?;
-    let mut reader = tokio::time::timeout(IO_PROGRESS_WATCHDOG, ftp.retr_as_stream(&relative_path))
+    let (bytes_read, sha256) = if prepared.uses_exact_ftp_relay() {
+        let mut ftp = tokio::time::timeout(IO_PROGRESS_WATCHDOG, prepared.open_exact_ftp_read_session())
+            .await
+            .map_err(|_| remote_failure("Opening the remote verification session timed out"))?
+            .map_err(remote_failure)?;
+        let mut reader = tokio::time::timeout(IO_PROGRESS_WATCHDOG, ftp.retr_as_stream(&relative_path))
+            .await
+            .map_err(|_| remote_failure("Opening the remote verification reader timed out"))?
+            .map_err(|error| remote_failure(prepared.redact_exact_ftp_error(error)))?;
+        let result = hash_remote_reader(prepared, &mut reader, cancellation).await?;
+        let finalize = tokio::time::timeout(IO_PROGRESS_WATCHDOG, ftp.finalize_retr_stream(reader))
+            .await
+            .map_err(|_| remote_failure("Finalizing the remote verification reader timed out"))?
+            .map_err(|error| remote_failure(prepared.redact_exact_ftp_error(error)));
+        let _ = ftp.quit().await;
+        finalize?;
+        result
+    } else {
+        let configured = prepared.configured_path(&relative_path).map_err(local_failure)?;
+        let reader = tokio::time::timeout(
+            IO_PROGRESS_WATCHDOG,
+            prepared.operator.reader_with(&configured).concurrent(1).chunk(REMOTE_COPY_BUFFER_SIZE),
+        )
         .await
         .map_err(|_| remote_failure("Opening the remote verification reader timed out"))?
-        .map_err(|error| remote_failure(prepared.redact_exact_ftp_error(error)))?;
+        .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
+        let mut reader = reader
+            .into_futures_async_read(..)
+            .await
+            .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
+        hash_futures_remote_reader(prepared, &mut reader, cancellation).await?
+    };
+    let after = prepared.fingerprint_remote_file(&relative_path).await.map_err(remote_failure)?;
+    if before != after || bytes_read != before.size {
+        return Err(remote_failure(
+            "Remote file changed while its content hash was being verified; source deletion was not attempted",
+        ));
+    }
+    Ok(VerifiedRemoteContent { fingerprint: after, sha256 })
+}
+
+async fn hash_remote_reader<R>(
+    prepared: &PreparedFileMutation<'_>,
+    reader: &mut R,
+    cancellation: &CancellationToken,
+) -> Result<(u64, String), TransferFailure>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buffer = vec![0_u8; REMOTE_COPY_BUFFER_SIZE];
     let mut bytes_read = 0_u64;
     let mut hasher = Sha256::new();
@@ -1153,7 +1198,7 @@ async fn verify_remote_content(
             result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, reader.read(&mut buffer)) => {
                 result
                     .map_err(|_| remote_failure("Remote content verification made no progress before the I/O watchdog expired"))?
-                    .map_err(|error| remote_failure(error.to_string()))?
+                    .map_err(|error| remote_failure(prepared.redact_remote_error(error.to_string())))?
             }
         };
         if count == 0 {
@@ -1162,18 +1207,46 @@ async fn verify_remote_content(
         bytes_read = bytes_read.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
         hasher.update(&buffer[..count]);
     }
-    tokio::time::timeout(IO_PROGRESS_WATCHDOG, ftp.finalize_retr_stream(reader))
-        .await
-        .map_err(|_| remote_failure("Finalizing the remote verification reader timed out"))?
-        .map_err(|error| remote_failure(prepared.redact_exact_ftp_error(error)))?;
-    let _ = ftp.quit().await;
-    let after = prepared.fingerprint_remote_file(&relative_path).await.map_err(remote_failure)?;
-    if before != after || bytes_read != before.size {
-        return Err(remote_failure(
-            "Remote file changed while its content hash was being verified; source deletion was not attempted",
-        ));
+    Ok((bytes_read, format!("{:x}", hasher.finalize())))
+}
+
+async fn hash_futures_remote_reader<R>(
+    prepared: &PreparedFileMutation<'_>,
+    reader: &mut R,
+    cancellation: &CancellationToken,
+) -> Result<(u64, String), TransferFailure>
+where
+    R: FuturesAsyncRead + Unpin,
+{
+    let mut buffer = vec![0_u8; REMOTE_COPY_BUFFER_SIZE];
+    let mut bytes_read = 0_u64;
+    let mut hasher = Sha256::new();
+    loop {
+        let count = tokio::select! {
+            _ = cancellation.cancelled() => return Err(cancelled_active_failure()),
+            _ = prepared.cancellation.cancelled() => {
+                return Err(TransferFailure {
+                    status: "cancelled",
+                    message: "The file connection was removed during remote content verification".to_string(),
+                    invalidate_operator: true,
+                })
+            },
+            result = tokio::time::timeout(
+                IO_PROGRESS_WATCHDOG,
+                FuturesAsyncReadExt::read(reader, &mut buffer),
+            ) => {
+                result
+                    .map_err(|_| remote_failure("Remote content verification made no progress before the I/O watchdog expired"))?
+                    .map_err(|error| remote_failure(prepared.redact_remote_error(error.to_string())))?
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        hasher.update(&buffer[..count]);
     }
-    Ok(VerifiedRemoteContent { fingerprint: after, sha256: format!("{:x}", hasher.finalize()) })
+    Ok((bytes_read, format!("{:x}", hasher.finalize())))
 }
 
 async fn open_remote_copy_writer(
@@ -1182,19 +1255,24 @@ async fn open_remote_copy_writer(
 ) -> Result<opendal::Writer, TransferFailure> {
     let writer = tokio::time::timeout(
         IO_PROGRESS_WATCHDOG,
-        prepared.operator.writer_with(partial_configured).append(true).chunk(REMOTE_COPY_BUFFER_SIZE).concurrent(1),
+        prepared
+            .operator
+            .writer_with(partial_configured)
+            .append(prepared.requires_append_streaming_write())
+            .chunk(REMOTE_COPY_BUFFER_SIZE)
+            .concurrent(1),
     )
     .await
     .map_err(|_| remote_failure("Opening the remote copy destination timed out"))?
-    .map_err(|error| remote_failure(error.to_string()))?;
+    .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
     #[cfg(test)]
     if TEST_REMOTE_COPY_WRITER_OPEN_SIDE_EFFECT_FAILURE.swap(false, Ordering::SeqCst) {
         let mut writer = writer;
         writer
             .write(Bytes::from_static(b"injected writer-open side effect"))
             .await
-            .map_err(|error| remote_failure(error.to_string()))?;
-        writer.close().await.map_err(|error| remote_failure(error.to_string()))?;
+            .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
+        writer.close().await.map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
         return Err(remote_failure(
             "Injected remote copy writer-open failure after creating its operation-owned partial",
         ));
@@ -1224,7 +1302,7 @@ async fn execute_remote_transfer<R: Runtime>(
     cancellation: &CancellationToken,
     progress: Arc<TransferProgressSnapshot>,
 ) -> Result<RemoteTransferOutcome, RemoteTransferFailure> {
-    if prepared.uses_server_side_copy() {
+    if prepared.uses_server_side_copy() || (operation == "rename" && prepared.uses_native_sftp_rename()) {
         return execute_server_side_remote_transfer(
             app,
             state,
@@ -1320,12 +1398,12 @@ async fn execute_remote_transfer<R: Runtime>(
     )
     .await
     .map_err(|_| remote_failure("Opening the remote copy source timed out"))
-    .and_then(|result| result.map_err(|error| remote_failure(error.to_string())))
+    .and_then(|result| result.map_err(|error| remote_failure(prepared.redact_operator_error(error))))
     .map_err(remote_transfer_before_copy)?;
     let mut reader = reader
         .into_futures_async_read(..)
         .await
-        .map_err(|error| remote_transfer_before_copy(remote_failure(error.to_string())))?;
+        .map_err(|error| remote_transfer_before_copy(remote_failure(prepared.redact_operator_error(error))))?;
     let mut writer = match open_remote_copy_writer(prepared, &partial_configured).await {
         Ok(writer) => writer,
         Err(failure) => {
@@ -1357,7 +1435,7 @@ async fn execute_remote_transfer<R: Runtime>(
                 result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, reader.read(&mut buffer)) => {
                     result
                         .map_err(|_| remote_failure("Remote copy read made no progress before the I/O watchdog expired"))?
-                        .map_err(|error| remote_failure(error.to_string()))?
+                        .map_err(|error| remote_failure(prepared.redact_remote_error(error.to_string())))?
                 }
             };
             if count == 0 {
@@ -1379,7 +1457,7 @@ async fn execute_remote_transfer<R: Runtime>(
                 ) => {
                     result
                         .map_err(|_| remote_failure("Remote copy write made no progress before the I/O watchdog expired"))?
-                        .map_err(|error| remote_failure(error.to_string()))?;
+                        .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
                 }
             }
             bytes_transferred =
@@ -1414,7 +1492,7 @@ async fn execute_remote_transfer<R: Runtime>(
         tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.close())
             .await
             .map_err(|_| remote_failure("Closing the remote copy destination timed out"))?
-            .map_err(|error| remote_failure(error.to_string()))?;
+            .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
         Ok(())
     }
     .await;
@@ -1752,7 +1830,7 @@ async fn reconcile_uncertain_server_side_copy(
     }
 }
 
-async fn reconcile_uncertain_webdav_move(
+async fn reconcile_uncertain_native_move(
     prepared: &PreparedFileMutation<'_>,
     source_before: &RemoteFileFingerprint,
     source_path: &str,
@@ -1764,7 +1842,8 @@ async fn reconcile_uncertain_webdav_move(
     let destination = prepared.fingerprint_remote_file(destination_path).await;
     match (source, destination) {
         (Err(source_error), Ok(destination))
-            if source_error.contains("no longer exists") && destination.size == source_before.size =>
+            if source_error.contains("no longer exists")
+                && prepared.native_rename_destination_matches(source_before, &destination) =>
         {
             RemoteTransferFailure {
                 failure: partial_failure(format!(
@@ -1802,7 +1881,7 @@ async fn reconcile_uncertain_webdav_move(
         },
         (source, destination) => RemoteTransferFailure {
             failure: partial_failure(format!(
-                "{detail}; WebDAV MOVE reconciliation was inconclusive (source={}, destination={})",
+                "{detail}; native rename reconciliation was inconclusive (source={}, destination={})",
                 source.as_ref().map(|_| "present").unwrap_or("unknown"),
                 destination.as_ref().map(|_| "present").unwrap_or("unknown")
             )),
@@ -1978,14 +2057,14 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
             _ = cancellation.cancelled() => {
                 return Err(remote_transfer_before_copy(TransferFailure {
                     status: "cancelled",
-                    message: "Remote MOVE was cancelled while waiting for the mutation lock".to_string(),
+                    message: "Native rename was cancelled while waiting for the mutation lock".to_string(),
                     invalidate_operator: false,
                 }))
             }
             _ = prepared.cancellation.cancelled() => {
                 return Err(remote_transfer_before_copy(TransferFailure {
                     status: "cancelled",
-                    message: "The file connection was removed while WebDAV MOVE was waiting for the mutation lock".to_string(),
+                    message: "The file connection was removed while native rename was waiting for the mutation lock".to_string(),
                     invalidate_operator: true,
                 }))
             }
@@ -1995,31 +2074,31 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
             _ = cancellation.cancelled() => {
                 return Err(remote_transfer_before_copy(TransferFailure {
                     status: "cancelled",
-                    message: "Remote MOVE was cancelled before dispatch".to_string(),
+                    message: "Native rename was cancelled before dispatch".to_string(),
                     invalidate_operator: false,
                 }))
             }
             _ = prepared.cancellation.cancelled() => {
                 return Err(remote_transfer_before_copy(TransferFailure {
                     status: "cancelled",
-                    message: "The file connection was removed before WebDAV MOVE dispatch".to_string(),
+                    message: "The file connection was removed before native rename dispatch".to_string(),
                     invalidate_operator: true,
                 }))
             }
-            result = prepared.preflight_native_webdav_mutation(source_path, destination_path, policy.replace()) => result,
+            result = prepared.preflight_native_rename(source_path, destination_path, policy.replace()) => result,
         };
         preflight.map_err(remote_failure).map_err(remote_transfer_before_copy)?;
         if cancellation.is_cancelled() {
             return Err(remote_transfer_before_copy(TransferFailure {
                 status: "cancelled",
-                message: "Remote MOVE was cancelled before dispatch".to_string(),
+                message: "Native rename was cancelled before dispatch".to_string(),
                 invalidate_operator: false,
             }));
         }
         if prepared.cancellation.is_cancelled() {
             return Err(remote_transfer_before_copy(TransferFailure {
                 status: "cancelled",
-                message: "The file connection was removed before WebDAV MOVE dispatch".to_string(),
+                message: "The file connection was removed before native rename dispatch".to_string(),
                 invalidate_operator: true,
             }));
         }
@@ -2029,39 +2108,39 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
             biased;
             result = tokio::time::timeout(
                 IO_PROGRESS_WATCHDOG,
-                prepared.dispatch_native_webdav_rename(source_path, destination_path, dispatch_for_request),
+                prepared.dispatch_native_rename(source_path, destination_path, dispatch_for_request),
             ) => result,
             _ = cancellation.cancelled() => {
                 if dispatch_started.load(Ordering::Acquire) {
-                    return Err(reconcile_uncertain_webdav_move(
+                    return Err(reconcile_uncertain_native_move(
                         prepared,
                         &source_before,
                         source_path,
                         destination_path,
-                        "WebDAV MOVE was cancelled after dispatch and its outcome is uncertain".to_string(),
+                        "Native rename was cancelled after dispatch and its outcome is uncertain".to_string(),
                         true,
                     ).await);
                 }
                 return Err(remote_transfer_before_copy(TransferFailure {
                     status: "cancelled",
-                    message: "Remote MOVE was cancelled before dispatch".to_string(),
+                    message: "Native rename was cancelled before dispatch".to_string(),
                     invalidate_operator: false,
                 }));
             }
             _ = prepared.cancellation.cancelled() => {
                 if dispatch_started.load(Ordering::Acquire) {
-                    return Err(reconcile_uncertain_webdav_move(
+                    return Err(reconcile_uncertain_native_move(
                         prepared,
                         &source_before,
                         source_path,
                         destination_path,
-                        "The file connection was removed after WebDAV MOVE dispatch".to_string(),
+                        "The file connection was removed after native rename dispatch".to_string(),
                         true,
                     ).await);
                 }
                 return Err(remote_transfer_before_copy(TransferFailure {
                     status: "cancelled",
-                    message: "The file connection was removed before WebDAV MOVE dispatch".to_string(),
+                    message: "The file connection was removed before native rename dispatch".to_string(),
                     invalidate_operator: true,
                 }));
             }
@@ -2078,9 +2157,9 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                         destination_fingerprint: None,
                     }
                 })?;
-                if destination.size != source_before.size {
+                if !prepared.native_rename_destination_matches(&source_before, &destination) {
                     return Err(RemoteTransferFailure {
-                        failure: partial_failure("WebDAV MOVE destination size did not match the source"),
+                        failure: partial_failure("Native rename destination size did not match the source"),
                         operation_outcome: "move_committed_verification_failed",
                         operation_phase: "copying",
                         partial_destination: Some(destination_path.to_string()),
@@ -2092,7 +2171,7 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                     Err(error) if error.contains("no longer exists") => {}
                     Ok(source) => {
                         return Err(RemoteTransferFailure {
-                            failure: partial_failure("WebDAV MOVE returned success but the source is still present"),
+                            failure: partial_failure("Native rename returned success but the source is still present"),
                             operation_outcome: "move_committed_verification_failed",
                             operation_phase: "copying",
                             partial_destination: Some(destination_path.to_string()),
@@ -2125,7 +2204,7 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                 if !error.is_outcome_unknown() {
                     return Err(remote_transfer_before_copy(remote_failure(error.message)));
                 }
-                return Err(reconcile_uncertain_webdav_move(
+                return Err(reconcile_uncertain_native_move(
                     prepared,
                     &source_before,
                     source_path,
@@ -2136,12 +2215,12 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                 .await);
             }
             Err(_) => {
-                return Err(reconcile_uncertain_webdav_move(
+                return Err(reconcile_uncertain_native_move(
                     prepared,
                     &source_before,
                     source_path,
                     destination_path,
-                    "WebDAV MOVE timed out".to_string(),
+                    "Native rename timed out".to_string(),
                     false,
                 )
                 .await);
@@ -2306,9 +2385,10 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
     } else {
         copier
     };
-    let mut copier = copier.concurrent(1).await.map_err(|error| {
-        remote_transfer_before_copy(remote_failure(prepared.redact_remote_error(error.to_string())))
-    })?;
+    let mut copier = copier
+        .concurrent(1)
+        .await
+        .map_err(|error| remote_transfer_before_copy(remote_failure(prepared.redact_operator_error(error))))?;
     let mut server_side_copied_bytes = 0_i64;
     let mut last_progress = Instant::now();
     loop {
@@ -2542,6 +2622,8 @@ async fn execute_upload<R: Runtime>(
         progress_snapshot,
         policy,
     } = context;
+    prepared.guard_destination_path(target_relative).await.map_err(remote_failure).map_err(UploadFailure::from)?;
+    prepared.guard_destination_path(partial_relative).await.map_err(remote_failure).map_err(UploadFailure::from)?;
     ensure_remote_target_absent(prepared, &prepared.remote_path).await.map_err(UploadFailure::from)?;
     if local.total_bytes == 0 {
         return execute_empty_upload(
@@ -2588,14 +2670,14 @@ async fn execute_upload<R: Runtime>(
             prepared
                 .operator
                 .writer_with(partial_configured)
-                .append(!prepared.uses_server_side_copy())
+                .append(prepared.requires_append_streaming_write())
                 .chunk(upload_buffer_size)
                 .concurrent(1),
         ) => {
             result
                 .map_err(|_| remote_failure("Opening the remote upload timed out"))
                 .and_then(|result| {
-                    result.map_err(|error| remote_failure(prepared.redact_remote_error(error.to_string())))
+                    result.map_err(|error| remote_failure(prepared.redact_operator_error(error)))
                 })
                 .map_err(UploadFailure::from)?
         }
@@ -2645,7 +2727,7 @@ async fn execute_upload<R: Runtime>(
                 result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, writer.write(chunk)) => {
                     result
                         .map_err(|_| remote_failure("Remote upload write made no progress before the I/O watchdog expired"))?
-                        .map_err(|error| remote_failure(prepared.redact_remote_error(error.to_string())))?;
+                        .map_err(|error| remote_failure(prepared.redact_operator_error(error)))?;
                 }
             }
             bytes_transferred =
@@ -2691,7 +2773,7 @@ async fn execute_upload<R: Runtime>(
                 writer,
                 prepared,
                 partial_relative,
-                remote_failure(prepared.redact_remote_error(error.to_string())),
+                remote_failure(prepared.redact_operator_error(error)),
             )
             .await);
         }
@@ -3078,7 +3160,7 @@ async fn ensure_remote_target_absent(prepared: &PreparedFileMutation<'_>, path: 
     match tokio::time::timeout(IO_PROGRESS_WATCHDOG, prepared.operator.stat(path)).await {
         Ok(Ok(_)) => Err(remote_failure("Remote upload destination already exists")),
         Ok(Err(error)) if error.kind() == opendal::ErrorKind::NotFound => Ok(()),
-        Ok(Err(error)) => Err(remote_failure(prepared.redact_remote_error(error.to_string()))),
+        Ok(Err(error)) => Err(remote_failure(prepared.redact_operator_error(error))),
         Err(_) => Err(remote_failure("Checking the remote upload destination timed out")),
     }
 }
@@ -3537,12 +3619,9 @@ async fn execute_download<R: Runtime>(
         .ok_or_else(|| local_failure("File transfer not found"))?;
     let local_path = PathBuf::from(&record.local_path);
 
-    let metadata = watched_remote(prepared.operator.stat(&prepared.remote_path), "Remote file metadata timed out")
-        .await
-        .map_err(|mut failure| {
-            failure.message = prepared.redact_remote_error(failure.message);
-            failure
-        })?;
+    let metadata =
+        watched_remote(prepared, prepared.operator.stat(&prepared.remote_path), "Remote file metadata timed out")
+            .await?;
     if !metadata.mode().is_file() {
         return Err(remote_failure("The remote path is not a file"));
     }
@@ -3640,18 +3719,9 @@ async fn execute_download<R: Runtime>(
 
     let mut output = tokio::fs::File::from_std(std_file);
     let reader_future = prepared.operator.reader_with(&prepared.remote_path).concurrent(1).chunk(DOWNLOAD_BUFFER_SIZE);
-    let reader = watched_remote(async { reader_future.await }, "Opening the remote file timed out").await.map_err(
-        |mut failure| {
-            failure.message = prepared.redact_remote_error(failure.message);
-            failure
-        },
-    )?;
-    let mut reader = watched_remote(reader.into_futures_async_read(..), "Preparing the remote stream timed out")
-        .await
-        .map_err(|mut failure| {
-            failure.message = prepared.redact_remote_error(failure.message);
-            failure
-        })?;
+    let reader = watched_remote(prepared, async { reader_future.await }, "Opening the remote file timed out").await?;
+    let mut reader =
+        watched_remote(prepared, reader.into_futures_async_read(..), "Preparing the remote stream timed out").await?;
     wait_at_test_remote_reader_barrier().await;
     let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_SIZE];
     let mut bytes_transferred = 0_i64;
@@ -3659,6 +3729,7 @@ async fn execute_download<R: Runtime>(
 
     loop {
         let count = transfer_one_chunk(
+            Some(prepared),
             &mut reader,
             &mut output,
             &mut buffer,
@@ -3861,6 +3932,16 @@ async fn wait_at_test_remote_rename_after_publish_barrier() {
 async fn wait_at_test_remote_rename_after_publish_barrier() {}
 
 #[cfg(test)]
+fn install_test_sftp_rename_before_dispatch_barrier() -> TestRemoteReaderBarrier {
+    install_test_async_barrier(&TEST_SFTP_RENAME_BEFORE_DISPATCH_BARRIER)
+}
+
+#[cfg(test)]
+pub(super) async fn wait_at_test_sftp_rename_before_dispatch_barrier() {
+    wait_at_test_async_barrier(&TEST_SFTP_RENAME_BEFORE_DISPATCH_BARRIER).await;
+}
+
+#[cfg(test)]
 fn install_test_async_barrier(
     slot: &std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>>,
 ) -> TestRemoteReaderBarrier {
@@ -3942,6 +4023,7 @@ fn release_test_blocking_barrier(barrier: &TestBlockingBarrier) {
 }
 
 async fn transfer_one_chunk<R, W>(
+    prepared: Option<&PreparedFileOperation>,
     reader: &mut R,
     output: &mut W,
     buffer: &mut [u8],
@@ -3956,7 +4038,10 @@ where
     let count = tokio::time::timeout(watchdog, FuturesAsyncReadExt::read(reader, buffer))
         .await
         .map_err(|_| remote_failure("Remote read made no progress before the I/O watchdog expired"))?
-        .map_err(|error| remote_failure(error.to_string()))?;
+        .map_err(|error| {
+            let message = error.to_string();
+            remote_failure(prepared.map_or(message.clone(), |prepared| prepared.redact_remote_error(message)))
+        })?;
     if count == 0 {
         return Ok(0);
     }
@@ -4339,13 +4424,14 @@ fn atomic_rename_noreplace(
 }
 
 async fn watched_remote<T>(
+    prepared: &PreparedFileOperation,
     future: impl std::future::Future<Output = Result<T, opendal::Error>>,
     timeout_message: &'static str,
 ) -> Result<T, TransferFailure> {
     tokio::time::timeout(IO_PROGRESS_WATCHDOG, future)
         .await
         .map_err(|_| remote_failure(timeout_message))?
-        .map_err(|error| remote_failure(error.to_string()))
+        .map_err(|error| remote_failure(prepared.redact_operator_error(error)))
 }
 
 async fn validate_local_destination(path: &Path) -> Result<ValidatedLocalDestination, String> {
@@ -6225,6 +6311,7 @@ mod tests {
         let mut bytes = 0;
 
         let disconnected = transfer_one_chunk(
+            None,
             &mut FailedReader,
             &mut sink,
             &mut buffer,
@@ -6238,6 +6325,7 @@ mod tests {
         assert!(disconnected.message.contains("injected disconnect"));
 
         let stalled = transfer_one_chunk(
+            None,
             &mut StalledReader,
             &mut sink,
             &mut buffer,
@@ -6252,6 +6340,7 @@ mod tests {
 
         let mut input = futures::io::Cursor::new(vec![7_u8; 1024]);
         let disk_full = transfer_one_chunk(
+            None,
             &mut input,
             &mut DiskFullWriter,
             &mut buffer,
@@ -6277,6 +6366,7 @@ mod tests {
         let progress = TransferProgressSnapshot::new();
         let mut bytes = 0;
         let failure = transfer_one_chunk(
+            None,
             &mut input,
             &mut disk_full,
             &mut buffer,
@@ -6296,7 +6386,15 @@ mod tests {
         let mut bytes = 0;
         let cancelled = tokio::time::timeout(
             Duration::from_millis(20),
-            transfer_one_chunk(&mut input, &mut stalled, &mut buffer, Duration::from_secs(30), &mut bytes, &progress),
+            transfer_one_chunk(
+                None,
+                &mut input,
+                &mut stalled,
+                &mut buffer,
+                Duration::from_secs(30),
+                &mut bytes,
+                &progress,
+            ),
         )
         .await;
         assert!(cancelled.is_err());
@@ -6349,14 +6447,29 @@ mod tests {
 
         let mut first = futures::io::Cursor::new(vec![1_u8; 1_024]);
         let mut bytes = 0;
-        transfer_one_chunk(&mut first, &mut writer, &mut buffer, Duration::from_millis(50), &mut bytes, &progress)
-            .await
-            .unwrap();
+        transfer_one_chunk(
+            None,
+            &mut first,
+            &mut writer,
+            &mut buffer,
+            Duration::from_millis(50),
+            &mut bytes,
+            &progress,
+        )
+        .await
+        .unwrap();
         let mut second = futures::io::Cursor::new(vec![2_u8; 1_024]);
-        let failure =
-            transfer_one_chunk(&mut second, &mut writer, &mut buffer, Duration::from_millis(50), &mut bytes, &progress)
-                .await
-                .unwrap_err();
+        let failure = transfer_one_chunk(
+            None,
+            &mut second,
+            &mut writer,
+            &mut buffer,
+            Duration::from_millis(50),
+            &mut bytes,
+            &progress,
+        )
+        .await
+        .unwrap_err();
         assert!(failure.message.contains("space") || failure.message.contains("No space left"));
 
         let state = Arc::new(AppState::new(storage));
@@ -6409,10 +6522,17 @@ mod tests {
         let progress = TransferProgressSnapshot::new();
         let mut bytes = 0_i64;
         loop {
-            let count =
-                transfer_one_chunk(&mut reader, &mut output, &mut buffer, IO_PROGRESS_WATCHDOG, &mut bytes, &progress)
-                    .await
-                    .unwrap();
+            let count = transfer_one_chunk(
+                None,
+                &mut reader,
+                &mut output,
+                &mut buffer,
+                IO_PROGRESS_WATCHDOG,
+                &mut bytes,
+                &progress,
+            )
+            .await
+            .unwrap();
             if count == 0 {
                 break;
             }
@@ -6762,6 +6882,599 @@ mod tests {
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .unwrap();
         (app, state, operator, directory)
+    }
+
+    async fn build_sftp_contract_app() -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, tempfile::TempDir) {
+        use super::super::file_manager::{
+            password_scope, FileConnectionConfig, SftpAuthentication, SftpConnectionConfig,
+        };
+
+        let endpoint = std::env::var("DBX_TEST_SFTP_ENDPOINT").expect("DBX_TEST_SFTP_ENDPOINT is required");
+        let username = std::env::var("DBX_TEST_SFTP_USERNAME").expect("DBX_TEST_SFTP_USERNAME is required");
+        let root = std::env::var("DBX_TEST_SFTP_ROOT").expect("DBX_TEST_SFTP_ROOT is required");
+        let private_key_file =
+            std::env::var("DBX_TEST_SFTP_PRIVATE_KEY_FILE").expect("DBX_TEST_SFTP_PRIVATE_KEY_FILE is required");
+        let private_key = std::fs::read_to_string(private_key_file).unwrap();
+        let passphrase = std::env::var("DBX_TEST_SFTP_PRIVATE_KEY_PASSPHRASE")
+            .expect("DBX_TEST_SFTP_PRIVATE_KEY_PASSPHRASE is required");
+        let config = FileConnectionConfig::Sftp(SftpConnectionConfig {
+            endpoint,
+            root,
+            username,
+            authentication: SftpAuthentication::PrivateKey,
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        storage
+            .save_file_connection_with_secret_bundle(
+                "sftp-contract".into(),
+                "SFTP contract".into(),
+                "sftp".into(),
+                serde_json::to_string(&config).unwrap(),
+                vec![
+                    ("sftp_private_key".to_string(), private_key),
+                    ("sftp_private_key_passphrase".to_string(), passphrase),
+                ],
+                vec!["sftp_private_key".to_string(), "sftp_private_key_passphrase".to_string()],
+                "sftp_scope".to_string(),
+                password_scope(&config).unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        (app, state, directory)
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/sftp-contract.sh with a digest-pinned OpenSSH server"]
+    async fn fixed_sftp_transfer_contract() {
+        let (app, state, directory) = build_sftp_contract_app().await;
+        app.state::<FileTransferRuntime>()
+            .ensure_recovered(&state, app.state::<FileManagerRuntime>().inner())
+            .await
+            .unwrap();
+        let connection = state.storage.load_file_connection("sftp-contract").await.unwrap().unwrap();
+        let file_manager = app.state::<FileManagerRuntime>();
+        let prepared = file_manager
+            .prepare_file_mutation_operation(&state, "sftp-contract", "fixture.txt", connection.revision)
+            .await
+            .unwrap();
+        assert_eq!(prepared.remote_path, "home/dbx/files/fixture.txt");
+        let operator = &prepared.operator;
+        let local_root = directory.path().canonicalize().unwrap();
+
+        let download_target = local_root.join("sftp-large-download.bin");
+        let (_, download_worker) = create_worker_transfer_for_connection(
+            &app,
+            "sftp-contract",
+            "sftp-large-download",
+            "large.bin",
+            &download_target,
+        )
+        .await;
+        download_worker.await.unwrap();
+        let download = state.storage.get_file_transfer("sftp-large-download").await.unwrap().unwrap();
+        assert_eq!(download.status, "completed", "{download:?}");
+        assert_eq!(tokio::fs::metadata(&download_target).await.unwrap().len(), 32 * 1024 * 1024);
+        assert_no_owned_temp(&local_root, "sftp-large-download");
+
+        let upload_source = local_root.join("sftp-upload-source.bin");
+        let upload_bytes = vec![0x5a_u8; 4 * 1024 * 1024 + 137];
+        tokio::fs::write(&upload_source, &upload_bytes).await.unwrap();
+        let (_, upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "sftp-contract",
+            "sftp-upload-success",
+            "worker-upload-success.bin",
+            &upload_source,
+        )
+        .await;
+        upload_worker.await.unwrap();
+        let upload = state.storage.get_file_transfer("sftp-upload-success").await.unwrap().unwrap();
+        assert_eq!(upload.status, "completed", "{upload:?}");
+        assert_eq!(upload.publish_outcome.as_deref(), Some("completed"), "{upload:?}");
+        let upload_path = prepared.configured_path("worker-upload-success.bin").unwrap();
+        assert_eq!(operator.read(&upload_path).await.unwrap().to_vec(), upload_bytes);
+        assert!(upload.partial_destination.is_none(), "{upload:?}");
+
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "sftp-contract",
+            "sftp-copy-success",
+            "copy",
+            "large.bin",
+            "worker-copy-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let copy = state.storage.get_file_transfer("sftp-copy-success").await.unwrap().unwrap();
+        assert_eq!(copy.status, "completed", "{copy:?}");
+        assert_eq!(copy.operation_outcome.as_deref(), Some("completed"), "{copy:?}");
+        let copy_path = prepared.configured_path("worker-copy-target.bin").unwrap();
+        assert_eq!(operator.stat(&copy_path).await.unwrap().content_length(), 32 * 1024 * 1024);
+        let container = std::env::var("DBX_TEST_SFTP_CONTAINER").expect("DBX_TEST_SFTP_CONTAINER is required");
+        let source_inode = Command::new("docker")
+            .args(["exec", &container, "stat", "-c", "%i", "/home/dbx/files/worker-copy-target.bin"])
+            .output()
+            .unwrap();
+        assert!(source_inode.status.success(), "{}", String::from_utf8_lossy(&source_inode.stderr));
+
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "sftp-contract",
+            "sftp-rename-success",
+            "rename",
+            "worker-copy-target.bin",
+            "worker-rename-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let renamed = state.storage.get_file_transfer("sftp-rename-success").await.unwrap().unwrap();
+        assert_eq!(renamed.status, "completed", "{renamed:?}");
+        assert_eq!(renamed.operation_outcome.as_deref(), Some("completed"), "{renamed:?}");
+        assert_eq!(operator.stat(&copy_path).await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        let renamed_path = prepared.configured_path("worker-rename-target.bin").unwrap();
+        assert_eq!(operator.stat(&renamed_path).await.unwrap().content_length(), 32 * 1024 * 1024);
+        let destination_inode = Command::new("docker")
+            .args(["exec", &container, "stat", "-c", "%i", "/home/dbx/files/worker-rename-target.bin"])
+            .output()
+            .unwrap();
+        assert!(destination_inode.status.success(), "{}", String::from_utf8_lossy(&destination_inode.stderr));
+        assert_eq!(source_inode.stdout, destination_inode.stdout, "SFTP rename must preserve the server inode");
+
+        let no_clobber_source = prepared.configured_path("worker-no-clobber-source.bin").unwrap();
+        let no_clobber_target = prepared.configured_path("worker-no-clobber-target.bin").unwrap();
+        operator.write(&no_clobber_source, "source").await.unwrap();
+        operator.write(&no_clobber_target, "keep").await.unwrap();
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "sftp-contract",
+            "sftp-copy-no-clobber",
+            "copy",
+            "worker-no-clobber-source.bin",
+            "worker-no-clobber-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let no_clobber = state.storage.get_file_transfer("sftp-copy-no-clobber").await.unwrap().unwrap();
+        assert_eq!(no_clobber.status, "failed", "{no_clobber:?}");
+        assert_eq!(no_clobber.operation_outcome.as_deref(), Some("failed_before_copy"), "{no_clobber:?}");
+        assert_eq!(no_clobber.partial_destination, None);
+        assert_eq!(operator.read(&no_clobber_target).await.unwrap().to_vec(), b"keep");
+
+        {
+            use super::super::file_manager::{
+                password_scope, FileConnectionConfig, SftpAuthentication, SftpConnectionConfig,
+            };
+
+            fn post_fault_control(control: &str, route: &str) {
+                let output = Command::new("curl")
+                    .args(["--silent", "--show-error", "--fail", "--request", "POST"])
+                    .arg(format!("{control}{route}"))
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "SFTP fault control request failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            async fn wait_for_fault_trigger(trace: &Path, label: &str, expect_bound_pair: bool) {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let trace = tokio::fs::read_to_string(trace).await.unwrap_or_default();
+                        let events = trace
+                            .lines()
+                            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                            .collect::<Vec<_>>();
+                        if let Some(trigger) = events.iter().find(|event| {
+                            event.get("event").and_then(serde_json::Value::as_str) == Some("trigger")
+                                && event.get("label").and_then(serde_json::Value::as_str) == Some(label)
+                        }) {
+                            if !expect_bound_pair {
+                                break;
+                            }
+                            if let Some(binding) = events.iter().find(|event| {
+                                event.get("event").and_then(serde_json::Value::as_str) == Some("bind")
+                                    && event.get("label").and_then(serde_json::Value::as_str) == Some(label)
+                            }) {
+                                let bound_pair = binding
+                                    .get("pairId")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .expect("next-pair fault binding must identify its SSH pair");
+                                let trigger_pair = trigger
+                                    .get("pairId")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .expect("next-pair fault trigger must identify its SSH pair");
+                                assert_eq!(trigger_pair, bound_pair, "{label} triggered on a pair it was not bound to");
+                                assert_eq!(
+                                    trigger.get("boundPairId").and_then(serde_json::Value::as_u64),
+                                    Some(bound_pair),
+                                    "{label} trigger did not retain its bound pair"
+                                );
+                                assert_eq!(
+                                    trigger.get("scope").and_then(serde_json::Value::as_str),
+                                    Some("next"),
+                                    "{label} trigger did not use next-pair scope"
+                                );
+                                break;
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .expect("the TCP fault proxy did not trigger the armed worker fault");
+            }
+
+            async fn await_fault_worker(
+                control: &str,
+                trace: &Path,
+                label: &str,
+                kind: &str,
+                expect_bound_pair: bool,
+                worker: tokio::task::JoinHandle<()>,
+            ) {
+                wait_for_fault_trigger(trace, label, expect_bound_pair).await;
+                let deadline = if kind == "timeout" {
+                    IO_PROGRESS_WATCHDOG + Duration::from_secs(15)
+                } else {
+                    Duration::from_secs(10)
+                };
+                tokio::time::timeout(deadline, worker)
+                    .await
+                    .unwrap_or_else(|_| panic!("{label} worker did not reach a terminal state"))
+                    .unwrap();
+                if kind == "timeout" {
+                    post_fault_control(control, "/drop");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+
+            fn assert_fault_error(record: &FileTransferStorageRecord, kind: &str) {
+                assert!(matches!(record.status.as_str(), "failed" | "partial"), "{record:?}");
+                let error = record.error.as_deref().expect("faulted transfer must persist a classified error");
+                assert!(!error.contains("dbx-sftp-keys-"), "temporary key path leaked: {error}");
+                if kind == "disconnect" {
+                    assert!(error.contains("SftpDisconnected:"), "disconnect was not classified: {error}");
+                } else {
+                    let lower = error.to_ascii_lowercase();
+                    assert!(
+                        error.contains("SftpTimeout:")
+                            || lower.contains("timed out")
+                            || lower.contains("watchdog expired"),
+                        "timeout was not classified: {error}"
+                    );
+                }
+            }
+
+            async fn assert_no_remote_owned_partial(
+                operator: &opendal::Operator,
+                configured_root: &str,
+                transfer_id: &str,
+            ) {
+                let residuals = operator
+                    .list_with(&format!("{}/", configured_root.trim_matches('/')))
+                    .recursive(true)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|entry| entry.path().to_string())
+                    .filter(|path| path.contains(transfer_id) && path.ends_with(".part"))
+                    .collect::<Vec<_>>();
+                assert!(residuals.is_empty(), "unexpected operation-owned partials: {residuals:?}");
+            }
+
+            let fault_endpoint =
+                std::env::var("DBX_TEST_SFTP_FAULT_ENDPOINT").expect("DBX_TEST_SFTP_FAULT_ENDPOINT is required");
+            let fault_control =
+                std::env::var("DBX_TEST_SFTP_FAULT_CONTROL").expect("DBX_TEST_SFTP_FAULT_CONTROL is required");
+            let fault_trace = PathBuf::from(
+                std::env::var("DBX_TEST_SFTP_PROXY_TRACE").expect("DBX_TEST_SFTP_PROXY_TRACE is required"),
+            );
+            let username = std::env::var("DBX_TEST_SFTP_USERNAME").expect("DBX_TEST_SFTP_USERNAME is required");
+            let root = std::env::var("DBX_TEST_SFTP_ROOT").expect("DBX_TEST_SFTP_ROOT is required");
+            let private_key_file =
+                std::env::var("DBX_TEST_SFTP_PRIVATE_KEY_FILE").expect("DBX_TEST_SFTP_PRIVATE_KEY_FILE is required");
+            let private_key = std::fs::read_to_string(private_key_file).unwrap();
+            let passphrase = std::env::var("DBX_TEST_SFTP_PRIVATE_KEY_PASSPHRASE")
+                .expect("DBX_TEST_SFTP_PRIVATE_KEY_PASSPHRASE is required");
+            let fault_config = FileConnectionConfig::Sftp(SftpConnectionConfig {
+                endpoint: fault_endpoint,
+                root: root.clone(),
+                username,
+                authentication: SftpAuthentication::PrivateKey,
+            });
+            state
+                .storage
+                .save_file_connection_with_secret_bundle(
+                    "sftp-fault".into(),
+                    "SFTP fault contract".into(),
+                    "sftp".into(),
+                    serde_json::to_string(&fault_config).unwrap(),
+                    vec![
+                        ("sftp_private_key".to_string(), private_key),
+                        ("sftp_private_key_passphrase".to_string(), passphrase),
+                    ],
+                    vec!["sftp_private_key".to_string(), "sftp_private_key_passphrase".to_string()],
+                    "sftp_scope".to_string(),
+                    password_scope(&fault_config).unwrap(),
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let fault_connection = state.storage.load_file_connection("sftp-fault").await.unwrap().unwrap();
+            let warm_fault_connection = || async {
+                let warm = file_manager
+                    .prepare_file_mutation_operation(&state, "sftp-fault", "large.bin", fault_connection.revision)
+                    .await
+                    .unwrap();
+                let configured = warm.configured_path("large.bin").unwrap();
+                assert_eq!(warm.operator.stat(&configured).await.unwrap().content_length(), 32 * 1024 * 1024);
+            };
+            let arm_fault = |operation: &str, kind: &str, direction: &str, bytes: usize, scope: Option<&str>| {
+                let action = if kind == "disconnect" { "reset" } else { "blackhole" };
+                let label = format!("{operation}-{kind}");
+                let scope = scope.map(|scope| format!("&scope={scope}")).unwrap_or_default();
+                post_fault_control(
+                    &fault_control,
+                    &format!("/arm?action={action}&direction={direction}&bytes={bytes}&label={label}{scope}"),
+                );
+                label
+            };
+
+            for kind in ["disconnect", "timeout"] {
+                warm_fault_connection().await;
+                let label = arm_fault("download", kind, "downstream", 128 * 1024, None);
+                let transfer_id = format!("sftp-download-{kind}");
+                let target = local_root.join(format!("{transfer_id}.bin"));
+                let (_, worker) =
+                    create_worker_transfer_for_connection(&app, "sftp-fault", &transfer_id, "large.bin", &target).await;
+                await_fault_worker(&fault_control, &fault_trace, &label, kind, false, worker).await;
+                let record = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
+                assert_fault_error(&record, kind);
+                assert!(!target.exists(), "faulted download published its final target");
+                assert_no_owned_temp(&local_root, &transfer_id);
+            }
+
+            let fault_upload_source = local_root.join("sftp-fault-upload-source.bin");
+            let fault_upload_payload = vec![0x6b_u8; 32 * 1024 * 1024 + 137];
+            tokio::fs::write(&fault_upload_source, &fault_upload_payload).await.unwrap();
+            for kind in ["disconnect", "timeout"] {
+                warm_fault_connection().await;
+                let label = arm_fault("upload", kind, "upstream", 128 * 1024, None);
+                let transfer_id = format!("sftp-upload-{kind}");
+                let destination = format!("worker-{transfer_id}.bin");
+                let (_, worker) = create_upload_worker_transfer_for_connection(
+                    &app,
+                    "sftp-fault",
+                    &transfer_id,
+                    &destination,
+                    &fault_upload_source,
+                )
+                .await;
+                await_fault_worker(&fault_control, &fault_trace, &label, kind, false, worker).await;
+                let record = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
+                assert_fault_error(&record, kind);
+                let configured_destination = prepared.configured_path(&destination).unwrap();
+                assert!(
+                    !operator.exists(&configured_destination).await.unwrap(),
+                    "faulted upload published its target"
+                );
+                if let Some(partial) = record.partial_destination.as_deref() {
+                    assert!(
+                        partial.contains(&format!(".dbx-upload-{transfer_id}-")) && partial.ends_with(".part"),
+                        "{record:?}"
+                    );
+                    let configured_partial = prepared.configured_path(partial).unwrap();
+                    if operator.exists(&configured_partial).await.unwrap() {
+                        operator.delete(&configured_partial).await.unwrap();
+                    }
+                } else {
+                    assert_no_remote_owned_partial(operator, &root, &transfer_id).await;
+                }
+            }
+
+            for kind in ["disconnect", "timeout"] {
+                warm_fault_connection().await;
+                let label = arm_fault("copy", kind, "either", 256 * 1024, None);
+                let transfer_id = format!("sftp-copy-{kind}");
+                let destination = format!("worker-{transfer_id}.bin");
+                let worker = create_remote_worker_transfer_for_connection(
+                    &app,
+                    "sftp-fault",
+                    &transfer_id,
+                    "copy",
+                    "large.bin",
+                    &destination,
+                )
+                .await;
+                await_fault_worker(&fault_control, &fault_trace, &label, kind, false, worker).await;
+                let record = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
+                assert_fault_error(&record, kind);
+                assert_eq!(
+                    operator.stat(&prepared.configured_path("large.bin").unwrap()).await.unwrap().content_length(),
+                    32 * 1024 * 1024
+                );
+                let configured_destination = prepared.configured_path(&destination).unwrap();
+                assert!(!operator.exists(&configured_destination).await.unwrap(), "faulted copy published its target");
+                if let Some(partial) = record.partial_destination.as_deref() {
+                    assert!(
+                        partial.contains(&format!(".dbx-copy-{transfer_id}-")) && partial.ends_with(".part"),
+                        "{record:?}"
+                    );
+                    let configured_partial = prepared.configured_path(partial).unwrap();
+                    if operator.exists(&configured_partial).await.unwrap() {
+                        operator.delete(&configured_partial).await.unwrap();
+                    }
+                } else {
+                    assert_no_remote_owned_partial(operator, &root, &transfer_id).await;
+                }
+            }
+
+            for kind in ["disconnect", "timeout"] {
+                let transfer_id = format!("sftp-rename-{kind}");
+                let source = format!("worker-{transfer_id}-source.bin");
+                let destination = format!("worker-{transfer_id}-target.bin");
+                let payload = format!("{transfer_id} payload");
+                operator.write(&prepared.configured_path(&source).unwrap(), payload.clone()).await.unwrap();
+                let dispatch_barrier = install_test_sftp_rename_before_dispatch_barrier();
+                let worker = create_remote_worker_transfer_for_connection(
+                    &app,
+                    "sftp-fault",
+                    &transfer_id,
+                    "rename",
+                    &source,
+                    &destination,
+                )
+                .await;
+                tokio::time::timeout(Duration::from_secs(10), dispatch_barrier.opened.notified())
+                    .await
+                    .expect("SFTP rename must finish preflight before the fault is armed");
+                post_fault_control(&fault_control, "/drop");
+                let label = arm_fault("rename", kind, "upstream", 1, Some("next"));
+                dispatch_barrier.release.notify_one();
+                await_fault_worker(&fault_control, &fault_trace, &label, kind, true, worker).await;
+                let record = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
+                assert_fault_error(&record, kind);
+                assert!(
+                    matches!(
+                        record.operation_outcome.as_deref(),
+                        Some("failed_before_copy")
+                            | Some("destination_state_unknown")
+                            | Some("move_committed_response_unknown")
+                    ),
+                    "{record:?}"
+                );
+                let source = prepared.configured_path(&source).unwrap();
+                let destination = prepared.configured_path(&destination).unwrap();
+                let source_exists = operator.exists(&source).await.unwrap();
+                let destination_exists = operator.exists(&destination).await.unwrap();
+                assert_ne!(source_exists, destination_exists, "rename must leave exactly one complete name");
+                let surviving_path = if source_exists { &source } else { &destination };
+                assert_eq!(operator.read(surviving_path).await.unwrap().to_vec(), payload.as_bytes());
+            }
+        }
+
+        let cancel_download_target = local_root.join("sftp-download-cancelled.bin");
+        let download_cancel_barrier = install_test_remote_reader_barrier();
+        let (_, download_cancel_worker) = create_worker_transfer_for_connection(
+            &app,
+            "sftp-contract",
+            "sftp-download-cancelled",
+            "large.bin",
+            &cancel_download_target,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), download_cancel_barrier.opened.notified())
+            .await
+            .expect("SFTP download must reach its active reader barrier");
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "sftp-download-cancelled",
+        )
+        .await
+        .unwrap();
+        download_cancel_barrier.release.notify_one();
+        download_cancel_worker.await.unwrap();
+        let cancelled_download = state.storage.get_file_transfer("sftp-download-cancelled").await.unwrap().unwrap();
+        assert_eq!(cancelled_download.status, "cancelled", "{cancelled_download:?}");
+        assert_eq!(cancelled_download.bytes_transferred, 0, "{cancelled_download:?}");
+        assert!(!cancel_download_target.exists());
+        assert_no_owned_temp(&local_root, "sftp-download-cancelled");
+        assert!(!cancelled_download.error.as_deref().is_some_and(|error| error.contains("dbx-sftp-keys-")));
+
+        let cancel_upload_source = local_root.join("sftp-upload-cancelled-source.bin");
+        tokio::fs::write(&cancel_upload_source, vec![0x37_u8; UPLOAD_BUFFER_SIZE * 2 + 19]).await.unwrap();
+        let upload_cancel_barrier = install_test_upload_after_chunk_barrier();
+        let (_, upload_cancel_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "sftp-contract",
+            "sftp-upload-cancelled",
+            "worker-upload-cancelled.bin",
+            &cancel_upload_source,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), upload_cancel_barrier.opened.notified())
+            .await
+            .expect("SFTP upload must reach its first-chunk barrier");
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "sftp-upload-cancelled",
+        )
+        .await
+        .unwrap();
+        upload_cancel_barrier.release.notify_one();
+        upload_cancel_worker.await.unwrap();
+        let cancelled_upload = state.storage.get_file_transfer("sftp-upload-cancelled").await.unwrap().unwrap();
+        assert_eq!(cancelled_upload.status, "cancelled", "{cancelled_upload:?}");
+        assert!(cancelled_upload.bytes_transferred > 0, "{cancelled_upload:?}");
+        assert_eq!(cancelled_upload.partial_destination, None, "{cancelled_upload:?}");
+        assert!(!operator.exists(&prepared.configured_path("worker-upload-cancelled.bin").unwrap()).await.unwrap());
+        assert!(!cancelled_upload.error.as_deref().is_some_and(|error| error.contains("dbx-sftp-keys-")));
+
+        let copy_cancel_barrier = install_test_remote_copy_after_close_barrier();
+        let copy_cancel_worker = create_remote_worker_transfer_for_connection(
+            &app,
+            "sftp-contract",
+            "sftp-copy-cancelled",
+            "copy",
+            "large.bin",
+            "worker-copy-cancelled.bin",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(15), copy_cancel_barrier.opened.notified())
+            .await
+            .expect("SFTP copy must reach its post-close barrier");
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            app.state::<FileManagerRuntime>().inner(),
+            "sftp-copy-cancelled",
+        )
+        .await
+        .unwrap();
+        copy_cancel_barrier.release.notify_one();
+        copy_cancel_worker.await.unwrap();
+        let cancelled_copy = state.storage.get_file_transfer("sftp-copy-cancelled").await.unwrap().unwrap();
+        assert_eq!(cancelled_copy.status, "cancelled", "{cancelled_copy:?}");
+        assert!(cancelled_copy.bytes_transferred > 0, "{cancelled_copy:?}");
+        assert_eq!(cancelled_copy.partial_destination, None, "{cancelled_copy:?}");
+        assert!(!operator.exists(&prepared.configured_path("worker-copy-cancelled.bin").unwrap()).await.unwrap());
+        assert!(!cancelled_copy.error.as_deref().is_some_and(|error| error.contains("dbx-sftp-keys-")));
+
+        let root = std::env::var("DBX_TEST_SFTP_ROOT").unwrap();
+        let residuals = operator
+            .list_with(&format!("{}/", root.trim_matches('/')))
+            .recursive(true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.path().to_string())
+            .filter(|path| path.contains(".dbx-upload-") || path.contains(".dbx-copy-"))
+            .collect::<Vec<_>>();
+        assert!(residuals.is_empty(), "residual SFTP operation-owned partials: {residuals:?}");
     }
 
     async fn assert_no_s3_owned_partial(operator: &opendal::Operator, transfer_id: &str) {
