@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<configuration>
+  <property>
+    <name>dfs.client.use.datanode.hostname</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>dfs.client.block.write.replace-datanode-on-failure.enable</name>
+    <value>true</value>
+  </property>
+  <property>
+    <name>dfs.client.block.write.replace-datanode-on-failure.policy</name>
+    <value>NEVER</value>
+  </property>
+  <property>
+    <name>dfs.client.block.write.replace-datanode-on-failure.best-effort</name>
+    <value>false</value>
+  </property>
+</configuration>

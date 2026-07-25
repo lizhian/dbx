@@ -62,7 +62,8 @@ bytes = "1"
 tempfile = "3"
 cap-std = "4.0.2"
 cap-fs-ext = "4.0.2"
-opendal = { version = "=0.57.0", default-features = false, features = ["executors-tokio", "reqwest-rustls-tls", "services-ftp", "services-s3", "services-webdav", "services-webhdfs"] }
+opendal = { version = "=0.57.0", default-features = false, features = ["executors-tokio", "reqwest-rustls-tls", "services-ftp", "services-hdfs-native", "services-s3", "services-webdav", "services-webhdfs"] }
+hdfs-native = "=0.13.5"
 mongodb = "3.2.5"
 percent-encoding = "2"
 minisign-verify = "0.2.5"

@@ -249,6 +249,58 @@ afterEach(() => {
 });
 
 describe("FileManagerPage transfer lifecycle", () => {
+  it("serializes HDFS Native configuration without storing environment values", async () => {
+    mocks.saveFileConnection.mockResolvedValue({
+      ...connection,
+      id: "hdfs-1",
+      config: {
+        type: "hdfs",
+        implementation: "native",
+        nameNodeUri: "hdfs://namenode:9000",
+        root: "/dbx",
+        options: { "dfs.client.use.datanode.hostname": "true" },
+        hadoopConfigDirectory: "/etc/hadoop/conf",
+        authenticationEnvironment: { userName: "HADOOP_USER_NAME" },
+      },
+    });
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.add"]')?.click();
+    await nextTick();
+    setSelect("#file-connection-type", "hdfs");
+    await nextTick();
+    expect(root?.textContent).toContain("fileManager.hdfsSecurity");
+    expect(root?.querySelector("#file-connection-hdfs-implementation")).toBeTruthy();
+
+    setInput("#file-connection-name", "Native HDFS");
+    setInput("#file-connection-endpoint", "hdfs://namenode:9000");
+    setInput("#file-connection-hdfs-root", "/dbx");
+    setInput("#file-connection-hdfs-config", "/etc/hadoop/conf");
+    setInput("#file-connection-hdfs-options", "dfs.client.use.datanode.hostname=true");
+    root?.querySelector<HTMLInputElement>("#file-connection-hdfs-user-environment")?.click();
+    await nextTick();
+
+    const save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    save?.click();
+
+    await vi.waitFor(() =>
+      expect(mocks.saveFileConnection).toHaveBeenCalledWith({
+        id: null,
+        expectedRevision: undefined,
+        name: "Native HDFS",
+        config: {
+          type: "hdfs",
+          implementation: "native",
+          nameNodeUri: "hdfs://namenode:9000",
+          root: "/dbx",
+          options: { "dfs.client.use.datanode.hostname": "true" },
+          hadoopConfigDirectory: "/etc/hadoop/conf",
+          authenticationEnvironment: { userName: "HADOOP_USER_NAME" },
+        },
+      }),
+    );
+  });
+
   it("submits inline SFTP private-key authentication without password-only support", async () => {
     mocks.saveFileConnection.mockResolvedValue({
       ...connection,
@@ -321,6 +373,51 @@ describe("FileManagerPage transfer lifecycle", () => {
     expect(save?.disabled).toBe(true);
     save?.click();
     expect(mocks.saveFileConnection).not.toHaveBeenCalled();
+  });
+
+  it("round-trips an existing HDFS Native nested configuration through edit", async () => {
+    const hdfsConnection: FileConnection = {
+      ...connection,
+      id: "hdfs-existing",
+      name: "Existing HDFS",
+      revision: 8,
+      config: {
+        type: "hdfs",
+        implementation: "native",
+        nameNodeUri: "hdfs://namenode:9000",
+        root: "/tenant/dbx",
+        options: {
+          "dfs.client.use.datanode.hostname": "true",
+          "dfs.user.home.dir.prefix": "/users",
+        },
+        hadoopConfigDirectory: "/etc/hadoop/conf",
+        authenticationEnvironment: { userName: "HADOOP_USER_NAME" },
+      },
+      hasPassword: false,
+      hasCredentials: false,
+    };
+    mocks.listFileConnections.mockResolvedValue([hdfsConnection]);
+    mocks.saveFileConnection.mockResolvedValue(hdfsConnection);
+    await mountPage();
+
+    root?.querySelector<HTMLButtonElement>('button[aria-label="fileManager.edit"]')?.click();
+    await nextTick();
+    expect(root?.querySelector<HTMLInputElement>("#file-connection-endpoint")?.value).toBe("hdfs://namenode:9000");
+    expect(root?.querySelector<HTMLInputElement>("#file-connection-hdfs-root")?.value).toBe("/tenant/dbx");
+    expect(root?.querySelector<HTMLInputElement>("#file-connection-hdfs-config")?.value).toBe("/etc/hadoop/conf");
+    expect(root?.querySelector<HTMLTextAreaElement>("#file-connection-hdfs-options")?.value).toContain("dfs.client.use.datanode.hostname=true");
+    expect(root?.querySelector<HTMLInputElement>("#file-connection-hdfs-user-environment")?.checked).toBe(true);
+
+    const save = Array.from(root?.querySelectorAll<HTMLButtonElement>("button") ?? []).findLast((button) => button.textContent?.trim() === "common.save");
+    save?.click();
+    await vi.waitFor(() =>
+      expect(mocks.saveFileConnection).toHaveBeenCalledWith({
+        id: "hdfs-existing",
+        expectedRevision: 8,
+        name: "Existing HDFS",
+        config: hdfsConnection.config,
+      }),
+    );
   });
 
   it("keeps the connection editor footer outside the scroll region at small viewport heights", async () => {

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<configuration>
+  <property>
+    <name>fs.defaultFS</name>
+    <value>hdfs://unreachable.invalid:1</value>
+  </property>
+  <property>
+    <name>dfs.ha.namenodes.contract</name>
+    <value>nn0,nn1</value>
+  </property>
+  <property>
+    <name>dfs.namenode.rpc-address.contract.nn0</name>
+    <value>unreachable.invalid:2</value>
+  </property>
+  <property>
+    <name>dfs.namenode.rpc-address.contract.nn1</name>
+    <value>unreachable.invalid:3</value>
+  </property>
+</configuration>

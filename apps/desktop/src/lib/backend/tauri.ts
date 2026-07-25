@@ -210,7 +210,19 @@ export interface WebdavFileConnectionConfig {
   username: string;
 }
 
-export type FileConnectionConfig = FtpFileConnectionConfig | SftpFileConnectionConfig | S3FileConnectionConfig | WebdavFileConnectionConfig;
+export interface HdfsNativeFileConnectionConfig {
+  type: "hdfs";
+  implementation: "native";
+  nameNodeUri: string;
+  root: string;
+  options: Record<string, string>;
+  hadoopConfigDirectory?: string | null;
+  authenticationEnvironment?: {
+    userName: "HADOOP_USER_NAME";
+  } | null;
+}
+
+export type FileConnectionConfig = FtpFileConnectionConfig | SftpFileConnectionConfig | S3FileConnectionConfig | WebdavFileConnectionConfig | HdfsNativeFileConnectionConfig;
 
 export interface FileConnectionInput {
   id?: string | null;

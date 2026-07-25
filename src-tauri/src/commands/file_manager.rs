@@ -7,6 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use super::file_manager_hdfs_native::{
+    build_direct_adapter as build_hdfs_native_direct_adapter, build_operator as build_hdfs_native_operator,
+    capabilities as hdfs_native_capabilities, classify_opendal_error as classify_hdfs_native_opendal_error,
+    delete_entry as delete_hdfs_native_entry, normalize_config as normalize_hdfs_native_config,
+    test_connection as test_hdfs_native_connection, validate_config as validate_hdfs_native_config,
+    HdfsNativeConnectionConfig, HdfsNativeMutationError,
+};
 use super::file_manager_paths::{reject_ftp_command_injection, reject_recursive_delete, RemotePath};
 pub use super::file_manager_s3::S3ConnectionConfig;
 use super::file_manager_s3::{
@@ -158,6 +165,7 @@ pub(super) struct PreparedFileOperation {
     pub cancellation: Arc<CancellationSignal>,
     secrets: ResolvedFileSecrets,
     is_sftp: bool,
+    is_hdfs_native: bool,
     _sftp_key_material: Option<Arc<SftpKeyMaterial>>,
     _lease: OperationLease,
 }
@@ -197,6 +205,13 @@ pub(super) struct UploadPublishResolution {
 pub(super) struct NativeRenameError {
     pub message: String,
     outcome_unknown: bool,
+}
+
+enum HdfsNativePublishDispatchOutcome {
+    Finished(Result<(), HdfsNativeMutationError>),
+    TransferCancelled,
+    ConnectionCancelled,
+    TimedOut,
 }
 
 impl NativeRenameError {
@@ -254,7 +269,7 @@ impl UploadPolicy {
         }
         if self.atomic_no_clobber || !self.external_toctou_risk {
             return Err(
-                "FTP uploads require best_effort_no_clobber with atomicNoClobber=false and externalToctouRisk=true"
+                "Uploads require best_effort_no_clobber with atomicNoClobber=false and externalToctouRisk=true"
                     .to_string(),
             );
         }
@@ -269,6 +284,13 @@ pub enum FileConnectionConfig {
     Sftp(SftpConnectionConfig),
     S3(S3ConnectionConfig),
     Webdav(WebdavConnectionConfig),
+    Hdfs(HdfsConnectionConfig),
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "implementation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HdfsConnectionConfig {
+    Native(HdfsNativeConnectionConfig),
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -598,6 +620,35 @@ pub async fn save_file_connection(
                     )
                     .await?
             }
+            FileConnectionConfig::Hdfs(_) => {
+                state
+                    .storage
+                    .save_file_connection_with_secret_bundle(
+                        id.clone(),
+                        input.name.trim().to_string(),
+                        config_kind(&input.config).to_string(),
+                        config_json,
+                        Vec::new(),
+                        vec![
+                            "password".to_string(),
+                            "password_scope".to_string(),
+                            "access_key_id".to_string(),
+                            "secret_access_key".to_string(),
+                            "session_token".to_string(),
+                            "s3_scope".to_string(),
+                            "webdav_token".to_string(),
+                            "webdav_scope".to_string(),
+                            "sftp_private_key".to_string(),
+                            "sftp_private_key_passphrase".to_string(),
+                            "sftp_scope".to_string(),
+                        ],
+                        "password_scope".to_string(),
+                        password_scope(&input.config)?,
+                        true,
+                        input.expected_revision,
+                    )
+                    .await?
+            }
         };
         runtime.evict(&id);
         Ok(record)
@@ -704,11 +755,19 @@ pub async fn list_file_entries(
         }
         let list_path = configured_directory_path(&config, &path);
         let is_sftp = matches!(config, FileConnectionConfig::Sftp(_));
+        let is_hdfs_native = matches!(config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)));
         let lister = operator.lister_with(&list_path).limit(options.page_size).await.map_err(|error| {
-            let error = if is_sftp { classify_sftp_error(error) } else { error.to_string() };
+            let error = if is_sftp {
+                classify_sftp_error(error)
+            } else if is_hdfs_native {
+                classify_hdfs_native_opendal_error(&error)
+            } else {
+                error.to_string()
+            };
             redact_secrets(error, &secrets)
         })?;
         let error_secrets = secrets.clone();
+        let hdfs_native_errors = is_hdfs_native;
         let configured_root = configured_root_list_path(&config);
         let object_store = matches!(config, FileConnectionConfig::S3(_));
         let seen_entries = Arc::new(Mutex::new(HashSet::<(String, String)>::new()));
@@ -731,7 +790,13 @@ pub async fn list_file_entries(
             }
             let result = result
                 .map_err(|error| {
-                    let error = if is_sftp { classify_sftp_error(error) } else { error.to_string() };
+                    let error = if is_sftp {
+                        classify_sftp_error(error)
+                    } else if hdfs_native_errors {
+                        classify_hdfs_native_opendal_error(&error)
+                    } else {
+                        error.to_string()
+                    };
                     redact_secrets(error, &error_secrets)
                 })
                 .and_then(|entry| file_entry_from_opendal(&configured_root, entry, object_store));
@@ -962,6 +1027,7 @@ impl FileManagerRuntime {
             remote_path,
             cancellation: lease.cancellation(),
             is_sftp: matches!(config, FileConnectionConfig::Sftp(_)),
+            is_hdfs_native: matches!(config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))),
             secrets,
             _sftp_key_material: built.sftp_key_material,
             _lease: lease,
@@ -1093,6 +1159,14 @@ impl FileManagerRuntime {
                 let target_size = file_size_if_exists(&built.operator, &target, &secrets).await?;
                 Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
             }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
+                let built = build_operator_with_secrets(&config, &secrets)?;
+                let source = configured_entry_path(&config, partial.as_str(), false);
+                let target = configured_entry_path(&config, target.as_str(), false);
+                let source_size = hdfs_native_file_size_if_exists(&built.operator, &source).await?;
+                let target_size = hdfs_native_file_size_if_exists(&built.operator, &target).await?;
+                Ok(resolve_upload_publish_observation(source_size, target_size, expected_size, detail))
+            }
         }
     }
 
@@ -1135,7 +1209,7 @@ impl FileManagerRuntime {
     }
 
     #[cfg(test)]
-    fn operator_count(&self) -> usize {
+    pub(super) fn operator_count(&self) -> usize {
         self.operators.read().unwrap_or_else(|error| error.into_inner()).len()
     }
 }
@@ -1180,6 +1254,8 @@ impl PreparedFileOperation {
     pub(super) fn redact_operator_error(&self, error: opendal::Error) -> String {
         if self.is_sftp {
             redact_secrets(classify_sftp_error(error), &self.secrets)
+        } else if self.is_hdfs_native {
+            classify_hdfs_native_opendal_error(&error)
         } else {
             self.redact_remote_error(error.to_string())
         }
@@ -1215,6 +1291,8 @@ impl PreparedFileMutation<'_> {
     pub(super) fn redact_operator_error(&self, error: opendal::Error) -> String {
         if matches!(self.config, FileConnectionConfig::Sftp(_)) {
             redact_secrets(classify_sftp_error(error), &self.secrets)
+        } else if matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))) {
+            classify_hdfs_native_opendal_error(&error)
         } else {
             self.redact_remote_error(error.to_string())
         }
@@ -1246,6 +1324,10 @@ impl PreparedFileMutation<'_> {
                     Err(error) => Err(self.redact_operator_error(error)),
                 }
             }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => {
+                let adapter = build_hdfs_native_direct_adapter(config)?;
+                adapter.delete_owned_file_if_exists(path.as_str()).await
+            }
             FileConnectionConfig::Sftp(_) | FileConnectionConfig::Webdav(_) => {
                 let configured = self.configured_path(path.as_str())?;
                 match self.operator.stat(&configured).await {
@@ -1268,7 +1350,9 @@ impl PreparedFileMutation<'_> {
             FileConnectionConfig::Ftp(_) => {
                 create_empty_ftp_file_exact(&self.config, &path, self.password.as_deref()).await
             }
-            FileConnectionConfig::Sftp(_) | FileConnectionConfig::S3(_) => {
+            FileConnectionConfig::Sftp(_)
+            | FileConnectionConfig::S3(_)
+            | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
                 let configured = self.configured_path(path.as_str())?;
                 if self.operator.exists(&configured).await.map_err(|error| self.redact_operator_error(error))? {
                     return Err("Operation-owned empty upload partial already exists".to_string());
@@ -1344,6 +1428,18 @@ impl PreparedFileMutation<'_> {
         if matches!(self.config, FileConnectionConfig::S3(_)) {
             return self
                 .publish_s3_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    false,
+                    "Upload publish",
+                    transfer_cancellation,
+                )
+                .await;
+        }
+        if matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))) {
+            return self
+                .publish_hdfs_native_owned_partial(
                     &partial,
                     &target,
                     expected_size,
@@ -1452,7 +1548,10 @@ impl PreparedFileMutation<'_> {
                 let _ = ftp.quit().await;
                 fingerprint.ok_or_else(|| "Remote file no longer exists".to_string())
             }
-            FileConnectionConfig::Sftp(_) | FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => {
+            FileConnectionConfig::Sftp(_)
+            | FileConnectionConfig::S3(_)
+            | FileConnectionConfig::Webdav(_)
+            | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
                 let configured = self.configured_path(path.as_str())?;
                 match self.operator.stat(&configured).await {
                     Ok(metadata) if metadata.mode().is_file() => Ok(remote_fingerprint_from_metadata(&metadata)),
@@ -1486,11 +1585,45 @@ impl PreparedFileMutation<'_> {
     }
 
     pub(super) fn uses_native_rename(&self) -> bool {
-        matches!(self.config, FileConnectionConfig::Sftp(_) | FileConnectionConfig::Webdav(_))
+        matches!(
+            self.config,
+            FileConnectionConfig::Sftp(_)
+                | FileConnectionConfig::Webdav(_)
+                | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))
+        )
     }
 
     pub(super) fn uses_native_sftp_rename(&self) -> bool {
         matches!(self.config, FileConnectionConfig::Sftp(_))
+    }
+
+    pub(super) fn uses_direct_hdfs_native_rename(&self) -> bool {
+        matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)))
+    }
+
+    pub(super) fn evict_uncertain_hdfs_native_rename(&self) {
+        if self.uses_direct_hdfs_native_rename() {
+            self.runtime.evict_revision(&self.connection_id, self.revision);
+        }
+    }
+
+    pub(super) async fn observe_uncertain_hdfs_native_rename_fresh(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+        timeout: Duration,
+    ) -> Result<(Result<RemoteFileFingerprint, String>, Result<RemoteFileFingerprint, String>), String> {
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) = &self.config else {
+            return Err("Fresh HDFS Native reconciliation received an incompatible connection".to_string());
+        };
+        let source = self.configured_path(source_path)?;
+        let destination = self.configured_path(destination_path)?;
+        let (operator, _) = build_hdfs_native_operator(config)?;
+        let (source, destination) = tokio::join!(
+            fresh_hdfs_native_fingerprint(&operator, &source, timeout),
+            fresh_hdfs_native_fingerprint(&operator, &destination, timeout),
+        );
+        Ok((source, destination))
     }
 
     pub(super) fn native_rename_destination_matches(
@@ -1498,7 +1631,7 @@ impl PreparedFileMutation<'_> {
         source: &RemoteFileFingerprint,
         destination: &RemoteFileFingerprint,
     ) -> bool {
-        if self.uses_native_sftp_rename() {
+        if self.uses_native_sftp_rename() || self.uses_direct_hdfs_native_rename() {
             source == destination
         } else {
             source.size == destination.size
@@ -1519,8 +1652,8 @@ impl PreparedFileMutation<'_> {
         destination_path: &str,
         replace: bool,
     ) -> Result<RemoteFileFingerprint, String> {
-        if !self.uses_native_sftp_rename() {
-            return Err("Native SFTP rename received a non-SFTP connection".to_string());
+        if !self.uses_native_sftp_rename() && !self.uses_direct_hdfs_native_rename() {
+            return Err("Native filesystem rename received an incompatible connection".to_string());
         }
         self.guard_existing_path(source_path).await?;
         self.guard_destination_path(destination_path).await?;
@@ -1550,7 +1683,7 @@ impl PreparedFileMutation<'_> {
         destination_path: &str,
         replace: bool,
     ) -> Result<(), String> {
-        if self.uses_native_sftp_rename() {
+        if self.uses_native_sftp_rename() || self.uses_direct_hdfs_native_rename() {
             self.preflight_native_sftp_rename(source_path, destination_path, replace).await.map(|_| ())
         } else {
             self.preflight_native_webdav_mutation(source_path, destination_path, replace).await
@@ -1561,6 +1694,7 @@ impl PreparedFileMutation<'_> {
         &self,
         source_path: &str,
         destination_path: &str,
+        replace: bool,
         dispatch_started: Arc<AtomicBool>,
     ) -> Result<(), NativeRenameError> {
         if self.uses_native_sftp_rename() {
@@ -1583,6 +1717,17 @@ impl PreparedFileMutation<'_> {
                 let outcome_unknown = sftp_mutation_outcome_unknown(error.kind());
                 NativeRenameError { message: self.redact_operator_error(error), outcome_unknown }
             })
+        } else if self.uses_direct_hdfs_native_rename() {
+            let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) = &self.config else { unreachable!() };
+            let adapter = build_hdfs_native_direct_adapter(config)
+                .map_err(|message| NativeRenameError { message, outcome_unknown: false })?;
+            #[cfg(test)]
+            super::file_transfer::wait_at_test_hdfs_native_rename_before_dispatch_barrier().await;
+            dispatch_started.store(true, Ordering::Release);
+            adapter
+                .rename(source_path, destination_path, replace)
+                .await
+                .map_err(|error| NativeRenameError { message: error.message, outcome_unknown: error.outcome_unknown })
         } else {
             self.dispatch_native_webdav_rename(source_path, destination_path, dispatch_started).await.map_err(|error| {
                 NativeRenameError { outcome_unknown: error.is_outcome_unknown(), message: error.message }
@@ -1681,6 +1826,18 @@ impl PreparedFileMutation<'_> {
         if matches!(self.config, FileConnectionConfig::S3(_)) {
             return self
                 .publish_s3_owned_partial(
+                    &partial,
+                    &target,
+                    expected_size,
+                    replace,
+                    "Remote copy publish",
+                    transfer_cancellation,
+                )
+                .await;
+        }
+        if matches!(self.config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))) {
+            return self
+                .publish_hdfs_native_owned_partial(
                     &partial,
                     &target,
                     expected_size,
@@ -1835,6 +1992,9 @@ impl PreparedFileMutation<'_> {
                 self.operator.delete(&source_path).await.map_err(|error| {
                     format!("Copied source could not be deleted: {}", self.redact_operator_error(error))
                 })
+            }
+            FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => {
+                Err("HDFS Native rename must use the direct rename2 adapter".to_string())
             }
         }
     }
@@ -2071,6 +2231,163 @@ impl PreparedFileMutation<'_> {
             resolution
                 .detail
                 .push_str("; the dispatched SFTP rename may still commit, so the operation-owned source was preserved");
+        }
+        Ok(resolution)
+    }
+
+    async fn publish_hdfs_native_owned_partial(
+        &self,
+        partial: &RemotePath,
+        target: &RemotePath,
+        expected_size: usize,
+        replace: bool,
+        operation: &str,
+        transfer_cancellation: &CancellationToken,
+    ) -> Result<UploadPublishResolution, String> {
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) = &self.config else {
+            return Err("HdfsNativeConfiguration: publish received an incompatible connection".to_string());
+        };
+        let partial_path = self.configured_path(partial.as_str())?;
+        let target_path = self.configured_path(target.as_str())?;
+        let partial_metadata =
+            self.operator.stat(&partial_path).await.map_err(|error| self.redact_operator_error(error))?;
+        if !partial_metadata.mode().is_file() || partial_metadata.content_length() != expected_size as u64 {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} source partial does not match the expected file size"),
+            });
+        }
+        if transfer_cancellation.is_cancelled() || self.cancellation.is_cancelled() {
+            return Ok(UploadPublishResolution {
+                state: UploadPublishState::PartialSource,
+                detail: format!("{operation} was cancelled before HDFS rename2 dispatch"),
+            });
+        }
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let dispatched_for_request = dispatched.clone();
+        let result = {
+            let adapter = build_hdfs_native_direct_adapter(config)?;
+            let rename = async {
+                dispatched_for_request.store(true, Ordering::Release);
+                adapter.rename(partial.as_str(), target.as_str(), replace).await
+            };
+            tokio::select! {
+                biased;
+                result = tokio::time::timeout(MUTATION_TIMEOUT, rename) => {
+                    match result {
+                        Ok(result) => HdfsNativePublishDispatchOutcome::Finished(result),
+                        Err(_) => HdfsNativePublishDispatchOutcome::TimedOut,
+                    }
+                },
+                _ = transfer_cancellation.cancelled() => HdfsNativePublishDispatchOutcome::TransferCancelled,
+                _ = self.cancellation.cancelled() => HdfsNativePublishDispatchOutcome::ConnectionCancelled,
+            }
+        };
+        match result {
+            HdfsNativePublishDispatchOutcome::TransferCancelled => {
+                if dispatched.load(Ordering::Acquire) {
+                    return self
+                        .reconcile_hdfs_native_publish(
+                            &partial_path,
+                            &target_path,
+                            expected_size,
+                            format!("{operation} was cancelled after HDFS rename2 dispatch"),
+                            true,
+                        )
+                        .await;
+                }
+                Ok(UploadPublishResolution {
+                    state: UploadPublishState::PartialSource,
+                    detail: format!("{operation} was cancelled before HDFS rename2 dispatch"),
+                })
+            }
+            HdfsNativePublishDispatchOutcome::ConnectionCancelled => {
+                if dispatched.load(Ordering::Acquire) {
+                    return self
+                        .reconcile_hdfs_native_publish(
+                            &partial_path,
+                            &target_path,
+                            expected_size,
+                            format!("{operation} connection was removed after HDFS rename2 dispatch"),
+                            true,
+                        )
+                        .await;
+                }
+                Ok(UploadPublishResolution {
+                    state: UploadPublishState::PartialSource,
+                    detail: format!("{operation} connection was removed before HDFS rename2 dispatch"),
+                })
+            }
+            HdfsNativePublishDispatchOutcome::Finished(Ok(())) => {
+                let target_metadata =
+                    self.operator.stat(&target_path).await.map_err(|error| self.redact_operator_error(error))?;
+                if target_metadata.mode().is_file() && target_metadata.content_length() == expected_size as u64 {
+                    Ok(UploadPublishResolution {
+                        state: UploadPublishState::Completed,
+                        detail: format!("{operation} completed with native HDFS rename2 (overwrite={replace})"),
+                    })
+                } else {
+                    Ok(UploadPublishResolution {
+                        state: UploadPublishState::PartialTarget,
+                        detail: format!("{operation} returned success but destination verification failed"),
+                    })
+                }
+            }
+            HdfsNativePublishDispatchOutcome::Finished(Err(error)) if !error.outcome_unknown => Err(error.message),
+            HdfsNativePublishDispatchOutcome::Finished(Err(error)) => {
+                self.reconcile_hdfs_native_publish(
+                    &partial_path,
+                    &target_path,
+                    expected_size,
+                    format!("{operation} failed after HDFS rename2 dispatch: {}", error.message),
+                    true,
+                )
+                .await
+            }
+            HdfsNativePublishDispatchOutcome::TimedOut => {
+                self.reconcile_hdfs_native_publish(
+                    &partial_path,
+                    &target_path,
+                    expected_size,
+                    format!("{operation} timed out after HDFS rename2 dispatch"),
+                    true,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn reconcile_hdfs_native_publish(
+        &self,
+        partial_path: &str,
+        target_path: &str,
+        expected_size: usize,
+        detail: String,
+        outcome_unknown: bool,
+    ) -> Result<UploadPublishResolution, String> {
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) = &self.config else {
+            return Err("HdfsNativeConfiguration: reconciliation received an incompatible connection".to_string());
+        };
+        let (operator, _) = build_hdfs_native_operator(config)?;
+        let source = async {
+            tokio::time::timeout(MUTATION_TIMEOUT, hdfs_native_file_size_if_exists(&operator, partial_path))
+                .await
+                .map_err(|_| "HdfsNativeTimeout: fresh publish source reconciliation timed out".to_string())?
+        };
+        let target = async {
+            tokio::time::timeout(MUTATION_TIMEOUT, hdfs_native_file_size_if_exists(&operator, target_path))
+                .await
+                .map_err(|_| "HdfsNativeTimeout: fresh publish target reconciliation timed out".to_string())?
+        };
+        let (source_size, target_size) = tokio::join!(source, target);
+        let source_size = source_size?;
+        let target_size = target_size?;
+        let mut resolution = resolve_upload_publish_observation(source_size, target_size, expected_size, detail);
+        if outcome_unknown && resolution.state == UploadPublishState::PartialSource {
+            resolution.state = UploadPublishState::Unknown;
+            resolution
+                .detail
+                .push_str("; dispatched HDFS rename2 may still commit, so the operation-owned source was preserved");
         }
         Ok(resolution)
     }
@@ -2435,6 +2752,7 @@ async fn resolve_input_secrets(state: &AppState, input: &FileConnectionInput) ->
                 });
             }
         }
+        FileConnectionConfig::Hdfs(_) => return Ok(ResolvedFileSecrets::default()),
     }
 
     let Some(id) = input.id.as_deref() else {
@@ -2510,6 +2828,7 @@ async fn load_file_connection_secrets(
             }
             Ok(ResolvedFileSecrets { password, webdav_token, ..ResolvedFileSecrets::default() })
         }
+        FileConnectionConfig::Hdfs(_) => Ok(ResolvedFileSecrets::default()),
     }
 }
 
@@ -2525,6 +2844,17 @@ async fn file_size_if_exists(
         Ok(_) => Err("Remote resource is not a file".to_string()),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(redact_secrets(error.to_string(), secrets)),
+    }
+}
+
+async fn hdfs_native_file_size_if_exists(operator: &Operator, path: &str) -> Result<Option<usize>, String> {
+    match operator.stat(path).await {
+        Ok(metadata) if metadata.mode().is_file() => usize::try_from(metadata.content_length())
+            .map(Some)
+            .map_err(|_| "Remote file size is not representable".to_string()),
+        Ok(_) => Err("Remote resource is not a file".to_string()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(classify_hdfs_native_opendal_error(&error)),
     }
 }
 
@@ -2644,6 +2974,10 @@ async fn delete_entry(
             let operator = build_webdav_operator(config, secrets)?;
             delete_webdav_backend_entry(config, &operator, path, expected_kind, secrets).await
         }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => {
+            let adapter = build_hdfs_native_direct_adapter(config)?;
+            delete_hdfs_native_entry(&adapter, path, expected_kind).await
+        }
     }
 }
 
@@ -2682,6 +3016,17 @@ async fn create_directory_entry(
                     operator.create_dir(&directory).await.map_err(|error| redact_secrets(error.to_string(), secrets))
                 }
                 Err(error) => Err(redact_secrets(error.to_string(), secrets)),
+            }
+        }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => {
+            let (operator, _) = build_hdfs_native_operator(config)?;
+            let directory = format!("{}/", path.as_str().trim_end_matches('/'));
+            match operator.stat(&directory).await {
+                Ok(_) => Err("HDFS Native destination already exists".to_string()),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    operator.create_dir(&directory).await.map_err(|error| classify_hdfs_native_opendal_error(&error))
+                }
+                Err(error) => Err(classify_hdfs_native_opendal_error(&error)),
             }
         }
     }
@@ -3437,6 +3782,19 @@ async fn test_connection_for_input(
                     .collect(),
             },
         },
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => match validate_input(input) {
+            Ok(()) => test_hdfs_native_connection(config).await,
+            Err(error) => FileConnectionTestResult {
+                success: false,
+                stages: std::iter::once(failed_stage("configuration", error))
+                    .chain(
+                        ["dns", "tcp", "namenode_rpc", "root", "datanode_write", "datanode_read"]
+                            .into_iter()
+                            .map(skipped_stage),
+                    )
+                    .collect(),
+            },
+        },
     }
 }
 
@@ -3630,6 +3988,15 @@ fn validate_input(input: &FileConnectionInput) -> Result<(), String> {
                 .filter(|value| !value.is_empty());
             validate_webdav_config(config, input.id.is_none(), password, token)
         }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => {
+            if input.secrets.is_some() {
+                return Err(
+                    "HDFS Native simple authentication uses an environment reference and accepts no secret fields"
+                        .to_string(),
+                );
+            }
+            validate_hdfs_native_config(config)
+        }
     }
 }
 
@@ -3684,6 +4051,10 @@ fn build_operator_with_secrets(
             sftp_key_material: None,
             sftp_path_guard: None,
         }),
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => {
+            let (operator, _) = build_hdfs_native_operator(config)?;
+            Ok(BuiltOperator { operator, sftp_key_material: None, sftp_path_guard: None })
+        }
     }
 }
 
@@ -3710,6 +4081,9 @@ fn normalize_input(input: &mut FileConnectionInput) -> Result<(), String> {
             config.endpoint = normalize_webdav_endpoint(&config.endpoint)?;
             config.root = normalize_webdav_root(&config.root)?;
             config.username = config.username.trim().to_string();
+        }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => {
+            normalize_hdfs_native_config(config)?;
         }
     }
     Ok(())
@@ -3754,7 +4128,9 @@ fn configured_root_list_path(config: &FileConnectionConfig) -> String {
                 format!("{relative}/")
             }
         }
-        FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => "/".to_string(),
+        FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) | FileConnectionConfig::Hdfs(_) => {
+            "/".to_string()
+        }
     }
 }
 
@@ -3892,6 +4268,8 @@ async fn stat_remote_metadata(
             Err(error) => {
                 let error = if matches!(config, FileConnectionConfig::Sftp(_)) {
                     classify_sftp_error(error)
+                } else if matches!(config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))) {
+                    classify_hdfs_native_opendal_error(&error)
                 } else {
                     error.to_string()
                 };
@@ -3900,8 +4278,13 @@ async fn stat_remote_metadata(
         }
     }
     let error = last_error.expect("a transient stat failure is recorded before retry");
-    let error =
-        if matches!(config, FileConnectionConfig::Sftp(_)) { classify_sftp_error(error) } else { error.to_string() };
+    let error = if matches!(config, FileConnectionConfig::Sftp(_)) {
+        classify_sftp_error(error)
+    } else if matches!(config, FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_))) {
+        classify_hdfs_native_opendal_error(&error)
+    } else {
+        error.to_string()
+    };
     Err(redact_error(error, password))
 }
 
@@ -3927,9 +4310,10 @@ async fn stat_remote_metadata_once(
             let directory_path = configured_entry_path(config, path, true);
             match config {
                 FileConnectionConfig::S3(_) => stat_s3_directory_or_virtual(operator, &directory_path).await,
-                FileConnectionConfig::Ftp(_) | FileConnectionConfig::Sftp(_) | FileConnectionConfig::Webdav(_) => {
-                    operator.stat(&directory_path).await
-                }
+                FileConnectionConfig::Ftp(_)
+                | FileConnectionConfig::Sftp(_)
+                | FileConnectionConfig::Webdav(_)
+                | FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => operator.stat(&directory_path).await,
             }
         }
         Err(error) => Err(error),
@@ -3975,6 +4359,20 @@ fn remote_fingerprint_from_metadata(metadata: &Metadata) -> RemoteFileFingerprin
     }
 }
 
+async fn fresh_hdfs_native_fingerprint(
+    operator: &Operator,
+    configured_path: &str,
+    timeout: Duration,
+) -> Result<RemoteFileFingerprint, String> {
+    match tokio::time::timeout(timeout, operator.stat(configured_path)).await {
+        Ok(Ok(metadata)) if metadata.mode().is_file() => Ok(remote_fingerprint_from_metadata(&metadata)),
+        Ok(Ok(_)) => Err("Unsupported: directory copy and rename are not available in v1".to_string()),
+        Ok(Err(error)) if error.kind() == ErrorKind::NotFound => Err("Remote file no longer exists".to_string()),
+        Ok(Err(error)) => Err(classify_hdfs_native_opendal_error(&error)),
+        Err(_) => Err("HdfsNativeTimeout: fresh rename reconciliation stat timed out".to_string()),
+    }
+}
+
 pub(super) fn password_scope(config: &FileConnectionConfig) -> Result<String, String> {
     match config {
         FileConnectionConfig::Ftp(config) => {
@@ -3998,6 +4396,16 @@ pub(super) fn password_scope(config: &FileConnectionConfig) -> Result<String, St
                 config.username
             ))
         }
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(config)) => Ok(format!(
+            "hdfs\nnative\n{}\n{}\n{}",
+            config.name_node_uri,
+            config.root,
+            config
+                .authentication_environment
+                .as_ref()
+                .map(|environment| environment.user_name.as_str())
+                .unwrap_or("process_user")
+        )),
     }
 }
 
@@ -4068,6 +4476,7 @@ fn config_kind(config: &FileConnectionConfig) -> &'static str {
         FileConnectionConfig::Sftp(_) => "sftp",
         FileConnectionConfig::S3(_) => "s3",
         FileConnectionConfig::Webdav(_) => "webdav",
+        FileConnectionConfig::Hdfs(_) => "hdfs",
     }
 }
 
@@ -4076,6 +4485,7 @@ fn file_connection_capabilities(config: &FileConnectionConfig) -> FileConnection
         FileConnectionConfig::Sftp(_) => sftp_capabilities(),
         FileConnectionConfig::S3(_) => s3_capabilities(),
         FileConnectionConfig::Webdav(_) => webdav_capabilities(),
+        FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(_)) => hdfs_native_capabilities(),
         FileConnectionConfig::Ftp(_) => FileConnectionCapabilities {
             read: true,
             write: true,
@@ -4989,6 +5399,288 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "run through tests/hdfs-native-contract.sh with the fixed Hadoop service"]
+    async fn fixed_hdfs_native_service_contract() {
+        let config = FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(HdfsNativeConnectionConfig {
+            name_node_uri: std::env::var("DBX_TEST_HDFS_NATIVE_NAMENODE").unwrap(),
+            root: std::env::var("DBX_TEST_HDFS_NATIVE_ROOT").unwrap(),
+            options: std::collections::BTreeMap::from([(
+                "dfs.client.use.datanode.hostname".to_string(),
+                "true".to_string(),
+            )]),
+            hadoop_config_directory: Some(std::env::var("DBX_TEST_HDFS_NATIVE_HADOOP_CONFIG_DIR").unwrap()),
+            authentication_environment: Some(
+                super::super::file_manager_hdfs_native::HdfsNativeAuthenticationEnvironment {
+                    user_name: "HADOOP_USER_NAME".to_string(),
+                },
+            ),
+        }));
+        let directory = tempfile::tempdir().unwrap();
+        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let input = FileConnectionInput {
+            id: None,
+            expected_revision: None,
+            name: "HDFS Native service contract".to_string(),
+            config: config.clone(),
+            secrets: None,
+        };
+        let mut normalized_config = config.clone();
+        let FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(normalized)) = &mut normalized_config else {
+            unreachable!()
+        };
+        normalized.hadoop_config_directory = normalized
+            .hadoop_config_directory
+            .as_deref()
+            .map(std::fs::canonicalize)
+            .transpose()
+            .unwrap()
+            .map(|path| path.to_string_lossy().into_owned());
+
+        let tested =
+            test_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), input.clone())
+                .await
+                .unwrap();
+        assert!(tested.success, "{:?}", tested.stages);
+
+        let saved =
+            save_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), input).await.unwrap();
+        assert!(!saved.has_credentials);
+        let stored = state.storage.load_file_connection(&saved.id).await.unwrap().unwrap();
+        assert_eq!(stored.kind, "hdfs");
+        let ambient_user = std::env::var("DBX_TEST_HDFS_NATIVE_CONTRACT_USER").expect("contract user is required");
+        assert!(
+            !serde_json::to_string(&stored).unwrap().contains(&ambient_user),
+            "ambient HDFS identity must not be persisted"
+        );
+        assert_eq!(serde_json::to_value(&saved.config).unwrap(), serde_json::to_value(&normalized_config).unwrap());
+        for key in [
+            "password",
+            "password_scope",
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "s3_scope",
+            "webdav_token",
+            "webdav_scope",
+            "sftp_private_key",
+            "sftp_private_key_passphrase",
+            "sftp_scope",
+        ] {
+            assert!(state.storage.load_file_connection_secret(&saved.id, key).await.unwrap().is_none(), "{key}");
+        }
+
+        let edited = save_file_connection(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            FileConnectionInput {
+                id: Some(saved.id.clone()),
+                expected_revision: Some(saved.revision),
+                name: "HDFS Native edited".to_string(),
+                config: config.clone(),
+                secrets: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(edited.revision, saved.revision + 1);
+        assert_eq!(serde_json::to_value(&edited.config).unwrap(), serde_json::to_value(&normalized_config).unwrap());
+
+        let options = FileListOptions { page_size: Some(50) };
+        let mut page = list_file_entries(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            String::new(),
+            Some(options.clone()),
+        )
+        .await
+        .unwrap();
+        let mut entries = page.entries;
+        while let Some(cursor) = page.cursor {
+            page = list_file_entries_next(
+                app.state::<Arc<AppState>>(),
+                app.state::<FileManagerRuntime>(),
+                saved.id.clone(),
+                cursor,
+                String::new(),
+                Some(options.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(page.entries.len() <= 50);
+            entries.extend(page.entries.iter().cloned());
+        }
+        let paths = entries.iter().map(|entry| entry.path.clone()).collect::<Vec<_>>();
+        let expected_page_paths = (1..=205).map(|index| format!("page-{index:03}.txt")).collect::<HashSet<_>>();
+        let actual_page_paths = paths
+            .iter()
+            .filter(|path| path.starts_with("page-") && path.ends_with(".txt"))
+            .cloned()
+            .collect::<HashSet<_>>();
+        assert_eq!(actual_page_paths, expected_page_paths);
+        for required in ["fixture.txt", "nested", "empty", "denied"] {
+            assert!(paths.iter().any(|path| path == required), "missing {required}");
+        }
+        for required_directory in ["nested", "empty", "denied"] {
+            assert_eq!(
+                entries.iter().find(|entry| entry.path == required_directory).map(|entry| entry.kind.as_str()),
+                Some("directory"),
+                "{required_directory} must retain its directory kind"
+            );
+        }
+        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), paths.len());
+
+        let fixture = stat_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            "fixture.txt".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.size, b"hdfs native fixture\n".len() as u64);
+
+        let contract_dir = format!("product-service-{}/", Uuid::new_v4());
+        create_file_directory(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            contract_dir.clone(),
+        )
+        .await
+        .unwrap();
+        let connection = state.storage.load_file_connection(&saved.id).await.unwrap().unwrap();
+        let file_manager = app.state::<FileManagerRuntime>();
+        let prepared = file_manager
+            .prepare_file_mutation_operation(&state, &saved.id, "fixture.txt", connection.revision)
+            .await
+            .unwrap();
+        let file = format!("{contract_dir}delete.txt");
+        prepared.operator.write(&file, b"delete-me".to_vec()).await.unwrap();
+        delete_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            file,
+            Some(false),
+            Some("file".to_string()),
+        )
+        .await
+        .unwrap();
+        delete_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            contract_dir.trim_end_matches('/').to_string(),
+            Some(false),
+            Some("directory".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let raced_directory = format!("product-delete-race-{}/", Uuid::new_v4());
+        create_file_directory(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            raced_directory.clone(),
+        )
+        .await
+        .unwrap();
+        let delete_barrier = super::super::file_manager_hdfs_native::install_test_delete_after_empty_check_barrier();
+        let delete_app = app.handle().clone();
+        let delete_connection_id = saved.id.clone();
+        let delete_path = raced_directory.trim_end_matches('/').to_string();
+        let raced_delete = tokio::spawn(async move {
+            delete_file_entry(
+                delete_app.state::<Arc<AppState>>(),
+                delete_app.state::<FileManagerRuntime>(),
+                delete_connection_id,
+                delete_path,
+                Some(false),
+                Some("directory".to_string()),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), delete_barrier.reached.notified())
+            .await
+            .expect("HDFS delete did not reach its post-empty-check barrier");
+        let raced_child = format!("{raced_directory}child.txt");
+        prepared.operator.write(&raced_child, b"preserve-me".to_vec()).await.unwrap();
+        delete_barrier.release.notify_one();
+        let raced_error = raced_delete.await.unwrap().unwrap_err();
+        assert!(
+            raced_error.contains("non-empty")
+                || raced_error.contains("Unsupported")
+                || raced_error.contains("HdfsNative"),
+            "{raced_error}"
+        );
+        assert_eq!(prepared.operator.read(&raced_child).await.unwrap().to_vec(), b"preserve-me");
+        delete_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            raced_child,
+            Some(false),
+            Some("file".to_string()),
+        )
+        .await
+        .unwrap();
+        delete_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            raced_directory.trim_end_matches('/').to_string(),
+            Some(false),
+            Some("directory".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let root_escape = delete_file_entry(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            "../outside-root-canary.txt".to_string(),
+            Some(false),
+            Some("file".to_string()),
+        )
+        .await
+        .unwrap_err();
+        assert!(root_escape.contains("cannot contain '.' or '..' path segments"), "{root_escape}");
+
+        let denied_list = list_file_entries(
+            app.state::<Arc<AppState>>(),
+            app.state::<FileManagerRuntime>(),
+            saved.id.clone(),
+            "denied".to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let denied_read = prepared.operator.read("denied/secret.txt").await.unwrap_err();
+        let denied_read = classify_hdfs_native_opendal_error(&denied_read);
+        for denied in [denied_list, denied_read] {
+            assert_eq!(denied, "HdfsNativePermission: permission denied");
+            for secret in [ambient_user.as_str(), "denied/secret.txt", "/tenant/root/denied", "token"] {
+                assert!(!denied.to_ascii_lowercase().contains(&secret.to_ascii_lowercase()), "{denied}");
+            }
+        }
+        drop(prepared);
+
+        delete_file_connection(app.state::<Arc<AppState>>(), app.state::<FileManagerRuntime>(), saved.id)
+            .await
+            .unwrap();
+        assert!(state.storage.list_file_connections().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     #[ignore = "run through tests/sftp-contract.sh with a digest-pinned OpenSSH server"]
     async fn fixed_sftp_service_contract() {
         let endpoint = std::env::var("DBX_TEST_SFTP_ENDPOINT").expect("DBX_TEST_SFTP_ENDPOINT is required");
@@ -5718,14 +6410,20 @@ mod tests {
         let missing_config = FileConnectionConfig::Ftp(FtpConnectionConfig {
             endpoint: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.endpoint.clone(),
-                FileConnectionConfig::Sftp(_) | FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => {
+                FileConnectionConfig::Sftp(_)
+                | FileConnectionConfig::S3(_)
+                | FileConnectionConfig::Webdav(_)
+                | FileConnectionConfig::Hdfs(_) => {
                     unreachable!()
                 }
             },
             root: "/ftp/dbx/must-not-be-created".to_string(),
             username: match &input.config {
                 FileConnectionConfig::Ftp(config) => config.username.clone(),
-                FileConnectionConfig::Sftp(_) | FileConnectionConfig::S3(_) | FileConnectionConfig::Webdav(_) => {
+                FileConnectionConfig::Sftp(_)
+                | FileConnectionConfig::S3(_)
+                | FileConnectionConfig::Webdav(_)
+                | FileConnectionConfig::Hdfs(_) => {
                     unreachable!()
                 }
             },

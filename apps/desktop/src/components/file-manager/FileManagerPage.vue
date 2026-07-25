@@ -30,6 +30,7 @@ const text = computed(() => ({
   sftp: "SFTP",
   s3: "S3",
   webdav: "WebDAV",
+  hdfs: "HDFS",
   region: t("fileManager.region"),
   bucket: t("fileManager.bucket"),
   accessKeyId: t("fileManager.accessKeyId"),
@@ -48,6 +49,14 @@ const text = computed(() => ({
   webdavSecurity: t("fileManager.webdavSecurity"),
   sftpSecurity: t("fileManager.sftpSecurity"),
   sftpUnsupported: t("fileManager.sftpUnsupported"),
+  hdfsSecurity: t("fileManager.hdfsSecurity"),
+  implementation: t("fileManager.implementation"),
+  native: t("fileManager.native"),
+  nameNodeUri: t("fileManager.nameNodeUri"),
+  hadoopConfigDirectory: t("fileManager.hadoopConfigDirectory"),
+  hdfsOptions: t("fileManager.hdfsOptions"),
+  hdfsOptionsHint: t("fileManager.hdfsOptionsHint"),
+  hdfsUseUserEnvironment: t("fileManager.hdfsUseUserEnvironment"),
   sshConfig: t("fileManager.sshConfig"),
   sshAgent: t("fileManager.sshAgent"),
   sshPrivateKey: t("fileManager.sshPrivateKey"),
@@ -84,6 +93,9 @@ const text = computed(() => ({
     host_key: t("fileManager.stageHostKey"),
     bucket: t("fileManager.bucket"),
     root: t("fileManager.root"),
+    namenode_rpc: t("fileManager.stageNameNodeRpc"),
+    datanode_write: t("fileManager.stageDataNodeWrite"),
+    datanode_read: t("fileManager.stageDataNodeRead"),
   },
   type: t("fileManager.type"),
   size: t("fileManager.size"),
@@ -114,6 +126,9 @@ const text = computed(() => ({
   webdavRenameRisk: t("fileManager.webdavRenameRisk"),
   sftpCopyRisk: t("fileManager.sftpCopyRisk"),
   sftpRenameRisk: t("fileManager.sftpRenameRisk"),
+  hdfsCopyRisk: t("fileManager.hdfsCopyRisk"),
+  hdfsRenameRisk: t("fileManager.hdfsRenameRisk"),
+  hdfsUploadRiskConfirm: (path: string) => t("fileManager.hdfsUploadRiskConfirm", { path }),
   sftpUploadRiskConfirm: (path: string) => t("fileManager.sftpUploadRiskConfirm", { path }),
   replaceDestination: t("fileManager.replaceDestination"),
   replaceConfirm: (path: string) => t("fileManager.replaceConfirm", { path }),
@@ -176,7 +191,7 @@ const clearS3Credentials = ref(false);
 const clearWebdavCredentials = ref(false);
 const sftpSupported = ["macos", "linux"].includes(getPlatform());
 const form = ref({
-  type: "ftp" as "ftp" | "sftp" | "s3" | "webdav",
+  type: "ftp" as "ftp" | "sftp" | "s3" | "webdav" | "hdfs",
   name: "",
   endpoint: "ftp://localhost:21",
   root: "/",
@@ -194,6 +209,9 @@ const form = ref({
   sftpAuthentication: "ssh_config" as "ssh_config" | "agent" | "private_key",
   sftpPrivateKey: "",
   sftpPrivateKeyPassphrase: "",
+  hdfsOptions: "",
+  hadoopConfigDirectory: "",
+  hdfsUseUserEnvironment: false,
 });
 let connectionsGeneration = 0;
 let rootGeneration = 0;
@@ -203,7 +221,9 @@ let unlistenTransfers: UnlistenFn | null = null;
 let transferPoll: ReturnType<typeof setInterval> | null = null;
 
 const selectedConnection = computed(() => connections.value.find((connection) => connection.id === selectedId.value));
-const connectionSecurityText = computed(() => (form.value.type === "ftp" ? text.value.ftpSecurity : form.value.type === "sftp" ? (sftpSupported ? text.value.sftpSecurity : text.value.sftpUnsupported) : form.value.type === "s3" ? text.value.s3Security : text.value.webdavSecurity));
+const connectionSecurityText = computed(() =>
+  form.value.type === "ftp" ? text.value.ftpSecurity : form.value.type === "sftp" ? (sftpSupported ? text.value.sftpSecurity : text.value.sftpUnsupported) : form.value.type === "s3" ? text.value.s3Security : form.value.type === "hdfs" ? text.value.hdfsSecurity : text.value.webdavSecurity,
+);
 const canSubmit = computed(
   () =>
     !!form.value.name.trim() &&
@@ -225,6 +245,32 @@ const breadcrumbs = computed(() => {
 });
 
 function inputFromForm(): FileConnectionInput {
+  if (form.value.type === "hdfs") {
+    const options = Object.fromEntries(
+      form.value.hdfsOptions
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const separator = line.indexOf("=");
+          return separator < 1 ? [line, ""] : [line.slice(0, separator).trim(), line.slice(separator + 1).trim()];
+        }),
+    );
+    return {
+      id: editingId.value,
+      expectedRevision: editingId.value ? selectedConnection.value?.revision : undefined,
+      name: form.value.name.trim(),
+      config: {
+        type: "hdfs",
+        implementation: "native",
+        nameNodeUri: form.value.endpoint.trim(),
+        root: form.value.root.trim(),
+        options,
+        hadoopConfigDirectory: form.value.hadoopConfigDirectory.trim() || null,
+        authenticationEnvironment: form.value.hdfsUseUserEnvironment ? { userName: "HADOOP_USER_NAME" } : null,
+      },
+    };
+  }
   if (form.value.type === "sftp") {
     const hasPrivateKey = !!form.value.sftpPrivateKey.trim();
     return {
@@ -314,6 +360,9 @@ function remoteOperationRisk(): string {
   }
   if (selectedConnection.value?.config.type === "sftp") {
     return remoteOperation.value === "copy" ? text.value.sftpCopyRisk : text.value.sftpRenameRisk;
+  }
+  if (selectedConnection.value?.config.type === "hdfs") {
+    return remoteOperation.value === "copy" ? text.value.hdfsCopyRisk : text.value.hdfsRenameRisk;
   }
   return text.value.copyRenameRisk;
 }
@@ -493,6 +542,9 @@ function openCreate() {
     sftpAuthentication: "ssh_config",
     sftpPrivateKey: "",
     sftpPrivateKeyPassphrase: "",
+    hdfsOptions: "",
+    hadoopConfigDirectory: "",
+    hdfsUseUserEnvironment: false,
   };
   testResult.value = null;
   clearPassword.value = false;
@@ -508,7 +560,7 @@ function openEdit() {
   form.value = {
     type: connection.config.type,
     name: connection.name,
-    endpoint: connection.config.endpoint,
+    endpoint: connection.config.type === "hdfs" ? connection.config.nameNodeUri : connection.config.endpoint,
     root: connection.config.root,
     username: connection.config.type === "ftp" || connection.config.type === "sftp" || connection.config.type === "webdav" ? connection.config.username : "",
     password: "",
@@ -524,6 +576,14 @@ function openEdit() {
     sftpAuthentication: connection.config.type === "sftp" ? connection.config.authentication : "ssh_config",
     sftpPrivateKey: "",
     sftpPrivateKeyPassphrase: "",
+    hdfsOptions:
+      connection.config.type === "hdfs"
+        ? Object.entries(connection.config.options)
+            .map(([key, value]) => `${key}=${value}`)
+            .join("\n")
+        : "",
+    hadoopConfigDirectory: connection.config.type === "hdfs" ? (connection.config.hadoopConfigDirectory ?? "") : "",
+    hdfsUseUserEnvironment: connection.config.type === "hdfs" && !!connection.config.authenticationEnvironment,
   };
   testResult.value = null;
   clearPassword.value = false;
@@ -683,7 +743,14 @@ async function uploadFile() {
   if (typeof selected !== "string") return;
   const name = localFileName(selected);
   const remotePath = targetDirectory ? `${targetDirectory}/${name}` : name;
-  const uploadConfirmation = selectedConnection.value?.config.type === "s3" ? text.value.s3UploadRiskConfirm(remotePath) : selectedConnection.value?.config.type === "sftp" ? text.value.sftpUploadRiskConfirm(remotePath) : text.value.uploadRiskConfirm(remotePath);
+  const uploadConfirmation =
+    selectedConnection.value?.config.type === "s3"
+      ? text.value.s3UploadRiskConfirm(remotePath)
+      : selectedConnection.value?.config.type === "sftp"
+        ? text.value.sftpUploadRiskConfirm(remotePath)
+        : selectedConnection.value?.config.type === "hdfs"
+          ? text.value.hdfsUploadRiskConfirm(remotePath)
+          : text.value.uploadRiskConfirm(remotePath);
   if (!globalThis.confirm(uploadConfirmation)) return;
   try {
     const started = await api.startFileUpload({
@@ -1036,7 +1103,7 @@ onBeforeUnmount(() => {
               v-model="form.type"
               class="h-9 rounded-md border border-input bg-background px-3 text-sm"
               @change="
-                form.endpoint = form.type === 'ftp' ? 'ftp://localhost:21' : form.type === 'sftp' ? 'localhost' : form.type === 's3' ? 'http://localhost:9000' : 'http://localhost:8080';
+                form.endpoint = form.type === 'ftp' ? 'ftp://localhost:21' : form.type === 'sftp' ? 'localhost' : form.type === 's3' ? 'http://localhost:9000' : form.type === 'hdfs' ? 'hdfs://localhost:9000' : 'http://localhost:8080';
                 testResult = null;
               "
             >
@@ -1044,6 +1111,7 @@ onBeforeUnmount(() => {
               <option value="sftp" :disabled="!sftpSupported">{{ text.sftp }}{{ sftpSupported ? "" : ` - ${text.sftpUnsupported}` }}</option>
               <option value="s3">{{ text.s3 }}</option>
               <option value="webdav">{{ text.webdav }}</option>
+              <option value="hdfs">{{ text.hdfs }}</option>
             </select>
           </div>
           <div class="grid gap-1.5">
@@ -1051,8 +1119,12 @@ onBeforeUnmount(() => {
             ><Input id="file-connection-name" v-model="form.name" />
           </div>
           <div class="grid gap-1.5">
-            <Label for="file-connection-endpoint">{{ text.endpoint }}</Label
-            ><Input id="file-connection-endpoint" v-model="form.endpoint" :placeholder="form.type === 'ftp' ? 'ftp://host:21' : form.type === 'sftp' ? 'host-alias or ssh://host:22' : form.type === 's3' ? 'https://s3.example.com' : 'https://dav.example.com/webdav'" />
+            <Label for="file-connection-endpoint">{{ form.type === "hdfs" ? text.nameNodeUri : text.endpoint }}</Label
+            ><Input
+              id="file-connection-endpoint"
+              v-model="form.endpoint"
+              :placeholder="form.type === 'ftp' ? 'ftp://host:21' : form.type === 'sftp' ? 'host-alias or ssh://host:22' : form.type === 's3' ? 'https://s3.example.com' : form.type === 'hdfs' ? 'hdfs://namenode:9000' : 'https://dav.example.com/webdav'"
+            />
           </div>
           <div v-if="form.type === 'ftp'" class="grid grid-cols-2 gap-3">
             <div class="grid gap-1.5">
@@ -1160,6 +1232,32 @@ onBeforeUnmount(() => {
                 <span>{{ text.clearS3Credentials }}</span>
               </label>
             </div>
+          </template>
+          <template v-else-if="form.type === 'hdfs'">
+            <div class="grid grid-cols-2 gap-3">
+              <div class="grid gap-1.5">
+                <Label for="file-connection-hdfs-implementation">{{ text.implementation }}</Label>
+                <select id="file-connection-hdfs-implementation" class="h-9 rounded-md border border-input bg-background px-3 text-sm" disabled>
+                  <option value="native">{{ text.native }}</option>
+                </select>
+              </div>
+              <div class="grid gap-1.5">
+                <Label for="file-connection-hdfs-root">{{ text.root }}</Label>
+                <Input id="file-connection-hdfs-root" v-model="form.root" placeholder="/" />
+              </div>
+            </div>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-hdfs-config">{{ text.hadoopConfigDirectory }}</Label>
+              <Input id="file-connection-hdfs-config" v-model="form.hadoopConfigDirectory" placeholder="/etc/hadoop/conf" />
+            </div>
+            <div class="grid gap-1.5">
+              <Label for="file-connection-hdfs-options">{{ text.hdfsOptions }}</Label>
+              <textarea id="file-connection-hdfs-options" v-model="form.hdfsOptions" :placeholder="text.hdfsOptionsHint" class="min-h-24 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-xs" spellcheck="false" />
+            </div>
+            <label class="flex items-center gap-2 text-xs text-muted-foreground">
+              <input id="file-connection-hdfs-user-environment" v-model="form.hdfsUseUserEnvironment" type="checkbox" class="h-3.5 w-3.5 accent-primary" />
+              <span>{{ text.hdfsUseUserEnvironment }}</span>
+            </label>
           </template>
           <template v-else>
             <div class="grid gap-1.5">

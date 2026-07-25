@@ -5,6 +5,8 @@ use std::io;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,8 +30,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::file_manager::{
-    validate_remote_relative_path, CancellationSignal, FileManagerRuntime, PreparedFileMutation, PreparedFileOperation,
-    RemoteFileFingerprint, UploadPolicy, UploadPublishResolution, UploadPublishState,
+    validate_remote_relative_path, CancellationSignal, FileManagerRuntime, NativeRenameError, PreparedFileMutation,
+    PreparedFileOperation, RemoteFileFingerprint, UploadPolicy, UploadPublishResolution, UploadPublishState,
 };
 use super::file_manager_webdav::WebdavMutationErrorKind;
 
@@ -60,6 +62,10 @@ static TEST_REMOTE_READER_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteRe
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static TEST_DOWNLOAD_AFTER_CHUNK_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
 static TEST_UPLOAD_AFTER_CHUNK_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
     std::sync::OnceLock::new();
 
@@ -72,12 +78,29 @@ static TEST_REMOTE_COPY_AFTER_CLOSE_BARRIER: std::sync::OnceLock<Mutex<Option<Te
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static TEST_REMOTE_COPY_AFTER_CHUNK_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
 static TEST_REMOTE_RENAME_AFTER_PUBLISH_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
 static TEST_SFTP_RENAME_BEFORE_DISPATCH_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
     std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_HDFS_NATIVE_RENAME_BEFORE_DISPATCH_BARRIER: std::sync::OnceLock<Mutex<Option<TestRemoteReaderBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_REMOTE_COPY_MAX_READ_CHUNK: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+static TEST_REMOTE_COPY_MAX_WRITE_CHUNK: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+static TEST_REMOTE_COPY_MAX_RELAY_PAYLOAD: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
 static TEST_S3_COPY_AFTER_COMMIT_RESPONSE_LOSS: std::sync::OnceLock<Mutex<Option<String>>> = std::sync::OnceLock::new();
@@ -256,6 +279,13 @@ struct RemoteTransferFailure {
     partial_destination: Option<String>,
     source_fingerprint: Option<String>,
     destination_fingerprint: Option<String>,
+}
+
+enum NativeRenameDispatchOutcome {
+    Finished(Result<(), NativeRenameError>),
+    TransferCancelled,
+    ConnectionCancelled,
+    TimedOut,
 }
 
 struct UploadFailure {
@@ -1302,7 +1332,9 @@ async fn execute_remote_transfer<R: Runtime>(
     cancellation: &CancellationToken,
     progress: Arc<TransferProgressSnapshot>,
 ) -> Result<RemoteTransferOutcome, RemoteTransferFailure> {
-    if prepared.uses_server_side_copy() || (operation == "rename" && prepared.uses_native_sftp_rename()) {
+    if prepared.uses_server_side_copy()
+        || (operation == "rename" && (prepared.uses_native_sftp_rename() || prepared.uses_direct_hdfs_native_rename()))
+    {
         return execute_server_side_remote_transfer(
             app,
             state,
@@ -1441,7 +1473,9 @@ async fn execute_remote_transfer<R: Runtime>(
             if count == 0 {
                 break;
             }
+            record_test_remote_copy_read(count);
             hasher.update(&buffer[..count]);
+            record_test_remote_copy_write(count);
             tokio::select! {
                 _ = cancellation.cancelled() => return Err(cancelled_active_failure()),
                 _ = prepared.cancellation.cancelled() => {
@@ -1463,6 +1497,7 @@ async fn execute_remote_transfer<R: Runtime>(
             bytes_transferred =
                 bytes_transferred.saturating_add(i64::try_from(count).unwrap_or(i64::MAX));
             progress.record_bytes(bytes_transferred);
+            wait_at_test_remote_copy_after_chunk_barrier().await;
             if last_progress.elapsed() >= PROGRESS_INTERVAL {
                 let update = state
                     .storage
@@ -1838,8 +1873,22 @@ async fn reconcile_uncertain_native_move(
     detail: String,
     cancelled: bool,
 ) -> RemoteTransferFailure {
-    let source = prepared.fingerprint_remote_file(source_path).await;
-    let destination = prepared.fingerprint_remote_file(destination_path).await;
+    let (source, destination) = if prepared.uses_direct_hdfs_native_rename() {
+        // The direct RPC future has been cancelled or returned an uncertain
+        // transport result. Remove its cache entry before any observation so
+        // no later operation can reuse that client, then reconcile through a
+        // separately constructed and bounded OpenDAL client.
+        prepared.evict_uncertain_hdfs_native_rename();
+        match prepared
+            .observe_uncertain_hdfs_native_rename_fresh(source_path, destination_path, IO_PROGRESS_WATCHDOG)
+            .await
+        {
+            Ok(observation) => observation,
+            Err(error) => (Err(error.clone()), Err(error)),
+        }
+    } else {
+        (prepared.fingerprint_remote_file(source_path).await, prepared.fingerprint_remote_file(destination_path).await)
+    };
     match (source, destination) {
         (Err(source_error), Ok(destination))
             if source_error.contains("no longer exists")
@@ -1892,6 +1941,16 @@ async fn reconcile_uncertain_native_move(
             destination_fingerprint: None,
         },
     }
+}
+
+fn invalidate_hdfs_native_after_uncertain_move(
+    prepared: &PreparedFileMutation<'_>,
+    mut failure: RemoteTransferFailure,
+) -> RemoteTransferFailure {
+    if prepared.uses_direct_hdfs_native_rename() {
+        failure.failure.invalidate_operator = true;
+    }
+    failure
 }
 
 async fn reconcile_uncertain_webdav_copy(
@@ -2104,22 +2163,34 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
         }
         let dispatch_started = Arc::new(AtomicBool::new(false));
         let dispatch_for_request = dispatch_started.clone();
-        let mutation = tokio::select! {
-            biased;
-            result = tokio::time::timeout(
-                IO_PROGRESS_WATCHDOG,
-                prepared.dispatch_native_rename(source_path, destination_path, dispatch_for_request),
-            ) => result,
-            _ = cancellation.cancelled() => {
+        let mutation = {
+            let dispatch =
+                prepared.dispatch_native_rename(source_path, destination_path, policy.replace(), dispatch_for_request);
+            tokio::select! {
+                biased;
+                result = tokio::time::timeout(IO_PROGRESS_WATCHDOG, dispatch) => {
+                    match result {
+                        Ok(result) => NativeRenameDispatchOutcome::Finished(result),
+                        Err(_) => NativeRenameDispatchOutcome::TimedOut,
+                    }
+                },
+                _ = cancellation.cancelled() => NativeRenameDispatchOutcome::TransferCancelled,
+                _ = prepared.cancellation.cancelled() => NativeRenameDispatchOutcome::ConnectionCancelled,
+            }
+        };
+        match mutation {
+            NativeRenameDispatchOutcome::TransferCancelled => {
                 if dispatch_started.load(Ordering::Acquire) {
-                    return Err(reconcile_uncertain_native_move(
+                    let failure = reconcile_uncertain_native_move(
                         prepared,
                         &source_before,
                         source_path,
                         destination_path,
                         "Native rename was cancelled after dispatch and its outcome is uncertain".to_string(),
                         true,
-                    ).await);
+                    )
+                    .await;
+                    return Err(invalidate_hdfs_native_after_uncertain_move(prepared, failure));
                 }
                 return Err(remote_transfer_before_copy(TransferFailure {
                     status: "cancelled",
@@ -2127,16 +2198,18 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                     invalidate_operator: false,
                 }));
             }
-            _ = prepared.cancellation.cancelled() => {
+            NativeRenameDispatchOutcome::ConnectionCancelled => {
                 if dispatch_started.load(Ordering::Acquire) {
-                    return Err(reconcile_uncertain_native_move(
+                    let failure = reconcile_uncertain_native_move(
                         prepared,
                         &source_before,
                         source_path,
                         destination_path,
                         "The file connection was removed after native rename dispatch".to_string(),
                         true,
-                    ).await);
+                    )
+                    .await;
+                    return Err(invalidate_hdfs_native_after_uncertain_move(prepared, failure));
                 }
                 return Err(remote_transfer_before_copy(TransferFailure {
                     status: "cancelled",
@@ -2144,9 +2217,7 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                     invalidate_operator: true,
                 }));
             }
-        };
-        match mutation {
-            Ok(Ok(())) => {
+            NativeRenameDispatchOutcome::Finished(Ok(())) => {
                 let destination = prepared.fingerprint_remote_file(destination_path).await.map_err(|error| {
                     RemoteTransferFailure {
                         failure: partial_failure(error),
@@ -2200,11 +2271,11 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                     destination_fingerprint: destination.encode(),
                 });
             }
-            Ok(Err(error)) => {
+            NativeRenameDispatchOutcome::Finished(Err(error)) => {
                 if !error.is_outcome_unknown() {
                     return Err(remote_transfer_before_copy(remote_failure(error.message)));
                 }
-                return Err(reconcile_uncertain_native_move(
+                let failure = reconcile_uncertain_native_move(
                     prepared,
                     &source_before,
                     source_path,
@@ -2212,10 +2283,11 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                     error.message,
                     false,
                 )
-                .await);
+                .await;
+                return Err(invalidate_hdfs_native_after_uncertain_move(prepared, failure));
             }
-            Err(_) => {
-                return Err(reconcile_uncertain_native_move(
+            NativeRenameDispatchOutcome::TimedOut => {
+                let failure = reconcile_uncertain_native_move(
                     prepared,
                     &source_before,
                     source_path,
@@ -2223,7 +2295,8 @@ async fn execute_server_side_remote_transfer<R: Runtime>(
                     "Native rename timed out".to_string(),
                     false,
                 )
-                .await);
+                .await;
+                return Err(invalidate_hdfs_native_after_uncertain_move(prepared, failure));
             }
         }
     }
@@ -3745,6 +3818,7 @@ async fn execute_download<R: Runtime>(
         if count == 0 {
             break;
         }
+        wait_at_test_download_after_chunk_barrier().await;
 
         if last_progress.elapsed() >= PROGRESS_INTERVAL {
             let progress = state
@@ -3832,6 +3906,19 @@ fn install_test_remote_reader_barrier() -> TestRemoteReaderBarrier {
 }
 
 #[cfg(test)]
+fn install_test_download_after_chunk_barrier() -> TestRemoteReaderBarrier {
+    install_test_async_barrier(&TEST_DOWNLOAD_AFTER_CHUNK_BARRIER)
+}
+
+#[cfg(test)]
+async fn wait_at_test_download_after_chunk_barrier() {
+    wait_at_test_async_barrier(&TEST_DOWNLOAD_AFTER_CHUNK_BARRIER).await;
+}
+
+#[cfg(not(test))]
+async fn wait_at_test_download_after_chunk_barrier() {}
+
+#[cfg(test)]
 async fn wait_at_test_remote_reader_barrier() {
     let barrier = TEST_REMOTE_READER_BARRIER
         .get_or_init(|| Mutex::new(None))
@@ -3911,6 +3998,19 @@ fn install_test_remote_copy_after_close_barrier() -> TestRemoteReaderBarrier {
 }
 
 #[cfg(test)]
+fn install_test_remote_copy_after_chunk_barrier() -> TestRemoteReaderBarrier {
+    install_test_async_barrier(&TEST_REMOTE_COPY_AFTER_CHUNK_BARRIER)
+}
+
+#[cfg(test)]
+async fn wait_at_test_remote_copy_after_chunk_barrier() {
+    wait_at_test_async_barrier(&TEST_REMOTE_COPY_AFTER_CHUNK_BARRIER).await;
+}
+
+#[cfg(not(test))]
+async fn wait_at_test_remote_copy_after_chunk_barrier() {}
+
+#[cfg(test)]
 async fn wait_at_test_remote_copy_after_close_barrier() {
     wait_at_test_async_barrier(&TEST_REMOTE_COPY_AFTER_CLOSE_BARRIER).await;
 }
@@ -3937,8 +4037,52 @@ fn install_test_sftp_rename_before_dispatch_barrier() -> TestRemoteReaderBarrier
 }
 
 #[cfg(test)]
+fn install_test_hdfs_native_rename_before_dispatch_barrier() -> TestRemoteReaderBarrier {
+    install_test_async_barrier(&TEST_HDFS_NATIVE_RENAME_BEFORE_DISPATCH_BARRIER)
+}
+
+#[cfg(test)]
 pub(super) async fn wait_at_test_sftp_rename_before_dispatch_barrier() {
     wait_at_test_async_barrier(&TEST_SFTP_RENAME_BEFORE_DISPATCH_BARRIER).await;
+}
+
+#[cfg(test)]
+pub(super) async fn wait_at_test_hdfs_native_rename_before_dispatch_barrier() {
+    wait_at_test_async_barrier(&TEST_HDFS_NATIVE_RENAME_BEFORE_DISPATCH_BARRIER).await;
+}
+
+#[cfg(test)]
+fn reset_test_remote_copy_high_water() {
+    TEST_REMOTE_COPY_MAX_READ_CHUNK.store(0, Ordering::SeqCst);
+    TEST_REMOTE_COPY_MAX_WRITE_CHUNK.store(0, Ordering::SeqCst);
+    TEST_REMOTE_COPY_MAX_RELAY_PAYLOAD.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn record_test_remote_copy_read(bytes: usize) {
+    TEST_REMOTE_COPY_MAX_READ_CHUNK.fetch_max(bytes, Ordering::SeqCst);
+    TEST_REMOTE_COPY_MAX_RELAY_PAYLOAD.fetch_max(bytes, Ordering::SeqCst);
+}
+
+#[cfg(not(test))]
+fn record_test_remote_copy_read(_bytes: usize) {}
+
+#[cfg(test)]
+fn record_test_remote_copy_write(bytes: usize) {
+    TEST_REMOTE_COPY_MAX_WRITE_CHUNK.fetch_max(bytes, Ordering::SeqCst);
+    TEST_REMOTE_COPY_MAX_RELAY_PAYLOAD.fetch_max(bytes, Ordering::SeqCst);
+}
+
+#[cfg(not(test))]
+fn record_test_remote_copy_write(_bytes: usize) {}
+
+#[cfg(test)]
+fn test_remote_copy_high_water() -> (usize, usize, usize) {
+    (
+        TEST_REMOTE_COPY_MAX_READ_CHUNK.load(Ordering::SeqCst),
+        TEST_REMOTE_COPY_MAX_WRITE_CHUNK.load(Ordering::SeqCst),
+        TEST_REMOTE_COPY_MAX_RELAY_PAYLOAD.load(Ordering::SeqCst),
+    )
 }
 
 #[cfg(test)]
@@ -5079,6 +5223,7 @@ fn sanitize_error(message: &str) -> String {
 mod tests {
     use super::*;
     use dbx_core::storage::Storage;
+    use std::collections::BTreeSet;
     use std::pin::Pin;
     use std::process::Command;
     use std::task::{Context, Poll};
@@ -6933,6 +7078,898 @@ mod tests {
         (app, state, directory)
     }
 
+    async fn build_hdfs_native_contract_app() -> (tauri::App<tauri::test::MockRuntime>, Arc<AppState>, tempfile::TempDir)
+    {
+        use super::super::file_manager::{password_scope, FileConnectionConfig, HdfsConnectionConfig};
+        use super::super::file_manager_hdfs_native::{HdfsNativeAuthenticationEnvironment, HdfsNativeConnectionConfig};
+
+        let config = FileConnectionConfig::Hdfs(HdfsConnectionConfig::Native(HdfsNativeConnectionConfig {
+            name_node_uri: std::env::var("DBX_TEST_HDFS_NATIVE_NAMENODE")
+                .expect("DBX_TEST_HDFS_NATIVE_NAMENODE is required"),
+            root: std::env::var("DBX_TEST_HDFS_NATIVE_ROOT").expect("DBX_TEST_HDFS_NATIVE_ROOT is required"),
+            options: std::collections::BTreeMap::from([(
+                "dfs.client.use.datanode.hostname".to_string(),
+                "true".to_string(),
+            )]),
+            hadoop_config_directory: Some(
+                std::env::var("DBX_TEST_HDFS_NATIVE_HADOOP_CONFIG_DIR")
+                    .expect("DBX_TEST_HDFS_NATIVE_HADOOP_CONFIG_DIR is required"),
+            ),
+            authentication_environment: Some(HdfsNativeAuthenticationEnvironment {
+                user_name: "HADOOP_USER_NAME".to_string(),
+            }),
+        }));
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        storage
+            .save_file_connection_with_secret_bundle(
+                "hdfs-native-contract".into(),
+                "HDFS Native contract".into(),
+                "hdfs".into(),
+                serde_json::to_string(&config).unwrap(),
+                Vec::new(),
+                vec![
+                    "password".to_string(),
+                    "password_scope".to_string(),
+                    "access_key_id".to_string(),
+                    "secret_access_key".to_string(),
+                    "session_token".to_string(),
+                    "s3_scope".to_string(),
+                    "webdav_token".to_string(),
+                    "webdav_scope".to_string(),
+                    "sftp_private_key".to_string(),
+                    "sftp_private_key_passphrase".to_string(),
+                    "sftp_scope".to_string(),
+                ],
+                "password_scope".to_string(),
+                password_scope(&config).unwrap(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        let state = Arc::new(AppState::new(storage));
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(FileManagerRuntime::default())
+            .manage(FileTransferRuntime::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        (app, state, directory)
+    }
+
+    #[tokio::test]
+    #[ignore = "run through tests/hdfs-native-contract.sh with the fixed Hadoop service and fault proxies"]
+    async fn fixed_hdfs_native_transfer_contract() {
+        fn post_fault_control(control: &str, route: &str) {
+            let output = Command::new("curl")
+                .args(["--silent", "--show-error", "--fail", "--request", "POST"])
+                .arg(format!("{control}{route}"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "HDFS Native fault control request failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        async fn wait_for_fault_trigger(trace: &Path, label: &str) -> u64 {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let trace = tokio::fs::read_to_string(trace).await.unwrap_or_default();
+                    let events = trace
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .collect::<Vec<_>>();
+                    let binding = events.iter().find(|event| {
+                        event.get("event").and_then(serde_json::Value::as_str) == Some("bind")
+                            && event.get("label").and_then(serde_json::Value::as_str) == Some(label)
+                    });
+                    let trigger = events.iter().find(|event| {
+                        event.get("event").and_then(serde_json::Value::as_str) == Some("trigger")
+                            && event.get("label").and_then(serde_json::Value::as_str) == Some(label)
+                    });
+                    if let (Some(binding), Some(trigger)) = (binding, trigger) {
+                        let bound_pair = binding.get("pairId").and_then(serde_json::Value::as_u64).unwrap();
+                        assert_eq!(
+                            trigger.get("pairId").and_then(serde_json::Value::as_u64),
+                            Some(bound_pair),
+                            "{label} triggered on a different proxy pair"
+                        );
+                        assert_eq!(
+                            trigger.get("boundPairId").and_then(serde_json::Value::as_u64),
+                            Some(bound_pair),
+                            "{label} lost its next-pair binding"
+                        );
+                        assert_eq!(trigger.get("scope").and_then(serde_json::Value::as_str), Some("next"));
+                        break bound_pair;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("HDFS Native fault '{label}' did not trigger"))
+        }
+
+        async fn wait_for_proxy_client_release(trace: &Path, pair_id: u64, label: &str, expect_suppressed_end: bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let trace = tokio::fs::read_to_string(trace).await.unwrap_or_default();
+                    let released = trace
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                        .any(|event| {
+                            if event.get("pairId").and_then(serde_json::Value::as_u64) != Some(pair_id)
+                                || event.get("side").and_then(serde_json::Value::as_str) != Some("client")
+                            {
+                                return false;
+                            }
+                            let event_name = event.get("event").and_then(serde_json::Value::as_str);
+                            if expect_suppressed_end {
+                                event_name == Some("end-suppressed")
+                                    && event.get("direction").and_then(serde_json::Value::as_str) == Some("upstream")
+                            } else {
+                                event_name == Some("close")
+                                    || (event_name == Some("end")
+                                        && event.get("direction").and_then(serde_json::Value::as_str)
+                                            == Some("upstream"))
+                            }
+                        });
+                    if released {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("HDFS Native fault '{label}' did not release its client socket"));
+        }
+
+        fn proxy_health(control: &str) -> serde_json::Value {
+            let output = Command::new("curl")
+                .args(["--silent", "--show-error", "--fail"])
+                .arg(format!("{control}/health"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+        }
+
+        fn proxy_active_pairs(control: &str) -> BTreeSet<u64> {
+            proxy_health(control)
+                .get("activePairs")
+                .and_then(serde_json::Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|pair| pair.get("pairId").and_then(serde_json::Value::as_u64).unwrap())
+                .collect()
+        }
+
+        fn proxy_traffic_totals(control: &str) -> (u64, u64, u64, u64) {
+            let health = proxy_health(control);
+            let totals = health.get("totals").unwrap();
+            (
+                totals.get("upstreamBytes").and_then(serde_json::Value::as_u64).unwrap(),
+                totals.get("downstreamBytes").and_then(serde_json::Value::as_u64).unwrap(),
+                totals.get("upstreamChunks").and_then(serde_json::Value::as_u64).unwrap(),
+                totals.get("downstreamChunks").and_then(serde_json::Value::as_u64).unwrap(),
+            )
+        }
+
+        fn proxy_open_count(trace: &Path) -> usize {
+            std::fs::read_to_string(trace)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|event| event.get("event").and_then(serde_json::Value::as_str) == Some("open"))
+                .count()
+        }
+
+        async fn wait_for_proxy_baseline(control: &str, baseline: &BTreeSet<u64>) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if proxy_active_pairs(control) == *baseline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("HDFS Native proxy connections did not return to baseline");
+        }
+
+        async fn wait_for_proxy_subset(control: &str, baseline: &BTreeSet<u64>) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if proxy_active_pairs(control).is_subset(baseline) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("HDFS Native proxy retained a connection outside the allowed baseline");
+        }
+
+        async fn wait_for_proxy_subset_including(control: &str, allowed: &BTreeSet<u64>, required_pair: u64) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let active = proxy_active_pairs(control);
+                    if active.contains(&required_pair) && active.is_subset(allowed) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("HDFS Native proxy did not retain exactly the required fault pair within its allowed baseline");
+        }
+
+        async fn assert_proxy_traffic_quiet(control: &str) {
+            let before = proxy_traffic_totals(control);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                proxy_traffic_totals(control),
+                before,
+                "cancelled HDFS Native transfer continued emitting proxy traffic"
+            );
+        }
+
+        async fn assert_no_hdfs_owned_partial(operator: &opendal::Operator, transfer_id: &str, destination: &str) {
+            let parent =
+                destination.rsplit_once('/').map_or_else(|| "/".to_string(), |(parent, _)| format!("{parent}/"));
+            let upload_prefix = format!(".dbx-upload-{transfer_id}-");
+            let copy_prefix = format!(".dbx-copy-{transfer_id}-");
+            let residuals = operator
+                .list_with(&parent)
+                .recursive(false)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path().to_string())
+                .filter(|path| {
+                    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
+                    (name.starts_with(&upload_prefix) || name.starts_with(&copy_prefix)) && name.ends_with(".part")
+                })
+                .collect::<Vec<_>>();
+            assert!(residuals.is_empty(), "unexpected HDFS Native operation-owned partials: {residuals:?}");
+        }
+
+        async fn warm_hdfs_read_cache(file_manager: &FileManagerRuntime, state: &AppState) {
+            let warm = file_manager.prepare_file_operation(state, "hdfs-native-contract", "fixture.txt").await.unwrap();
+            let metadata = tokio::time::timeout(Duration::from_secs(10), warm.operator.stat(&warm.remote_path))
+                .await
+                .expect("HDFS Native read-cache warmup timed out")
+                .unwrap();
+            assert!(metadata.mode().is_file());
+            drop(warm);
+            assert_eq!(file_manager.operator_count(), 1, "HDFS Native read cache was not retained");
+        }
+
+        let (app, state, directory) = build_hdfs_native_contract_app().await;
+        app.state::<FileTransferRuntime>()
+            .ensure_recovered(&state, app.state::<FileManagerRuntime>().inner())
+            .await
+            .unwrap();
+        let connection = state.storage.load_file_connection("hdfs-native-contract").await.unwrap().unwrap();
+        let file_manager = app.state::<FileManagerRuntime>();
+        let prepared = file_manager
+            .prepare_file_mutation_operation(&state, "hdfs-native-contract", "fixture.txt", connection.revision)
+            .await
+            .unwrap();
+        let operator = &prepared.operator;
+        let local_root = directory.path().canonicalize().unwrap();
+        let datanode_control = std::env::var("DBX_TEST_HDFS_NATIVE_DATANODE_FAULT_CONTROL")
+            .expect("DBX_TEST_HDFS_NATIVE_DATANODE_FAULT_CONTROL is required");
+        let datanode_trace = PathBuf::from(
+            std::env::var("DBX_TEST_HDFS_NATIVE_DATANODE_PROXY_TRACE")
+                .expect("DBX_TEST_HDFS_NATIVE_DATANODE_PROXY_TRACE is required"),
+        );
+        let namenode_control = std::env::var("DBX_TEST_HDFS_NATIVE_NAMENODE_FAULT_CONTROL")
+            .expect("DBX_TEST_HDFS_NATIVE_NAMENODE_FAULT_CONTROL is required");
+        let namenode_trace = PathBuf::from(
+            std::env::var("DBX_TEST_HDFS_NATIVE_NAMENODE_PROXY_TRACE")
+                .expect("DBX_TEST_HDFS_NATIVE_NAMENODE_PROXY_TRACE is required"),
+        );
+        let source = format!("product-transfer-{}-source.bin", Uuid::new_v4());
+        let configured_source = prepared.configured_path(&source).unwrap();
+        let chunk = vec![0x4d_u8; REMOTE_COPY_BUFFER_SIZE];
+        let mut source_writer = operator.writer(&configured_source).await.unwrap();
+        for _ in 0..8 {
+            source_writer.write(chunk.clone()).await.unwrap();
+        }
+        source_writer.close().await.unwrap();
+        drop(source_writer);
+        assert_eq!(operator.stat(&configured_source).await.unwrap().content_length(), 32 * 1024 * 1024);
+
+        let no_datanode_pairs = BTreeSet::new();
+        wait_for_proxy_baseline(&datanode_control, &no_datanode_pairs).await;
+        let normal_download_uncached_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let normal_download_uncached_datanode_baseline = proxy_active_pairs(&datanode_control);
+        warm_hdfs_read_cache(file_manager.inner(), &state).await;
+        wait_for_proxy_subset(&datanode_control, &normal_download_uncached_datanode_baseline).await;
+        let normal_download_datanode_baseline = proxy_active_pairs(&datanode_control);
+        let download_target = local_root.join("hdfs-native-download.bin");
+        let (_, download_worker) = create_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-download-success",
+            &source,
+            &download_target,
+        )
+        .await;
+        download_worker.await.unwrap();
+        let download = state.storage.get_file_transfer("hdfs-native-download-success").await.unwrap().unwrap();
+        assert_eq!(download.status, "completed", "{download:?}");
+        assert_eq!(tokio::fs::metadata(&download_target).await.unwrap().len(), 32 * 1024 * 1024);
+        assert_no_owned_temp(&local_root, "hdfs-native-download-success");
+        wait_for_proxy_subset(&datanode_control, &normal_download_datanode_baseline).await;
+        assert_eq!(file_manager.operator_count(), 1, "download must retain its warmed read-cache operator");
+        file_manager.evict_revision("hdfs-native-contract", connection.revision);
+        assert_eq!(file_manager.operator_count(), 0, "download read-cache eviction must remove the cached operator");
+        wait_for_proxy_subset(&namenode_control, &normal_download_uncached_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &normal_download_uncached_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+
+        let upload_source = local_root.join("hdfs-native-upload-source.bin");
+        let upload_payload = vec![0x5a_u8; 32 * 1024 * 1024 + 137];
+        tokio::fs::write(&upload_source, &upload_payload).await.unwrap();
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let upload_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let upload_datanode_baseline = proxy_active_pairs(&datanode_control);
+        let (_, upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-upload-success",
+            "hdfs-native-upload-target.bin",
+            &upload_source,
+        )
+        .await;
+        upload_worker.await.unwrap();
+        let upload = state.storage.get_file_transfer("hdfs-native-upload-success").await.unwrap().unwrap();
+        assert_eq!(upload.status, "completed", "{upload:?}");
+        assert_eq!(upload.publish_outcome.as_deref(), Some("completed"), "{upload:?}");
+        wait_for_proxy_subset(&namenode_control, &upload_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &upload_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        assert_eq!(
+            operator.read(&prepared.configured_path("hdfs-native-upload-target.bin").unwrap()).await.unwrap().to_vec(),
+            upload_payload
+        );
+
+        reset_test_remote_copy_high_water();
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let copy_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let copy_datanode_baseline = proxy_active_pairs(&datanode_control);
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-copy-success",
+            "copy",
+            &source,
+            "hdfs-native-copy-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let copy = state.storage.get_file_transfer("hdfs-native-copy-success").await.unwrap().unwrap();
+        assert_eq!(copy.status, "completed", "{copy:?}");
+        assert_eq!(copy.bytes_transferred, 32 * 1024 * 1024, "{copy:?}");
+        assert_eq!(copy.operation_outcome.as_deref(), Some("completed"), "{copy:?}");
+        let (max_read_chunk, max_write_chunk, max_relay_payload) = test_remote_copy_high_water();
+        assert!((1..=REMOTE_COPY_BUFFER_SIZE).contains(&max_read_chunk), "{max_read_chunk}");
+        assert!((1..=REMOTE_COPY_BUFFER_SIZE).contains(&max_write_chunk), "{max_write_chunk}");
+        assert!((1..=REMOTE_COPY_BUFFER_SIZE).contains(&max_relay_payload), "{max_relay_payload}");
+        wait_for_proxy_subset(&namenode_control, &copy_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &copy_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        let copy_path = prepared.configured_path("hdfs-native-copy-target.bin").unwrap();
+        assert_eq!(operator.stat(&copy_path).await.unwrap().content_length(), 32 * 1024 * 1024);
+        assert_eq!(operator.read(&copy_path).await.unwrap().to_vec(), vec![0x4d_u8; 32 * 1024 * 1024]);
+
+        let datanode_opens_before_rename = proxy_open_count(&datanode_trace);
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let rename_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let rename_datanode_baseline = proxy_active_pairs(&datanode_control);
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-rename-success",
+            "rename",
+            "hdfs-native-copy-target.bin",
+            "hdfs-native-rename-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let rename = state.storage.get_file_transfer("hdfs-native-rename-success").await.unwrap().unwrap();
+        assert_eq!(rename.status, "completed", "{rename:?}");
+        wait_for_proxy_subset(&namenode_control, &rename_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &rename_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        assert_eq!(operator.stat(&copy_path).await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        let renamed_path = prepared.configured_path("hdfs-native-rename-target.bin").unwrap();
+        assert_eq!(operator.stat(&renamed_path).await.unwrap().content_length(), 32 * 1024 * 1024);
+        assert_eq!(
+            proxy_open_count(&datanode_trace),
+            datanode_opens_before_rename,
+            "HDFS Native rename must not open a DataNode relay"
+        );
+
+        let no_clobber_source = prepared.configured_path("hdfs-native-no-clobber-source.bin").unwrap();
+        let no_clobber_target = prepared.configured_path("hdfs-native-no-clobber-target.bin").unwrap();
+        operator.write(&no_clobber_source, b"source".to_vec()).await.unwrap();
+        operator.write(&no_clobber_target, b"keep".to_vec()).await.unwrap();
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let no_clobber_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let no_clobber_datanode_baseline = proxy_active_pairs(&datanode_control);
+        create_remote_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-rename-no-clobber",
+            "rename",
+            "hdfs-native-no-clobber-source.bin",
+            "hdfs-native-no-clobber-target.bin",
+        )
+        .await
+        .await
+        .unwrap();
+        let no_clobber = state.storage.get_file_transfer("hdfs-native-rename-no-clobber").await.unwrap().unwrap();
+        assert_eq!(no_clobber.status, "failed", "{no_clobber:?}");
+        wait_for_proxy_subset(&namenode_control, &no_clobber_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &no_clobber_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        assert_eq!(operator.read(&no_clobber_source).await.unwrap().to_vec(), b"source");
+        assert_eq!(operator.read(&no_clobber_target).await.unwrap().to_vec(), b"keep");
+
+        let datanode_opens_before_replace = proxy_open_count(&datanode_trace);
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let replace_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let replace_datanode_baseline = proxy_active_pairs(&datanode_control);
+        create_remote_worker_transfer_with_policy(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-rename-replace",
+            "rename",
+            "hdfs-native-no-clobber-source.bin",
+            "hdfs-native-no-clobber-target.bin",
+            RemoteMutationPolicy::Replace { confirmed: true },
+        )
+        .await
+        .await
+        .unwrap();
+        let replace = state.storage.get_file_transfer("hdfs-native-rename-replace").await.unwrap().unwrap();
+        assert_eq!(replace.status, "completed", "{replace:?}");
+        wait_for_proxy_subset(&namenode_control, &replace_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &replace_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        assert_eq!(operator.stat(&no_clobber_source).await.unwrap_err().kind(), opendal::ErrorKind::NotFound);
+        assert_eq!(
+            proxy_open_count(&datanode_trace),
+            datanode_opens_before_replace,
+            "HDFS Native replace rename must not open a DataNode relay"
+        );
+        assert_eq!(operator.read(&no_clobber_target).await.unwrap().to_vec(), b"source");
+
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let cancel_download_uncached_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let cancel_download_uncached_datanode_baseline = proxy_active_pairs(&datanode_control);
+        warm_hdfs_read_cache(file_manager.inner(), &state).await;
+        wait_for_proxy_subset(&datanode_control, &cancel_download_uncached_datanode_baseline).await;
+        let cancel_download_datanode_baseline = proxy_active_pairs(&datanode_control);
+        let download_cancel_barrier = install_test_download_after_chunk_barrier();
+        let cancelled_download_target = local_root.join("hdfs-native-download-cancelled.bin");
+        let (_, cancelled_download_worker) = create_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-download-cancelled",
+            &source,
+            &cancelled_download_target,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), download_cancel_barrier.opened.notified())
+            .await
+            .expect("HDFS Native download did not complete its first DataNode chunk");
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            file_manager.inner(),
+            "hdfs-native-download-cancelled",
+        )
+        .await
+        .unwrap();
+        download_cancel_barrier.release.notify_one();
+        cancelled_download_worker.await.unwrap();
+        let cancelled_download =
+            state.storage.get_file_transfer("hdfs-native-download-cancelled").await.unwrap().unwrap();
+        assert_eq!(cancelled_download.status, "cancelled", "{cancelled_download:?}");
+        assert!(cancelled_download.bytes_transferred > 0, "{cancelled_download:?}");
+        assert!(!cancelled_download_target.exists());
+        assert_no_owned_temp(&local_root, "hdfs-native-download-cancelled");
+        wait_for_proxy_subset(&datanode_control, &cancel_download_datanode_baseline).await;
+        assert_eq!(file_manager.operator_count(), 0, "cancelled download must evict its read-cache operator");
+        wait_for_proxy_subset(&namenode_control, &cancel_download_uncached_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &cancel_download_uncached_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+
+        let cancelled_upload_source = local_root.join("hdfs-native-upload-cancelled-source.bin");
+        tokio::fs::write(&cancelled_upload_source, vec![0x37_u8; 32 * 1024 * 1024 + 137]).await.unwrap();
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let cancel_upload_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let cancel_upload_datanode_baseline = proxy_active_pairs(&datanode_control);
+        let upload_cancel_barrier = install_test_upload_after_chunk_barrier();
+        let (_, cancelled_upload_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-upload-cancelled",
+            "hdfs-native-upload-cancelled.bin",
+            &cancelled_upload_source,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(15), upload_cancel_barrier.opened.notified())
+            .await
+            .expect("HDFS Native upload did not complete its first DataNode chunk");
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            file_manager.inner(),
+            "hdfs-native-upload-cancelled",
+        )
+        .await
+        .unwrap();
+        upload_cancel_barrier.release.notify_one();
+        cancelled_upload_worker.await.unwrap();
+        let cancelled_upload = state.storage.get_file_transfer("hdfs-native-upload-cancelled").await.unwrap().unwrap();
+        assert_eq!(cancelled_upload.status, "cancelled", "{cancelled_upload:?}");
+        assert!(cancelled_upload.bytes_transferred > 0, "{cancelled_upload:?}");
+        assert_eq!(cancelled_upload.partial_destination, None, "{cancelled_upload:?}");
+        wait_for_proxy_subset(&namenode_control, &cancel_upload_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &cancel_upload_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        assert!(!operator
+            .exists(&prepared.configured_path("hdfs-native-upload-cancelled.bin").unwrap())
+            .await
+            .unwrap());
+        assert_no_hdfs_owned_partial(operator, "hdfs-native-upload-cancelled", "hdfs-native-upload-cancelled.bin")
+            .await;
+
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let cancel_copy_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let cancel_copy_datanode_baseline = proxy_active_pairs(&datanode_control);
+        let copy_cancel_barrier = install_test_remote_copy_after_chunk_barrier();
+        let cancelled_copy_worker = create_remote_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-copy-cancelled",
+            "copy",
+            &source,
+            "hdfs-native-copy-cancelled.bin",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(20), copy_cancel_barrier.opened.notified())
+            .await
+            .expect("HDFS Native copy did not complete its first relay chunk");
+        cancel_file_transfer_inner(
+            app.handle(),
+            &state,
+            app.state::<FileTransferRuntime>().inner(),
+            file_manager.inner(),
+            "hdfs-native-copy-cancelled",
+        )
+        .await
+        .unwrap();
+        copy_cancel_barrier.release.notify_one();
+        cancelled_copy_worker.await.unwrap();
+        let cancelled_copy = state.storage.get_file_transfer("hdfs-native-copy-cancelled").await.unwrap().unwrap();
+        assert_eq!(cancelled_copy.status, "cancelled", "{cancelled_copy:?}");
+        assert!(cancelled_copy.bytes_transferred > 0, "{cancelled_copy:?}");
+        wait_for_proxy_subset(&namenode_control, &cancel_copy_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &cancel_copy_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        assert_no_hdfs_owned_partial(operator, "hdfs-native-copy-cancelled", "hdfs-native-copy-cancelled.bin").await;
+
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let reset_recovery_uncached_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let reset_recovery_uncached_datanode_baseline = proxy_active_pairs(&datanode_control);
+        warm_hdfs_read_cache(file_manager.inner(), &state).await;
+        wait_for_proxy_subset(&datanode_control, &reset_recovery_uncached_datanode_baseline).await;
+        let reset_recovery_datanode_baseline = proxy_active_pairs(&datanode_control);
+        let reset_recovery_label = "hdfs-download-reset-recovery";
+        post_fault_control(
+            &datanode_control,
+            &format!(
+                "/arm?action=reset&direction=downstream&bytes={}&label={reset_recovery_label}&scope=next",
+                128 * 1024
+            ),
+        );
+        let reset_recovery_target = local_root.join("hdfs-native-download-reset-recovery.bin");
+        let (_, reset_recovery_worker) = create_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-download-reset-recovery",
+            &source,
+            &reset_recovery_target,
+        )
+        .await;
+        let _reset_recovery_pair = wait_for_fault_trigger(&datanode_trace, reset_recovery_label).await;
+        tokio::time::timeout(Duration::from_secs(15), reset_recovery_worker)
+            .await
+            .expect("HDFS Native download did not recover from the transient DataNode reset")
+            .unwrap();
+        let reset_recovery =
+            state.storage.get_file_transfer("hdfs-native-download-reset-recovery").await.unwrap().unwrap();
+        assert_eq!(reset_recovery.status, "completed", "{reset_recovery:?}");
+        assert_eq!(reset_recovery.bytes_transferred, 32 * 1024 * 1024, "{reset_recovery:?}");
+        assert_eq!(reset_recovery.error, None, "{reset_recovery:?}");
+        assert_eq!(tokio::fs::read(&reset_recovery_target).await.unwrap(), vec![0x4d_u8; 32 * 1024 * 1024]);
+        assert_no_owned_temp(&local_root, "hdfs-native-download-reset-recovery");
+        wait_for_proxy_subset(&datanode_control, &reset_recovery_datanode_baseline).await;
+        assert_eq!(file_manager.operator_count(), 1, "recovered download must retain its warmed read-cache operator");
+        file_manager.evict_revision("hdfs-native-contract", connection.revision);
+        assert_eq!(file_manager.operator_count(), 0, "download read-cache eviction must remove the cached operator");
+        wait_for_proxy_subset(&namenode_control, &reset_recovery_uncached_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &reset_recovery_uncached_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+
+        let timeout_label = "hdfs-upload-timeout";
+        let timeout_source = local_root.join("hdfs-native-upload-timeout-source.bin");
+        tokio::fs::write(&timeout_source, vec![0x6b_u8; 32 * 1024 * 1024 + 137]).await.unwrap();
+        post_fault_control(
+            &datanode_control,
+            &format!("/arm?action=blackhole&direction=upstream&bytes={}&label={timeout_label}&scope=next", 128 * 1024),
+        );
+        assert_eq!(file_manager.operator_count(), 0, "mutation paths must not retain a read-cache operator");
+        let timeout_upload_namenode_baseline = proxy_active_pairs(&namenode_control);
+        let timeout_upload_datanode_baseline = proxy_active_pairs(&datanode_control);
+        let (_, timeout_worker) = create_upload_worker_transfer_for_connection(
+            &app,
+            "hdfs-native-contract",
+            "hdfs-native-upload-timeout",
+            "hdfs-native-upload-timeout.bin",
+            &timeout_source,
+        )
+        .await;
+        let timeout_pair = wait_for_fault_trigger(&datanode_trace, timeout_label).await;
+        tokio::time::timeout(IO_PROGRESS_WATCHDOG + Duration::from_secs(15), timeout_worker)
+            .await
+            .expect("timed-out HDFS Native upload did not terminate")
+            .unwrap();
+        wait_for_proxy_client_release(&datanode_trace, timeout_pair, timeout_label, true).await;
+        let mut timeout_upload_datanode_fault_baseline = timeout_upload_datanode_baseline.clone();
+        timeout_upload_datanode_fault_baseline.insert(timeout_pair);
+        wait_for_proxy_subset_including(&datanode_control, &timeout_upload_datanode_fault_baseline, timeout_pair).await;
+        wait_for_proxy_subset(&namenode_control, &timeout_upload_namenode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        post_fault_control(&datanode_control, "/drop");
+        let timed_out = state.storage.get_file_transfer("hdfs-native-upload-timeout").await.unwrap().unwrap();
+        assert!(matches!(timed_out.status.as_str(), "failed" | "partial"), "{timed_out:?}");
+        assert!(
+            timed_out.error.as_deref().is_some_and(|error| {
+                error.contains("HdfsNativeTimeout:")
+                    || error.contains("timed out")
+                    || error.contains("watchdog expired")
+            }),
+            "{timed_out:?}"
+        );
+        wait_for_proxy_subset(&namenode_control, &timeout_upload_namenode_baseline).await;
+        wait_for_proxy_subset(&datanode_control, &timeout_upload_datanode_baseline).await;
+        assert_proxy_traffic_quiet(&namenode_control).await;
+        assert_proxy_traffic_quiet(&datanode_control).await;
+        assert_no_hdfs_owned_partial(operator, "hdfs-native-upload-timeout", "hdfs-native-upload-timeout.bin").await;
+
+        let recovery_id = "hdfs-native-upload-recovery";
+        let recovery_partial = format!(".dbx-upload-{recovery_id}-fixed.part");
+        operator.write(&recovery_partial, b"recovery".to_vec()).await.unwrap();
+        state
+            .storage
+            .create_file_upload_transfer(
+                recovery_id.into(),
+                "hdfs-native-contract".into(),
+                "hdfs-native-upload-recovery-target.bin".into(),
+                local_root.join("missing-recovery-source.bin").to_string_lossy().into_owned(),
+                canonical_directory_identity(&local_root),
+                "recovery-source-fingerprint".into(),
+                8,
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .start_file_upload_transfer(
+                recovery_id,
+                recovery_partial.clone(),
+                "recovery-source-fingerprint".into(),
+                8,
+                connection.revision,
+            )
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_file_transfer(
+                recovery_id,
+                "publishing".into(),
+                8,
+                Some(8),
+                Some(recovery_partial.clone()),
+                Some("recovery-source-fingerprint".into()),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let interrupted = state
+            .storage
+            .recover_interrupted_file_transfers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == recovery_id)
+            .unwrap();
+        recover_interrupted_transfer(&state, file_manager.inner(), &interrupted).await.unwrap();
+        let recovered = state.storage.get_file_transfer(recovery_id).await.unwrap().unwrap();
+        assert_eq!(recovered.status, "partial", "{recovered:?}");
+        assert_eq!(recovered.publish_outcome.as_deref(), Some("partial_source"), "{recovered:?}");
+        prepared.delete_owned_upload_partial(&recovery_partial).await.unwrap();
+        assert_no_hdfs_owned_partial(operator, recovery_id, "hdfs-native-upload-recovery-target.bin").await;
+
+        let namenode_fault_cases = [
+            (
+                "reset",
+                "upstream",
+                "hdfs-rename-namenode-reset-recovery",
+                "hdfs-native-nn-reset-recovery-source.bin",
+                "hdfs-native-nn-reset-recovery-target.bin",
+                b"namenode reset recovery payload".as_slice(),
+            ),
+            (
+                "blackhole",
+                "downstream",
+                "hdfs-rename-response-loss",
+                "hdfs-native-nn-blackhole-source.bin",
+                "hdfs-native-nn-blackhole-target.bin",
+                b"namenode blackhole payload".as_slice(),
+            ),
+        ];
+        for (_, _, _, source_path, _, payload) in namenode_fault_cases {
+            operator.write(&prepared.configured_path(source_path).unwrap(), payload.to_vec()).await.unwrap();
+        }
+        drop(prepared);
+        file_manager.evict_revision("hdfs-native-contract", connection.revision);
+        let no_proxy_pairs = BTreeSet::new();
+        wait_for_proxy_baseline(&namenode_control, &no_proxy_pairs).await;
+        wait_for_proxy_baseline(&datanode_control, &no_proxy_pairs).await;
+
+        for (action, direction, label, source_path, destination_path, payload) in namenode_fault_cases {
+            let datanode_opens_before_rename = proxy_open_count(&datanode_trace);
+            let dispatch_barrier = install_test_hdfs_native_rename_before_dispatch_barrier();
+            let worker = create_remote_worker_transfer_for_connection(
+                &app,
+                "hdfs-native-contract",
+                label,
+                "rename",
+                source_path,
+                destination_path,
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(10), dispatch_barrier.opened.notified())
+                .await
+                .expect("HDFS Native rename did not finish preflight before NameNode fault arming");
+            post_fault_control(
+                &namenode_control,
+                &format!("/arm?action={action}&direction={direction}&bytes=1&label={label}&scope=next"),
+            );
+            dispatch_barrier.release.notify_one();
+            let fault_pair = wait_for_fault_trigger(&namenode_trace, label).await;
+            let worker_deadline = if action == "blackhole" {
+                IO_PROGRESS_WATCHDOG + Duration::from_secs(15)
+            } else {
+                Duration::from_secs(20)
+            };
+            tokio::time::timeout(worker_deadline, worker)
+                .await
+                .unwrap_or_else(|_| panic!("{label} rename worker did not reach a controlled terminal state"))
+                .unwrap();
+            if action == "blackhole" {
+                wait_for_proxy_client_release(&namenode_trace, fault_pair, label, false).await;
+            }
+
+            let result = state.storage.get_file_transfer(label).await.unwrap().unwrap();
+            if action == "reset" {
+                assert_eq!(result.status, "completed", "{result:?}");
+                assert_eq!(result.operation_outcome.as_deref(), Some("completed"), "{result:?}");
+                assert_eq!(result.error.as_deref(), None, "{result:?}");
+            } else {
+                assert!(matches!(result.status.as_str(), "failed" | "partial"), "{result:?}");
+                assert!(
+                    matches!(
+                        result.operation_outcome.as_deref(),
+                        Some("destination_state_unknown")
+                            | Some("move_committed_response_unknown")
+                            | Some("destination_present_unproven")
+                    ),
+                    "{result:?}"
+                );
+                let error = result.error.as_deref().expect("faulted rename must persist a classified error");
+                let lower = error.to_ascii_lowercase();
+                assert!(
+                    error.contains("HdfsNativeTimeout:") || lower.contains("timed out") || lower.contains("watchdog"),
+                    "NameNode blackhole was not classified as a timeout: {error}"
+                );
+                for secret in [
+                    std::env::var("DBX_TEST_HDFS_NATIVE_CONTRACT_USER").unwrap(),
+                    std::env::var("DBX_TEST_HDFS_NATIVE_ROOT").unwrap(),
+                    "token".to_string(),
+                ] {
+                    assert!(!error.to_ascii_lowercase().contains(&secret.to_ascii_lowercase()), "{error}");
+                }
+            }
+            assert_eq!(file_manager.operator_count(), 0, "HDFS Native rename must not retain a cached operator");
+            let retained_fault_pairs = BTreeSet::from([fault_pair]);
+            if action == "blackhole" {
+                wait_for_proxy_baseline(&namenode_control, &retained_fault_pairs).await;
+            } else {
+                wait_for_proxy_baseline(&namenode_control, &no_proxy_pairs).await;
+            }
+            wait_for_proxy_baseline(&datanode_control, &no_proxy_pairs).await;
+            if action == "blackhole" {
+                assert_proxy_traffic_quiet(&namenode_control).await;
+                assert_proxy_traffic_quiet(&datanode_control).await;
+            }
+            assert_eq!(
+                proxy_open_count(&datanode_trace),
+                datanode_opens_before_rename,
+                "HDFS Native rename must not open a DataNode relay"
+            );
+
+            let warmed = file_manager
+                .prepare_file_mutation_operation(&state, "hdfs-native-contract", source_path, connection.revision)
+                .await
+                .unwrap();
+            let source = warmed.configured_path(source_path).unwrap();
+            let destination = warmed.configured_path(destination_path).unwrap();
+            let source_exists = warmed.operator.exists(&source).await.unwrap();
+            let destination_exists = warmed.operator.exists(&destination).await.unwrap();
+            if action == "reset" {
+                assert!(!source_exists, "{result:?}");
+                assert!(destination_exists, "{result:?}");
+            } else {
+                assert_ne!(source_exists, destination_exists, "{result:?}");
+            }
+            let survivor = if source_exists { &source } else { &destination };
+            assert_eq!(warmed.operator.read(survivor).await.unwrap().to_vec(), payload);
+            assert_eq!(file_manager.operator_count(), 0);
+            drop(warmed);
+            assert_eq!(file_manager.operator_count(), 0);
+            if action == "blackhole" {
+                wait_for_proxy_baseline(&namenode_control, &retained_fault_pairs).await;
+                wait_for_proxy_baseline(&datanode_control, &no_proxy_pairs).await;
+                assert_proxy_traffic_quiet(&namenode_control).await;
+                assert_proxy_traffic_quiet(&datanode_control).await;
+                post_fault_control(&namenode_control, "/drop");
+            }
+            wait_for_proxy_baseline(&namenode_control, &no_proxy_pairs).await;
+            wait_for_proxy_baseline(&datanode_control, &no_proxy_pairs).await;
+            assert_proxy_traffic_quiet(&namenode_control).await;
+            assert_proxy_traffic_quiet(&datanode_control).await;
+        }
+    }
+
     #[tokio::test]
     #[ignore = "run through tests/sftp-contract.sh with a digest-pinned OpenSSH server"]
     async fn fixed_sftp_transfer_contract() {
@@ -7518,6 +8555,27 @@ mod tests {
         source_path: &str,
         destination_path: &str,
     ) -> tokio::task::JoinHandle<()> {
+        create_remote_worker_transfer_with_policy(
+            app,
+            connection_id,
+            transfer_id,
+            operation,
+            source_path,
+            destination_path,
+            RemoteMutationPolicy::BestEffortNoClobber { atomic_no_clobber: false, external_toctou_risk: true },
+        )
+        .await
+    }
+
+    async fn create_remote_worker_transfer_with_policy<R: Runtime>(
+        app: &tauri::App<R>,
+        connection_id: &str,
+        transfer_id: &str,
+        operation: &'static str,
+        source_path: &str,
+        destination_path: &str,
+        policy: RemoteMutationPolicy,
+    ) -> tokio::task::JoinHandle<()> {
         let state = app.state::<Arc<AppState>>();
         let connection = state.storage.load_file_connection(connection_id).await.unwrap().unwrap();
         state
@@ -7542,15 +8600,7 @@ mod tests {
         let transfer_id = transfer_id.to_string();
         let connection_id = connection_id.to_string();
         tokio::spawn(async move {
-            run_remote_transfer_worker(
-                app_handle,
-                transfer_id,
-                connection_id,
-                cancellation,
-                operation,
-                RemoteMutationPolicy::BestEffortNoClobber { atomic_no_clobber: false, external_toctou_risk: true },
-            )
-            .await;
+            run_remote_transfer_worker(app_handle, transfer_id, connection_id, cancellation, operation, policy).await;
         })
     }
 

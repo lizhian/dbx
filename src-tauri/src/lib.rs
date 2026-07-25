@@ -101,6 +101,13 @@ pub(crate) fn apply_debug_log_level(debug_logging_enabled: bool) {
     log::set_max_level(if debug_logging_enabled { log::LevelFilter::Debug } else { log::LevelFilter::Off });
 }
 
+fn dependency_log_allowed(target: &str, level: log::Level) -> bool {
+    let sensitive_hdfs_target = ["hdfs_native", "opendal_service_hdfs_native"]
+        .iter()
+        .any(|prefix| target == *prefix || target.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with("::")));
+    !sensitive_hdfs_target || level == log::Level::Error
+}
+
 fn should_hide_window_on_close(target_os: &str) -> bool {
     matches!(target_os, "macos" | "windows")
 }
@@ -793,17 +800,36 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_system_gtk_immodules_cache,
-        linux_appimage_wayland_backend_override, linux_nvidia_driver_from_state, linux_selected_drm_render_device,
-        linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
-        should_enable_single_instance, should_fallback_to_native_quit, should_hide_window_on_close,
-        should_setup_desktop_tray, should_show_main_window_after_setup, tray_menu_labels_for_locale,
-        uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
+        app_menu_copy_support_info_label, app_menu_quit_label, dependency_log_allowed,
+        linux_appimage_system_gtk_immodules_cache, linux_appimage_wayland_backend_override,
+        linux_nvidia_driver_from_state, linux_selected_drm_render_device, linux_webkit_rendering_workarounds,
+        native_window_decorations_override, should_confirm_app_exit_request, should_enable_single_instance,
+        should_fallback_to_native_quit, should_hide_window_on_close, should_setup_desktop_tray,
+        should_show_main_window_after_setup, tray_menu_labels_for_locale, uses_application_level_icon,
+        LinuxDrmRenderDevice, LinuxNvidiaDriver,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
     const TEST_GTK3_IMMODULES_CACHE: &str = "/usr/lib/test/gtk-3.0/3.0.0/immodules.cache";
+
+    #[test]
+    fn suppresses_sensitive_hdfs_dependency_debug_logs() {
+        for target in [
+            "hdfs_native",
+            "hdfs_native::block_writer",
+            "opendal_service_hdfs_native",
+            "opendal_service_hdfs_native::backend",
+        ] {
+            assert!(!dependency_log_allowed(target, log::Level::Debug));
+            assert!(!dependency_log_allowed(target, log::Level::Trace));
+            assert!(!dependency_log_allowed(target, log::Level::Info));
+            assert!(!dependency_log_allowed(target, log::Level::Warn));
+            assert!(dependency_log_allowed(target, log::Level::Error));
+        }
+        assert!(dependency_log_allowed("hdfs_native_like", log::Level::Debug));
+        assert!(dependency_log_allowed("dbx::hdfs_native", log::Level::Debug));
+    }
 
     #[test]
     fn tray_menu_labels_follow_locale() {
@@ -1205,6 +1231,7 @@ pub fn run() {
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
+                    .filter(|metadata| dependency_log_allowed(metadata.target(), metadata.level()))
                     .format(|out, message, record| {
                         out.finish(format_args!(
                             "[{}][{}][{}] {}",
