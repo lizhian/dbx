@@ -17,17 +17,19 @@ export interface SftpFileConnectionConfig {
   authentication: { method: "ssh_config" | "ssh_agent" | "private_key" };
 }
 
+export interface S3FileConnectionConfig {
+  protocol: "s3";
+  endpoint: string;
+  region: string;
+  bucket: string;
+  root: string;
+  pathStyle: boolean;
+}
+
 export type FileConnectionConfig =
   | FtpFileConnectionConfig
   | SftpFileConnectionConfig
-  | {
-      protocol: "s3";
-      endpoint: string;
-      region: string;
-      bucket: string;
-      root: string;
-      pathStyle: boolean;
-    }
+  | S3FileConnectionConfig
   | {
       protocol: "webdav";
       endpoint: string;

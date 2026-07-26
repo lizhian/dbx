@@ -314,6 +314,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s3_credentials_are_required_and_never_stored_in_public_config() {
+        let storage = storage("s3-secrets").await;
+        let mut request = SaveFileConnectionRequest {
+            id: "s3-1".to_string(),
+            name: "Local S3".to_string(),
+            config: FileConnectionConfig::S3 {
+                endpoint: "http://127.0.0.1:9000".to_string(),
+                region: "us-east-1".to_string(),
+                bucket: "dbx".to_string(),
+                root: "/root/".to_string(),
+                path_style: true,
+            },
+            secrets: FileSecretUpdates::default(),
+        };
+        assert_eq!(save_connection(&storage, request.clone()).await.unwrap_err().code, "configuration");
+
+        request.secrets.access_key = SecretUpdate::Set("secret-access".to_string());
+        request.secrets.secret_key = SecretUpdate::Set("secret-value".to_string());
+        request.secrets.session_token = SecretUpdate::Set("secret-session".to_string());
+        let saved = save_connection(&storage, request).await.unwrap();
+        assert!(saved.secret_status.access_key);
+        assert!(saved.secret_status.secret_key);
+        assert!(saved.secret_status.session_token);
+        let public = serde_json::to_string(&list_connections(&storage).await.unwrap()).unwrap();
+        for secret in ["secret-access", "secret-value", "secret-session"] {
+            assert!(!public.contains(secret));
+        }
+        let stored = serde_json::to_string(&storage.load_file_connections().await.unwrap()).unwrap();
+        for secret in ["secret-access", "secret-value", "secret-session"] {
+            assert!(!stored.contains(secret));
+        }
+    }
+
+    #[tokio::test]
     async fn deleting_a_file_connection_removes_its_secrets_only() {
         let storage = storage("delete").await;
         save_connection(&storage, ftp_request("ftp-1", SecretUpdate::Set("one".to_string()))).await.unwrap();

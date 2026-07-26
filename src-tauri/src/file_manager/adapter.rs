@@ -93,7 +93,11 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
             }
         }
         FileConnectionConfig::S3 { endpoint, region, bucket, root, path_style } => {
+            validate_required("S3 endpoint", endpoint)?;
+            validate_required("S3 region", region)?;
             validate_required("S3 bucket", bucket)?;
+            validate_required("S3 access key", secrets.get("access_key"))?;
+            validate_required("S3 secret key", secrets.get("secret_key"))?;
             let mut builder = services::S3::default()
                 .endpoint(endpoint)
                 .region(region)

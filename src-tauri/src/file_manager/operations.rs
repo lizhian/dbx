@@ -52,7 +52,7 @@ pub async fn rename(
     }
 }
 
-async fn fallback_rename_with_delete<F, Fut>(
+pub(crate) async fn fallback_rename_with_delete<F, Fut>(
     operator: &Operator,
     source: &str,
     destination: &str,

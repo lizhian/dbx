@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type { FileConnection } from "@/types/fileManager";
 import FileConnectionDialog from "./FileConnectionDialog.vue";
-import { createFileConnectionDraft, createFtpConnectionDraft, fileConnectionRequestFromDraft, ftpPasswordUpdate, sftpPrivateKeyUpdate } from "./fileConnectionDraft";
+import { createFileConnectionDraft, createFtpConnectionDraft, fileConnectionRequestFromDraft, ftpPasswordUpdate, s3AccessKeyUpdate, s3SecretKeyUpdate, s3SessionTokenUpdate, sftpPrivateKeyUpdate } from "./fileConnectionDraft";
 
 vi.mock("@/lib/backend/api", () => ({
   listFileConnections: vi.fn(async () => []),
@@ -94,6 +94,43 @@ const sftpConnection: FileConnection = {
   },
 };
 
+const s3Connection: FileConnection = {
+  id: "s3-local",
+  name: "Local S3",
+  config: {
+    protocol: "s3",
+    endpoint: "http://127.0.0.1:9000",
+    region: "us-east-1",
+    bucket: "dbx",
+    root: "/root/",
+    pathStyle: true,
+  },
+  capabilities: {
+    read: true,
+    write: true,
+    stat: true,
+    list: true,
+    delete: true,
+    copy: true,
+    rename: true,
+    nativeCopy: true,
+    nativeRename: false,
+    atomicRename: false,
+    atomicNoClobber: false,
+    copyMode: "native",
+    renameMode: "copy_delete",
+  },
+  secretStatus: {
+    password: false,
+    privateKey: false,
+    accessKey: true,
+    secretKey: true,
+    sessionToken: true,
+    bearerToken: false,
+    delegationToken: false,
+  },
+};
+
 async function mountDialog(selectedConnection: FileConnection = connection) {
   const container = document.createElement("div");
   document.body.append(container);
@@ -176,5 +213,44 @@ describe("FileConnectionDialog SFTP lifecycle form", () => {
     expect(sftpPrivateKeyUpdate(draft)).toEqual({ action: "clear" });
     draft.authentication = "ssh_agent";
     expect(fileConnectionRequestFromDraft(draft).secrets?.privateKey).toEqual({ action: "clear" });
+  });
+});
+
+describe("FileConnectionDialog S3 lifecycle form", () => {
+  it("shows only S3 configuration and keeps all three saved credentials hidden", async () => {
+    await mountDialog(s3Connection);
+
+    expect(document.querySelector<HTMLInputElement>("#file-connection-endpoint")?.value).toBe("http://127.0.0.1:9000");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-region")?.value).toBe("us-east-1");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-bucket")?.value).toBe("dbx");
+    expect(document.querySelector("#file-connection-port")).toBeNull();
+    expect(document.querySelector("#file-connection-username")).toBeNull();
+    expect(document.querySelector("#file-connection-password")).toBeNull();
+    expect(document.querySelector<HTMLInputElement>("input#file-connection-access-key")?.value).toBe("");
+    expect(document.querySelector<HTMLInputElement>("input#file-connection-secret-key")?.value).toBe("");
+    expect(document.querySelector<HTMLInputElement>("input#file-connection-session-token")?.value).toBe("");
+    expect(document.body.textContent).not.toContain("SSH agent");
+  });
+
+  it("round-trips path-style and models Set, Keep, and Clear for S3 credentials", () => {
+    const draft = createFileConnectionDraft(s3Connection);
+    expect(draft.pathStyle).toBe(true);
+    expect(s3AccessKeyUpdate(draft)).toEqual({ action: "keep" });
+    expect(s3SecretKeyUpdate(draft)).toEqual({ action: "keep" });
+    expect(s3SessionTokenUpdate(draft)).toEqual({ action: "keep" });
+
+    draft.accessKey = "replacement-access";
+    draft.secretKey = "replacement-secret";
+    draft.clearSessionToken = true;
+    const request = fileConnectionRequestFromDraft(draft);
+    expect(request.config).toMatchObject({ protocol: "s3", pathStyle: true });
+    expect(request.secrets).toEqual({
+      accessKey: { action: "set", value: "replacement-access" },
+      secretKey: { action: "set", value: "replacement-secret" },
+      sessionToken: { action: "clear" },
+    });
+    const config = JSON.stringify(request.config);
+    expect(config).not.toContain("replacement-access");
+    expect(config).not.toContain("replacement-secret");
   });
 });
