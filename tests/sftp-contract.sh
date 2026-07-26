@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# LinuxServer's immutable multi-architecture manifest for OpenSSH 10.0p1-r9.
+# LinuxServer's immutable 10.0_p1-r9-ls210 release manifest; its bundled
+# OpenSSH package reports 10.0p2.
 image="lscr.io/linuxserver/openssh-server@sha256:3acac97f1b835860fbcc7fd4e9d6be3e0571f4742cdec97c1fe08ed07b8fc24c"
 port="${DBX_TEST_SFTP_PORT:-22220}"
 stall_port="${DBX_TEST_SFTP_STALL_PORT:-22221}"
@@ -228,7 +229,10 @@ start_sftp() {
   fi
 
   version="$(docker exec "${container}" ssh -V 2>&1)"
-  [[ "${version}" == OpenSSH_10.0p1* ]]
+  if [[ "${version}" != OpenSSH_10.0p2* ]]; then
+    echo "Pinned SFTP fixture reported an unexpected OpenSSH version: ${version}" >&2
+    exit 1
+  fi
 
   docker exec "${container}" sh -euc "
     mkdir -p '${contract_root}/nested'
