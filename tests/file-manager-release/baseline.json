@@ -1,0 +1,36 @@
+{
+  "schema_version": 2,
+  "matrix_id": "file-manager-v1-release",
+  "entries": [
+    {
+      "id": "performance-write-1gib",
+      "status": "legacy",
+      "notes": "Historical 2026-07-24 local Hadoop 3.4.1 simple-auth WebHDFS evidence; not current release evidence."
+    },
+    {
+      "id": "performance-write-10gib",
+      "status": "legacy",
+      "notes": "Historical 2026-07-24 local Hadoop 3.4.1 simple-auth WebHDFS evidence; not current release evidence."
+    },
+    {
+      "id": "performance-write-100gib",
+      "status": "legacy",
+      "notes": "Historical 2026-07-24 local Hadoop 3.4.1 simple-auth WebHDFS evidence; not current release evidence."
+    },
+    {
+      "id": "performance-relay-1gib",
+      "status": "legacy",
+      "notes": "Historical 2026-07-24 local Hadoop 3.4.1 simple-auth WebHDFS evidence; not current release evidence."
+    },
+    {
+      "id": "performance-relay-10gib",
+      "status": "legacy",
+      "notes": "Historical 2026-07-24 local Hadoop 3.4.1 simple-auth WebHDFS evidence; not current release evidence."
+    },
+    {
+      "id": "performance-relay-100gib",
+      "status": "legacy",
+      "notes": "Historical 2026-07-24 local Hadoop 3.4.1 simple-auth WebHDFS evidence; not current release evidence."
+    }
+  ]
+}

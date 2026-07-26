@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: write
+  actions: read
+  deployments: read
 
 env:
   CNB_REPOSITORY: "dbxio.com/dbx"
@@ -14,7 +16,76 @@ env:
   CNB_REGISTRY: "docker.cnb.cool"
 
 jobs:
+  file-manager-release-gate:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Download current-commit File Manager evidence
+        id: evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/file-manager-evidence.yml/runs?branch=main&event=push&head_sha=${GITHUB_SHA}&status=completed&per_page=20" \
+              --jq '[.workflow_runs[] | select(
+                .conclusion == "success" and
+                .event == "push" and
+                .head_branch == "main" and
+                .path == ".github/workflows/file-manager-evidence.yml" and
+                .head_repository.full_name == "'"${GITHUB_REPOSITORY}"'"
+              )][0] // empty'
+          )"
+          if [[ -z "$run" ]]; then
+            echo "No trusted main-branch push certification exists for ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+          run_id="$(jq -r '.id' <<<"$run")"
+          run_attempt="$(jq -r '.run_attempt' <<<"$run")"
+          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "run_attempt=$run_attempt" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/file-manager-evidence"
+          gh run download "$run_id" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "file-manager-release-evidence-${GITHUB_SHA}" \
+            --dir "$RUNNER_TEMP/file-manager-evidence"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/jobs?filter=latest&per_page=100" \
+            > "$RUNNER_TEMP/trusted-file-manager-run-jobs.json"
+          deployment_list="$(mktemp)"
+          deployment_lines="$(mktemp)"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/deployments?sha=${GITHUB_SHA}&per_page=100" \
+            > "$deployment_list"
+          : > "$deployment_lines"
+          while IFS= read -r deployment; do
+            statuses_url="$(jq -r '.statuses_url' <<<"$deployment")"
+            statuses_endpoint="${statuses_url#https://api.github.com/}"
+            statuses="$(gh api "${statuses_endpoint}?per_page=100")"
+            jq -c --argjson statuses "$statuses" \
+              '. + {statuses: $statuses}' <<<"$deployment" \
+              >> "$deployment_lines"
+          done < <(jq -c '.[]' "$deployment_list")
+          jq -s '{deployments: .}' "$deployment_lines" \
+            > "$RUNNER_TEMP/trusted-file-manager-deployments.json"
+      - name: Enforce File Manager release gate
+        run: |
+          node scripts/file-manager-release-report.mjs validate \
+            --matrix tests/file-manager-release/matrix.json \
+            --evidence "$RUNNER_TEMP/file-manager-evidence/file-manager-evidence.json" \
+            --commit "$GITHUB_SHA" \
+            --run-id "${{ steps.evidence.outputs.run_id }}" \
+            --run-attempt "${{ steps.evidence.outputs.run_attempt }}" \
+            --event push \
+            --ref refs/heads/main \
+            --artifact-root "$RUNNER_TEMP/file-manager-evidence/artifacts" \
+            --run-jobs "$RUNNER_TEMP/trusted-file-manager-run-jobs.json" \
+            --deployments "$RUNNER_TEMP/trusted-file-manager-deployments.json" \
+            --mode release
+
   nix-packaging:
+    needs: file-manager-release-gate
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -26,6 +97,7 @@ jobs:
         run: nix build .#dbx-desktop --no-link --print-build-logs
 
   bump-jdbc-plugin-version:
+    needs: file-manager-release-gate
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.bump.outputs.changed }}
@@ -79,6 +151,7 @@ jobs:
           git push origin HEAD:main
 
   build:
+    needs: file-manager-release-gate
     strategy:
       fail-fast: false
       matrix:
@@ -467,6 +540,7 @@ jobs:
             --assets-dir "$RUNNER_TEMP/release-assets"
 
   docker:
+    needs: file-manager-release-gate
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

@@ -1,0 +1,299 @@
+name: File Manager release evidence
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+jobs:
+  evidence-validator:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: node --test scripts/file-manager-release-report.test.mjs
+      - name: Confirm tracked baseline is NO-GO
+        shell: bash
+        run: |
+          node scripts/file-manager-release-report.mjs validate \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --event "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --mode audit
+
+  contracts:
+    needs: evidence-validator
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      DBX_REQUIRE_FULL_CONTRACT: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: contract-ftp
+            command: bash tests/ftp-contract.sh
+            image: delfer/alpine-ftp-server@sha256:60bb774d8408d9d4d5c74d05d1c086a34ce192c6c1a142ffac268cac0dbc6fac
+          - id: contract-sftp
+            command: bash tests/sftp-contract.sh
+            image: lscr.io/linuxserver/openssh-server@sha256:3acac97f1b835860fbcc7fd4e9d6be3e0571f4742cdec97c1fe08ed07b8fc24c
+          - id: contract-s3
+            command: bash tests/s3-contract.sh
+            image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e
+            image2: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3
+          - id: contract-webdav
+            command: bash tests/webdav-contract.sh
+            image: bytemark/webdav@sha256:bcabbc024c511b9c63ed3345f88573e31d84c952ee493c9acb3fe345f4f80f57
+          - id: contract-webhdfs
+            command: bash tests/webhdfs-contract.sh
+            image: apache/hadoop:3.4.1@sha256:69ffa97339aff768c4e6120c3fb27aa04c121402b1c8158408a5fb5be586a30e
+          - id: contract-hdfs-native
+            command: bash tests/hdfs-native-contract.sh
+            image: apache/hadoop:3.4.1@sha256:69ffa97339aff768c4e6120c3fb27aa04c121402b1c8158408a5fb5be586a30e
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libsecret-1-dev jq netcat-openbsd
+      - name: Run pinned service contract
+        id: contract
+        shell: bash
+        run: |
+          mkdir -p file-manager-evidence
+          set -o pipefail
+          ${{ matrix.command }} 2>&1 | tee "file-manager-evidence/${{ matrix.id }}.log"
+      - name: Record contract evidence
+        if: always()
+        shell: bash
+        run: |
+          status=failed
+          exit_code=1
+          job_conclusion=failure
+          if [[ "${{ steps.contract.outcome }}" == "success" ]]; then
+            status=passed
+            exit_code=0
+            job_conclusion=success
+          fi
+          touch "file-manager-evidence/${{ matrix.id }}.log"
+          service_image_args=(--service-image "${{ matrix.image }}")
+          if [[ -n "${{ matrix.image2 || '' }}" ]]; then
+            service_image_args+=(--service-image "${{ matrix.image2 }}")
+          fi
+          node scripts/file-manager-release-report.mjs record \
+            --id "${{ matrix.id }}" \
+            --status "$status" \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "$GITHUB_WORKFLOW" \
+            --workflow-path ".github/workflows/file-manager-evidence.yml" \
+            --event "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --job "contracts-${{ matrix.id }}" \
+            --command "${{ matrix.command }}" \
+            --runner-os "$RUNNER_OS" \
+            --job-conclusion "$job_conclusion" \
+            --artifact "file-manager-evidence/${{ matrix.id }}.log" \
+            --exit-code "$exit_code" \
+            "${service_image_args[@]}" \
+            --notes "Pinned Linux real-service contract." \
+            --output "file-manager-evidence/${{ matrix.id }}.json"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fm-evidence-${{ matrix.id }}
+          path: file-manager-evidence/${{ matrix.id }}.*
+          if-no-files-found: error
+
+  platform:
+    needs: evidence-validator
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            id: platform-compile-macos
+          - os: ubuntu-22.04
+            id: platform-compile-linux
+          - os: windows-2022
+            id: platform-compile-windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+      - name: Install Linux dependencies
+        if: matrix.id == 'platform-compile-linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libsecret-1-dev
+      - name: Compile platform contract surface
+        id: platform
+        shell: bash
+        run: |
+          mkdir -p file-manager-evidence
+          set -o pipefail
+          cargo test -p dbx --lib --no-default-features --no-run 2>&1 \
+            | tee "file-manager-evidence/${{ matrix.id }}.log"
+      - name: Record platform evidence
+        if: always()
+        shell: bash
+        run: |
+          status=failed
+          exit_code=1
+          job_conclusion=failure
+          if [[ "${{ steps.platform.outcome }}" == "success" ]]; then
+            status=passed
+            exit_code=0
+            job_conclusion=success
+          fi
+          touch "file-manager-evidence/${{ matrix.id }}.log"
+          node - \
+            "file-manager-evidence/${{ matrix.id }}.result" \
+            "${{ matrix.id }}" \
+            "$job_conclusion" <<'NODE'
+          const [path, rowId, jobConclusion] = process.argv.slice(2);
+          const result = {
+            schema_version: 1,
+            row_id: rowId,
+            kind: "platform-compile",
+            job_conclusion: jobConclusion,
+            compilation: { completed: jobConclusion === "success" },
+          };
+          require("node:fs").writeFileSync(path, `${JSON.stringify(result, null, 2)}\n`);
+          NODE
+          node scripts/file-manager-release-report.mjs record \
+            --id "${{ matrix.id }}" \
+            --status "$status" \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --workflow "$GITHUB_WORKFLOW" \
+            --workflow-path ".github/workflows/file-manager-evidence.yml" \
+            --event "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --job "${{ matrix.id }}" \
+            --command "cargo test -p dbx --lib --no-default-features --no-run" \
+            --runner-os "$RUNNER_OS" \
+            --job-conclusion "$job_conclusion" \
+            --artifact "file-manager-evidence/${{ matrix.id }}.result" \
+            --exit-code "$exit_code" \
+            --notes "Compilation and unit-test discovery on a real GitHub-hosted runner." \
+            --output "file-manager-evidence/${{ matrix.id }}.json"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fm-evidence-${{ matrix.id }}
+          path: file-manager-evidence/${{ matrix.id }}.*
+          if-no-files-found: error
+
+  desktop-behavior:
+    needs: evidence-validator
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v6
+      - run: pnpm install --frozen-lockfile
+      - name: Run current File Manager frontend behavior coverage
+        run: |
+          pnpm exec vitest run \
+            apps/desktop/src/components/file-manager/__tests__/FileManagerPage.spec.ts \
+            apps/desktop/src/components/file-manager/FileManagerPage.spec.ts
+      - name: Keep desktop E2E release row pending
+        run: |
+          echo "Component behavior coverage passed. This is not a real desktop E2E run."
+          echo "The desktop-e2e release row remains pending until a packaged desktop runner executes it."
+
+  report:
+    if: always()
+    needs: [evidence-validator, contracts, platform, desktop-behavior]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: fm-evidence-*
+          path: file-manager-evidence/raw
+          merge-multiple: true
+      - name: Download independent producer job attestation
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100" \
+            > file-manager-evidence/run-jobs.json
+      - name: Download independent deployment attestations
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          deployment_list="$(mktemp)"
+          deployment_lines="$(mktemp)"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/deployments?sha=${GITHUB_SHA}&per_page=100" \
+            > "$deployment_list"
+          : > "$deployment_lines"
+          while IFS= read -r deployment; do
+            statuses_url="$(jq -r '.statuses_url' <<<"$deployment")"
+            statuses_endpoint="${statuses_url#https://api.github.com/}"
+            statuses="$(gh api "${statuses_endpoint}?per_page=100")"
+            jq -c --argjson statuses "$statuses" \
+              '. + {statuses: $statuses}' <<<"$deployment" \
+              >> "$deployment_lines"
+          done < <(jq -c '.[]' "$deployment_list")
+          jq -s '{deployments: .}' "$deployment_lines" \
+            > file-manager-evidence/deployments.json
+      - name: Build fail-closed evidence report
+        shell: bash
+        run: |
+          mkdir -p file-manager-evidence/bundle/artifacts
+          evidence_args=()
+          while IFS= read -r evidence; do
+            evidence_args+=(--evidence "$evidence")
+          done < <(find file-manager-evidence/raw -name '*.json' -type f -print | sort)
+          while IFS= read -r artifact; do
+            cp "$artifact" file-manager-evidence/bundle/artifacts/
+          done < <(find file-manager-evidence/raw -type f \( -name '*.log' -o -name '*.result' \) -print | sort)
+          node scripts/file-manager-release-report.mjs validate \
+            --matrix tests/file-manager-release/matrix.json \
+            "${evidence_args[@]}" \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --event "$GITHUB_EVENT_NAME" \
+            --ref "$GITHUB_REF" \
+            --artifact-root file-manager-evidence/raw \
+            --run-jobs file-manager-evidence/run-jobs.json \
+            --deployments file-manager-evidence/deployments.json \
+            --mode audit \
+            --report file-manager-evidence/bundle/file-manager-evidence.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: file-manager-release-evidence-${{ github.sha }}
+          path: file-manager-evidence/bundle/
+          if-no-files-found: error
+          retention-days: 30

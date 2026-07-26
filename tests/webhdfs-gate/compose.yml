@@ -1,6 +1,6 @@
 services:
   namenode:
-    image: apache/hadoop:3.4.1
+    image: apache/hadoop:3.4.1@sha256:69ffa97339aff768c4e6120c3fb27aa04c121402b1c8158408a5fb5be586a30e
     platform: linux/amd64
     hostname: namenode
     command:
@@ -18,7 +18,7 @@ services:
       - ./hdfs-site.xml:/opt/hadoop/etc/hadoop/hdfs-site.xml:ro
 
   datanode:
-    image: apache/hadoop:3.4.1
+    image: apache/hadoop:3.4.1@sha256:69ffa97339aff768c4e6120c3fb27aa04c121402b1c8158408a5fb5be586a30e
     platform: linux/amd64
     hostname: datanode
     command: ["hdfs", "datanode"]

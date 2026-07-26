@@ -183,21 +183,31 @@ done
 curl --silent --show-error --fail --max-time 2 \
   "${proxy_endpoint}/minio/health/ready" >/dev/null
 
-test_endpoint="${proxy_endpoint}"
-DBX_TEST_S3_ENDPOINT="${test_endpoint}" \
-DBX_TEST_S3_DIRECT_ENDPOINT="${direct_endpoint}" \
-DBX_TEST_S3_FAULT_PROXY="1" \
-DBX_TEST_S3_REGION="${region}" \
-DBX_TEST_S3_BUCKET="${bucket}" \
-DBX_TEST_S3_ROOT="${root}" \
-DBX_TEST_S3_ACCESS_KEY_ID="${access_key_id}" \
-DBX_TEST_S3_SECRET_ACCESS_KEY="${secret_access_key}" \
-DBX_TEST_S3_CONTAINER="${container}" \
-DBX_TEST_S3_MC_IMAGE="${mc_image}" \
-DBX_TEST_S3_OUTSIDE_CANARY_KEY="tenant/outside-root-canary.txt" \
-DBX_TEST_S3_BUCKET_CANARY_KEY="outside-root-canary.txt" \
-  cargo test -p dbx --lib fixed_s3_ --no-default-features -- \
-    --ignored --test-threads=1
+run_exact_contract() {
+  local test_name="$1"
+  local output
+  output="$(mktemp "${TMPDIR:-/tmp}/dbx-s3-contract-result.XXXXXX")"
+  DBX_TEST_S3_ENDPOINT="${proxy_endpoint}" \
+  DBX_TEST_S3_DIRECT_ENDPOINT="${direct_endpoint}" \
+  DBX_TEST_S3_FAULT_PROXY="1" \
+  DBX_TEST_S3_REGION="${region}" \
+  DBX_TEST_S3_BUCKET="${bucket}" \
+  DBX_TEST_S3_ROOT="${root}" \
+  DBX_TEST_S3_ACCESS_KEY_ID="${access_key_id}" \
+  DBX_TEST_S3_SECRET_ACCESS_KEY="${secret_access_key}" \
+  DBX_TEST_S3_CONTAINER="${container}" \
+  DBX_TEST_S3_MC_IMAGE="${mc_image}" \
+  DBX_TEST_S3_OUTSIDE_CANARY_KEY="tenant/outside-root-canary.txt" \
+  DBX_TEST_S3_BUCKET_CANARY_KEY="outside-root-canary.txt" \
+    cargo test -p dbx --lib "${test_name}" --no-default-features -- \
+      --ignored --exact --test-threads=1 2>&1 | tee "${output}"
+  grep -Fx "test ${test_name} ... ok" "${output}" >/dev/null
+  grep -F 'test result: ok. 1 passed; 0 failed;' "${output}" >/dev/null
+  rm -f "${output}"
+}
+
+run_exact_contract commands::file_manager::tests::fixed_s3_service_contract
+run_exact_contract commands::file_transfer::tests::fixed_s3_transfer_contract
 
 node - "${proxy_trace}" <<'NODE'
 const fs = require("node:fs");

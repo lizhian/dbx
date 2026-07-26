@@ -180,22 +180,40 @@ start_secondary_ftp() {
 
 run_contract() {
   local test_name="$1"
+  local module="commands::file_transfer::tests"
+  local output
+  if [[ "${test_name}" == "fixed_ftp_service_contract" ]]; then
+    module="commands::file_manager::tests"
+  fi
+  local qualified="${module}::${test_name}"
+  output="$(mktemp "${TMPDIR:-/tmp}/dbx-ftp-contract-result.XXXXXX")"
   DBX_TEST_FTP_ENDPOINT="ftp://127.0.0.1:${control_port}" \
   DBX_TEST_FTP_USERNAME="dbx" \
   DBX_TEST_FTP_PASSWORD="dbx-password" \
   DBX_TEST_FTP_CONTAINER="${container}" \
-    cargo test -p dbx --lib "${test_name}" --no-default-features -- --ignored --test-threads=1
+    cargo test -p dbx --lib "${qualified}" --no-default-features -- \
+      --ignored --exact --test-threads=1 2>&1 | tee "${output}"
+  grep -Fx "test ${qualified} ... ok" "${output}" >/dev/null
+  grep -F 'test result: ok. 1 passed; 0 failed;' "${output}" >/dev/null
+  rm -f "${output}"
 }
 
 run_dual_service_contract() {
   local test_name="$1"
+  local qualified="commands::file_transfer::tests::${test_name}"
+  local output
+  output="$(mktemp "${TMPDIR:-/tmp}/dbx-ftp-contract-result.XXXXXX")"
   DBX_TEST_FTP_ENDPOINT="ftp://127.0.0.1:${control_port}" \
   DBX_TEST_FTP_USERNAME="dbx" \
   DBX_TEST_FTP_PASSWORD="dbx-password" \
   DBX_TEST_FTP_CONTAINER="${container}" \
   DBX_TEST_FTP_SECONDARY_ENDPOINT="ftp://127.0.0.1:${secondary_control_port}" \
   DBX_TEST_FTP_SECONDARY_CONTAINER="${secondary_container}" \
-    cargo test -p dbx --lib "${test_name}" --no-default-features -- --ignored --test-threads=1
+    cargo test -p dbx --lib "${qualified}" --no-default-features -- \
+      --ignored --exact --test-threads=1 2>&1 | tee "${output}"
+  grep -Fx "test ${qualified} ... ok" "${output}" >/dev/null
+  grep -F 'test result: ok. 1 passed; 0 failed;' "${output}" >/dev/null
+  rm -f "${output}"
 }
 
 start_ftp "read"

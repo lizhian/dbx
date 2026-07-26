@@ -3,6 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="$repo_root/tests/webhdfs-gate/compose.yml"
+hadoop_image="apache/hadoop:3.4.1@sha256:69ffa97339aff768c4e6120c3fb27aa04c121402b1c8158408a5fb5be586a30e"
 profile="${WEBHDFS_GATE_PROFILE:-release}"
 if [ "$profile" = "release" ]; then
   binary="$repo_root/target/release/webhdfs_gate"
@@ -52,7 +53,7 @@ fi
 {
   uname -a
   docker version --format 'docker_server={{.Server.Version}}'
-  docker image inspect apache/hadoop:3.4.1 --format 'hadoop_image={{.Id}}'
+  docker image inspect "$hadoop_image" --format 'hadoop_image={{.Id}}'
 } >"$result_dir/environment.txt"
 
 cleanup_run() {
@@ -172,6 +173,7 @@ if [ "$sizes_gib" = "1 10 100" ]; then
 else
   printf '{"candidate":"streaming-put","verdict":"NO-GO","reason":"required sizes 1/10/100 GiB were not all executed"}\n' \
     | tee "$result_dir/gate-verdict.json"
+  exit 1
 fi
 
 echo "Results written to $result_dir"

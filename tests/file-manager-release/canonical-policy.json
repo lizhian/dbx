@@ -1,0 +1,54 @@
+{
+  "schema_version": 2,
+  "matrix_id": "file-manager-v1-release",
+  "certification": {
+    "repository": "lizhian/dbx",
+    "workflow": "File Manager release evidence",
+    "workflow_path": ".github/workflows/file-manager-evidence.yml",
+    "release_event": "push",
+    "release_ref": "refs/heads/main"
+  },
+  "operations": ["read", "write", "stat", "list", "delete", "copy", "rename"],
+  "rows": [
+    { "id": "contract-ftp", "kind": "contract", "implementation": "ftp", "required": true, "expected_service_images": ["delfer/alpine-ftp-server@sha256:60bb774d8408d9d4d5c74d05d1c086a34ce192c6c1a142ffac268cac0dbc6fac"], "expected_tests": [{"name":"commands::file_manager::tests::fixed_ftp_service_contract","count":1},{"name":"commands::file_transfer::tests::fixed_ftp_download_contract","count":1},{"name":"commands::file_transfer::tests::fixed_ftp_upload_contract","count":1},{"name":"commands::file_transfer::tests::fixed_ftp_copy_rename_contract","count":1},{"name":"commands::file_transfer::tests::fixed_ftp_upload_queued_revision_contract","count":1},{"name":"commands::file_transfer::tests::fixed_ftp_worker_success_cancel_and_disconnect_contract","count":3},{"name":"commands::file_transfer::tests::fixed_ftp_upload_disconnect_contract","count":3}] },
+    { "id": "contract-sftp", "kind": "contract", "implementation": "sftp", "required": true, "expected_service_images": ["lscr.io/linuxserver/openssh-server@sha256:3acac97f1b835860fbcc7fd4e9d6be3e0571f4742cdec97c1fe08ed07b8fc24c"], "expected_tests": [{"name":"commands::file_manager::tests::fixed_sftp_service_contract","count":1},{"name":"commands::file_transfer::tests::fixed_sftp_transfer_contract","count":1}] },
+    { "id": "contract-s3", "kind": "contract", "implementation": "s3", "required": true, "expected_service_images": ["quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e", "quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3"], "expected_tests": [{"name":"commands::file_manager::tests::fixed_s3_service_contract","count":1},{"name":"commands::file_transfer::tests::fixed_s3_transfer_contract","count":1}] },
+    { "id": "contract-webdav", "kind": "contract", "implementation": "webdav", "required": true, "expected_service_images": ["bytemark/webdav@sha256:bcabbc024c511b9c63ed3345f88573e31d84c952ee493c9acb3fe345f4f80f57"], "expected_tests": [{"name":"commands::file_manager_webdav::tests::fixed_webdav_service_contract","count":1},{"name":"commands::file_transfer::tests::fixed_webdav_file_transfer_worker_contract","count":1}] },
+    { "id": "contract-webhdfs", "kind": "contract", "implementation": "webhdfs", "required": true, "expected_service_images": ["apache/hadoop:3.4.1@sha256:69ffa97339aff768c4e6120c3fb27aa04c121402b1c8158408a5fb5be586a30e"], "expected_tests": [{"name":"commands::file_manager_webhdfs::tests::fixed_webhdfs_service_contract","count":1},{"name":"commands::file_transfer::tests::fixed_webhdfs_file_transfer_worker_contract","count":1},{"name":"commands::file_transfer::tests::fixed_webhdfs_permission_failure_contract","count":1},{"name":"commands::file_transfer::tests::fixed_webhdfs_quota_failure_contract","count":1},{"name":"commands::file_transfer::tests::fixed_webhdfs_datanode_disconnect_contract","count":1}] },
+    { "id": "contract-hdfs-native", "kind": "contract", "implementation": "hdfs-native", "required": true, "expected_service_images": ["apache/hadoop:3.4.1@sha256:69ffa97339aff768c4e6120c3fb27aa04c121402b1c8158408a5fb5be586a30e"], "expected_tests": [{"name":"commands::file_manager_hdfs_native::tests::ambient_hdfs_native_config_contract","count":1},{"name":"commands::file_manager::tests::fixed_hdfs_native_service_contract","count":1},{"name":"commands::file_transfer::tests::fixed_hdfs_native_transfer_contract","count":1}] },
+
+    { "id": "platform-compile-macos", "kind": "platform-compile", "platform": "macos", "required": false },
+    { "id": "platform-compile-linux", "kind": "platform-compile", "platform": "linux", "required": false },
+    { "id": "platform-compile-windows", "kind": "platform-compile", "platform": "windows", "required": false },
+    { "id": "platform-conformance-macos", "kind": "platform-conformance", "platform": "macos", "implementations": ["ftp", "sftp", "s3", "webdav", "webhdfs", "hdfs-native"], "required": true },
+    { "id": "platform-conformance-linux", "kind": "platform-conformance", "platform": "linux", "implementations": ["ftp", "sftp", "s3", "webdav", "webhdfs", "hdfs-native"], "required": true },
+    { "id": "platform-conformance-windows", "kind": "platform-conformance", "platform": "windows", "implementations": ["ftp", "s3", "webdav", "webhdfs", "hdfs-native"], "unsupported": ["sftp"], "required": true },
+
+    { "id": "desktop-e2e", "kind": "desktop-e2e", "required": true },
+    { "id": "fault-injection", "kind": "fault", "scenarios": ["dns", "tls", "webhdfs-redirect-disconnect", "copy-delete-failure", "abort-failure", "permission-denied", "disk-full"], "required": true },
+
+    { "id": "real-aws-s3", "kind": "protected-service", "service": "aws-s3", "expected_environment": "aws-s3-contract", "required": true, "protected": true },
+    { "id": "real-webdav", "kind": "protected-service", "service": "webdav", "expected_environment": "webdav-contract", "required": true, "protected": true },
+    { "id": "target-hadoop-webhdfs", "kind": "protected-service", "service": "target-hadoop-webhdfs", "expected_environment": "target-hadoop-webhdfs", "required": true, "protected": true },
+    { "id": "target-hadoop-native", "kind": "protected-service", "service": "target-hadoop-native", "expected_environment": "target-hadoop-native", "required": true, "protected": true },
+
+    { "id": "performance-read-1gib", "kind": "performance", "operation": "read", "size_gib": 1, "required": true },
+    { "id": "performance-read-10gib", "kind": "performance", "operation": "read", "size_gib": 10, "required": true },
+    { "id": "performance-read-100gib", "kind": "performance", "operation": "read", "size_gib": 100, "required": true },
+    { "id": "performance-write-1gib", "kind": "performance", "operation": "write", "size_gib": 1, "required": true },
+    { "id": "performance-write-10gib", "kind": "performance", "operation": "write", "size_gib": 10, "required": true },
+    { "id": "performance-write-100gib", "kind": "performance", "operation": "write", "size_gib": 100, "required": true },
+    { "id": "performance-relay-1gib", "kind": "performance", "operation": "relay-copy", "size_gib": 1, "required": true },
+    { "id": "performance-relay-10gib", "kind": "performance", "operation": "relay-copy", "size_gib": 10, "required": true },
+    { "id": "performance-relay-100gib", "kind": "performance", "operation": "relay-copy", "size_gib": 100, "required": true },
+    { "id": "throughput-single", "kind": "performance", "metric": "single-transfer-vs-opendal", "minimum_ratio": 0.9, "required": true },
+    { "id": "throughput-eight", "kind": "performance", "metric": "eight-transfer-vs-opendal", "minimum_ratio": 0.85, "required": true },
+    { "id": "cancel-ui-ack", "kind": "performance", "metric": "cancel-ui-ack-ms", "maximum": 200, "required": true },
+    { "id": "cancel-active-io", "kind": "performance", "metric": "cancel-active-io-ms", "maximum": 2000, "required": true },
+    { "id": "cancel-stalled-io", "kind": "performance", "metric": "stalled-io-uses-progress-timeout", "expected_value": true, "required": true },
+    { "id": "release-footprint", "kind": "release-measurement", "metrics": ["cold-start-ms", "idle-rss-mib", "binary-size-bytes", "installer-size-bytes"], "required": true },
+
+    { "id": "webhdfs-production-gate", "kind": "release-gate", "checks": ["rss-upload-1gib", "rss-upload-10gib", "rss-upload-100gib", "rss-copy-1gib", "rss-copy-10gib", "rss-copy-100gib"], "expected_environment": "webhdfs-production-gate", "required": true, "protected": true },
+    { "id": "secrets-at-rest-gate", "kind": "release-gate", "checks": ["keychain-roundtrip", "plaintext-scan"], "expected_environment": "secrets-at-rest-gate", "required": true, "protected": true }
+  ]
+}

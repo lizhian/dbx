@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dbx.local/schemas/file-manager-release-raw-result-v1.json",
+  "title": "DBX File Manager raw certification result",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "row_id", "kind", "job_conclusion"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "row_id": { "type": "string", "minLength": 1 },
+    "kind": {
+      "enum": [
+        "platform-compile",
+        "platform-conformance",
+        "desktop-e2e",
+        "fault",
+        "protected-service",
+        "performance",
+        "release-measurement",
+        "release-gate"
+      ]
+    },
+    "job_conclusion": { "const": "success" },
+    "environment": { "type": "string", "minLength": 1 },
+    "compilation": { "type": "object" },
+    "conformance": { "type": "object" },
+    "tests": { "type": "array" },
+    "scenarios": { "type": "array" },
+    "measurement": { "type": "object" },
+    "measurements": { "type": "object" },
+    "review": { "type": "object" },
+    "checks": { "type": "array" }
+  }
+}

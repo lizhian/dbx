@@ -11,6 +11,7 @@ datanode_control_port="${DBX_TEST_HDFS_NATIVE_DATANODE_CONTROL_PORT:-29870}"
 contract_user="dbx-hdfs-contract"
 contract_root="/tenant/root"
 smoke_only="${DBX_TEST_HDFS_NATIVE_SMOKE_ONLY:-0}"
+require_full_contract="${DBX_REQUIRE_FULL_CONTRACT:-0}"
 contract_filter="${DBX_TEST_HDFS_NATIVE_CONTRACT_FILTER:-all}"
 suffix="${RANDOM}-$$"
 network="dbx-hdfs-native-${suffix}"
@@ -408,4 +409,12 @@ NODE
     echo "HDFS Native protocol credential material reached application test output" >&2
     exit 1
   fi
+fi
+
+if [[ "${smoke_only}" == 1 ]]; then
+  if [[ "${require_full_contract}" == 1 ]]; then
+    echo "HDFS Native fixture smoke completed, but the required product contract did not run" >&2
+    exit 3
+  fi
+  exit 0
 fi

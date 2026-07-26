@@ -5451,7 +5451,7 @@ mod tests {
     use dbx_core::storage::Storage;
     use std::collections::BTreeSet;
     use std::pin::Pin;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::task::{Context, Poll};
 
     async fn ensure_test_connection(storage: &Storage, id: &str) -> i64 {
@@ -8996,8 +8996,60 @@ mod tests {
                     .unwrap();
                 if kind == "timeout" {
                     post_fault_control(control, "/drop");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    wait_for_fault_proxy_idle(control).await;
                 }
+            }
+
+            async fn wait_for_fault_proxy_idle(control: &str) {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        let output = Command::new("curl")
+                            .args(["--silent", "--show-error", "--fail"])
+                            .arg(format!("{control}/health"))
+                            .output()
+                            .unwrap();
+                        assert!(
+                            output.status.success(),
+                            "SFTP fault health request failed: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        let health: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                        if health.get("activeConnections").and_then(serde_json::Value::as_u64) == Some(0)
+                            && health.get("armedFault").is_some_and(serde_json::Value::is_null)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                    }
+                })
+                .await
+                .expect("SFTP fault proxy retained a connection after control drop");
+            }
+
+            async fn assert_fault_connection_recovered(
+                file_manager: &FileManagerRuntime,
+                state: &AppState,
+                revision: i64,
+            ) {
+                let recovered = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    file_manager.prepare_file_mutation_operation(state, "sftp-fault", "large.bin", revision),
+                )
+                .await
+                .expect("SFTP fault connection did not rebuild within the recovery budget")
+                .unwrap();
+                let source = recovered.configured_path("large.bin").unwrap();
+                assert_eq!(recovered.operator.stat(&source).await.unwrap().content_length(), 32 * 1024 * 1024);
+                drop(recovered);
+                assert_eq!(file_manager.operator_count(), 0, "recovered SFTP mutation operator must not remain cached");
+            }
+
+            fn assert_fault_operator_evicted(file_manager: &FileManagerRuntime, transfer_id: &str) {
+                assert_eq!(
+                    file_manager.operator_count(),
+                    0,
+                    "{transfer_id} fault worker retained a cached SFTP operator"
+                );
             }
 
             fn assert_fault_error(record: &FileTransferStorageRecord, kind: &str) {
@@ -9104,6 +9156,9 @@ mod tests {
                 await_fault_worker(&fault_control, &fault_trace, &label, kind, false, worker).await;
                 let record = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
                 assert_fault_error(&record, kind);
+                assert_fault_operator_evicted(file_manager.inner(), &transfer_id);
+                assert_fault_connection_recovered(file_manager.inner(), state.as_ref(), fault_connection.revision)
+                    .await;
                 assert!(!target.exists(), "faulted download published its final target");
                 assert_no_owned_temp(&local_root, &transfer_id);
             }
@@ -9127,9 +9182,16 @@ mod tests {
                 await_fault_worker(&fault_control, &fault_trace, &label, kind, false, worker).await;
                 let record = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
                 assert_fault_error(&record, kind);
-                let configured_destination = prepared.configured_path(&destination).unwrap();
+                assert_fault_operator_evicted(file_manager.inner(), &transfer_id);
+                assert_fault_connection_recovered(file_manager.inner(), state.as_ref(), fault_connection.revision)
+                    .await;
+                let oracle = file_manager
+                    .prepare_file_mutation_operation(&state, "sftp-contract", &destination, connection.revision)
+                    .await
+                    .unwrap();
+                let configured_destination = oracle.configured_path(&destination).unwrap();
                 assert!(
-                    !operator.exists(&configured_destination).await.unwrap(),
+                    !oracle.operator.exists(&configured_destination).await.unwrap(),
                     "faulted upload published its target"
                 );
                 if let Some(partial) = record.partial_destination.as_deref() {
@@ -9137,13 +9199,14 @@ mod tests {
                         partial.contains(&format!(".dbx-upload-{transfer_id}-")) && partial.ends_with(".part"),
                         "{record:?}"
                     );
-                    let configured_partial = prepared.configured_path(partial).unwrap();
-                    if operator.exists(&configured_partial).await.unwrap() {
-                        operator.delete(&configured_partial).await.unwrap();
+                    let configured_partial = oracle.configured_path(partial).unwrap();
+                    if oracle.operator.exists(&configured_partial).await.unwrap() {
+                        oracle.operator.delete(&configured_partial).await.unwrap();
                     }
                 } else {
-                    assert_no_remote_owned_partial(operator, &root, &transfer_id).await;
+                    assert_no_remote_owned_partial(&oracle.operator, &root, &transfer_id).await;
                 }
+                drop(oracle);
             }
 
             for kind in ["disconnect", "timeout"] {
@@ -9163,24 +9226,35 @@ mod tests {
                 await_fault_worker(&fault_control, &fault_trace, &label, kind, false, worker).await;
                 let record = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
                 assert_fault_error(&record, kind);
+                assert_fault_operator_evicted(file_manager.inner(), &transfer_id);
+                assert_fault_connection_recovered(file_manager.inner(), state.as_ref(), fault_connection.revision)
+                    .await;
+                let oracle = file_manager
+                    .prepare_file_mutation_operation(&state, "sftp-contract", &destination, connection.revision)
+                    .await
+                    .unwrap();
                 assert_eq!(
-                    operator.stat(&prepared.configured_path("large.bin").unwrap()).await.unwrap().content_length(),
+                    oracle.operator.stat(&oracle.configured_path("large.bin").unwrap()).await.unwrap().content_length(),
                     32 * 1024 * 1024
                 );
-                let configured_destination = prepared.configured_path(&destination).unwrap();
-                assert!(!operator.exists(&configured_destination).await.unwrap(), "faulted copy published its target");
+                let configured_destination = oracle.configured_path(&destination).unwrap();
+                assert!(
+                    !oracle.operator.exists(&configured_destination).await.unwrap(),
+                    "faulted copy published its target"
+                );
                 if let Some(partial) = record.partial_destination.as_deref() {
                     assert!(
                         partial.contains(&format!(".dbx-copy-{transfer_id}-")) && partial.ends_with(".part"),
                         "{record:?}"
                     );
-                    let configured_partial = prepared.configured_path(partial).unwrap();
-                    if operator.exists(&configured_partial).await.unwrap() {
-                        operator.delete(&configured_partial).await.unwrap();
+                    let configured_partial = oracle.configured_path(partial).unwrap();
+                    if oracle.operator.exists(&configured_partial).await.unwrap() {
+                        oracle.operator.delete(&configured_partial).await.unwrap();
                     }
                 } else {
-                    assert_no_remote_owned_partial(operator, &root, &transfer_id).await;
+                    assert_no_remote_owned_partial(&oracle.operator, &root, &transfer_id).await;
                 }
+                drop(oracle);
             }
 
             for kind in ["disconnect", "timeout"] {
@@ -9208,6 +9282,9 @@ mod tests {
                 await_fault_worker(&fault_control, &fault_trace, &label, kind, true, worker).await;
                 let record = state.storage.get_file_transfer(&transfer_id).await.unwrap().unwrap();
                 assert_fault_error(&record, kind);
+                assert_fault_operator_evicted(file_manager.inner(), &transfer_id);
+                assert_fault_connection_recovered(file_manager.inner(), state.as_ref(), fault_connection.revision)
+                    .await;
                 assert!(
                     matches!(
                         record.operation_outcome.as_deref(),
@@ -9217,13 +9294,18 @@ mod tests {
                     ),
                     "{record:?}"
                 );
-                let source = prepared.configured_path(&source).unwrap();
-                let destination = prepared.configured_path(&destination).unwrap();
-                let source_exists = operator.exists(&source).await.unwrap();
-                let destination_exists = operator.exists(&destination).await.unwrap();
+                let oracle = file_manager
+                    .prepare_file_mutation_operation(&state, "sftp-contract", &source, connection.revision)
+                    .await
+                    .unwrap();
+                let source = oracle.configured_path(&source).unwrap();
+                let destination = oracle.configured_path(&destination).unwrap();
+                let source_exists = oracle.operator.exists(&source).await.unwrap();
+                let destination_exists = oracle.operator.exists(&destination).await.unwrap();
                 assert_ne!(source_exists, destination_exists, "rename must leave exactly one complete name");
                 let surviving_path = if source_exists { &source } else { &destination };
-                assert_eq!(operator.read(surviving_path).await.unwrap().to_vec(), payload.as_bytes());
+                assert_eq!(oracle.operator.read(surviving_path).await.unwrap().to_vec(), payload.as_bytes());
+                drop(oracle);
             }
         }
 
@@ -11449,10 +11531,12 @@ mod tests {
             operator.stat("ftp/dbx/upload-disconnect.bin").await.unwrap_err().kind(),
             opendal::ErrorKind::NotFound
         );
-        let killed = tokio::task::spawn_blocking(move || Command::new("docker").args(["kill", &container]).status())
-            .await
-            .unwrap()
-            .unwrap();
+        let killed = tokio::task::spawn_blocking(move || {
+            Command::new("docker").args(["kill", &container]).stdout(Stdio::null()).stderr(Stdio::null()).status()
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert!(killed.success());
         barrier.release.notify_one();
         tokio::time::timeout(Duration::from_secs(45), worker)
@@ -11560,10 +11644,12 @@ mod tests {
         let at_barrier = state.storage.get_file_transfer("ftp-disconnect").await.unwrap().unwrap();
         assert_eq!(at_barrier.status, "running");
         assert_eq!(at_barrier.bytes_transferred, 0);
-        let kill = tokio::task::spawn_blocking(move || Command::new("docker").args(["kill", &container]).status())
-            .await
-            .unwrap()
-            .unwrap();
+        let kill = tokio::task::spawn_blocking(move || {
+            Command::new("docker").args(["kill", &container]).stdout(Stdio::null()).stderr(Stdio::null()).status()
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert!(kill.success());
         disconnect_barrier.release.notify_one();
         tokio::time::timeout(Duration::from_secs(10), disconnect_worker)

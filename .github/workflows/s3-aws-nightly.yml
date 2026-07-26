@@ -21,6 +21,11 @@ jobs:
     environment: aws-s3-contract
 
     steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Initialize evidence log
+        run: mkdir -p file-manager-evidence && touch file-manager-evidence/real-aws-s3.log
+
       - name: Check protected AWS configuration
         id: preflight
         shell: bash
@@ -40,9 +45,6 @@ jobs:
           else
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           fi
-
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        if: steps.preflight.outputs.enabled == 'true'
 
       - name: Install system dependencies
         if: steps.preflight.outputs.enabled == 'true'
@@ -68,6 +70,7 @@ jobs:
           role-session-name: dbx-s3-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Run real AWS S3 contract
+        id: contract
         if: steps.preflight.outputs.enabled == 'true'
         shell: bash
         env:
@@ -76,9 +79,12 @@ jobs:
           DBX_AWS_S3_RUN_ID: ${{ github.run_id }}
           DBX_AWS_S3_RUN_ATTEMPT: ${{ github.run_attempt }}
           DBX_AWS_S3_RUN_NONCE: ${{ github.run_number }}
-        run: bash tests/s3-aws-contract.sh
+        run: |
+          set -o pipefail
+          bash tests/s3-aws-contract.sh 2>&1 | tee -a file-manager-evidence/real-aws-s3.log
 
       - name: Confirm isolated-prefix cleanup
+        id: cleanup
         if: always() && steps.preflight.outputs.enabled == 'true' && steps.aws_auth.outcome == 'success'
         shell: bash
         env:
@@ -88,8 +94,95 @@ jobs:
           DBX_AWS_S3_RUN_ATTEMPT: ${{ github.run_attempt }}
           DBX_AWS_S3_RUN_NONCE: ${{ github.run_number }}
           DBX_AWS_S3_CLEANUP_ONLY: "true"
-        run: bash tests/s3-aws-contract.sh
+        run: |
+          set -o pipefail
+          bash tests/s3-aws-contract.sh 2>&1 | tee -a file-manager-evidence/real-aws-s3.log
 
       - name: Report protected configuration skip
         if: steps.preflight.outputs.enabled != 'true'
-        run: echo "The AWS S3 contract did not run because its protected configuration is unavailable."
+        run: echo "The AWS S3 contract did not run because its protected configuration is unavailable." | tee -a file-manager-evidence/real-aws-s3.log
+
+      - name: Record AWS S3 evidence
+        if: always()
+        shell: bash
+        run: |
+          status=failed
+          exit_code=1
+          job_conclusion=failure
+          notes="AWS S3 contract or isolated-prefix cleanup failed."
+          if [[ "${{ steps.preflight.outputs.enabled }}" != "true" ]]; then
+            status=pending
+            notes="Protected AWS configuration is unavailable; the contract did not run."
+          elif [[ "${{ steps.contract.outcome }}" == "success" && "${{ steps.cleanup.outcome }}" == "success" ]]; then
+            status=passed
+            exit_code=0
+            job_conclusion=success
+            notes="Real AWS S3 contract and isolated-prefix cleanup passed."
+          fi
+
+          if [[ "$status" == "pending" ]]; then
+            node scripts/file-manager-release-report.mjs record \
+              --id real-aws-s3 \
+              --status pending \
+              --notes "$notes" \
+              --output file-manager-evidence/real-aws-s3.json
+          else
+            node - \
+              file-manager-evidence/real-aws-s3.result \
+              "$job_conclusion" <<'NODE'
+            const [path, jobConclusion] = process.argv.slice(2);
+            const passed = jobConclusion === "success";
+            const result = {
+              schema_version: 1,
+              row_id: "real-aws-s3",
+              kind: "protected-service",
+              job_conclusion: jobConclusion,
+              service: "aws-s3",
+              environment: "aws-s3-contract",
+              tests: [
+                { name: "aws-s3-contract", status: passed ? "passed" : "failed" },
+                { name: "isolated-prefix-cleanup", status: passed ? "passed" : "failed" },
+              ],
+            };
+            require("node:fs").writeFileSync(path, `${JSON.stringify(result, null, 2)}\n`);
+            NODE
+            node scripts/file-manager-release-report.mjs record \
+              --id real-aws-s3 \
+              --status "$status" \
+              --commit "$GITHUB_SHA" \
+              --run-id "$GITHUB_RUN_ID" \
+              --run-attempt "$GITHUB_RUN_ATTEMPT" \
+              --repository "$GITHUB_REPOSITORY" \
+              --workflow "$GITHUB_WORKFLOW" \
+              --workflow-path ".github/workflows/s3-aws-nightly.yml" \
+              --event "$GITHUB_EVENT_NAME" \
+              --ref "$GITHUB_REF" \
+              --job s3-contract \
+              --command "bash tests/s3-aws-contract.sh && cleanup" \
+              --runner-os "$RUNNER_OS" \
+              --environment aws-s3-contract \
+              --job-conclusion "$job_conclusion" \
+              --artifact file-manager-evidence/real-aws-s3.result \
+              --exit-code "$exit_code" \
+              --notes "$notes" \
+              --output file-manager-evidence/real-aws-s3.json
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: fm-evidence-real-aws-s3-${{ github.sha }}
+          path: file-manager-evidence/real-aws-s3.*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Fail when protected contract did not run
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.preflight.outputs.enabled }}" != "true" ]]; then
+            echo "AWS S3 evidence is pending, not passed." >&2
+            exit 1
+          fi
+          [[ "${{ steps.contract.outcome }}" == "success" ]]
+          [[ "${{ steps.cleanup.outcome }}" == "success" ]]

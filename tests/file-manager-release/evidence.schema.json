@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dbx.local/schemas/file-manager-release-evidence-v2.json",
+  "title": "DBX File Manager release evidence",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "matrix_id", "entries"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "matrix_id": { "const": "file-manager-v1-release" },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["id", "status", "notes"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "status": { "enum": ["passed", "failed", "pending", "legacy", "not_applicable"] },
+          "notes": { "type": "string" },
+          "observed_at": { "type": "string", "format": "date-time" },
+          "exit_code": { "type": "integer" },
+          "source_run": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["repository", "commit_sha", "run_id", "run_attempt", "workflow", "workflow_path", "event", "ref", "job", "command", "runner_os", "environment", "job_conclusion"],
+            "properties": {
+              "repository": { "type": "string", "minLength": 1 },
+              "commit_sha": { "type": "string", "minLength": 1 },
+              "run_id": { "type": "string", "minLength": 1 },
+              "run_attempt": { "type": "string", "minLength": 1 },
+              "workflow": { "type": "string", "minLength": 1 },
+              "workflow_path": { "type": "string", "minLength": 1 },
+              "event": { "type": "string", "minLength": 1 },
+              "ref": { "type": "string", "minLength": 1 },
+              "job": { "type": "string", "minLength": 1 },
+              "command": { "type": "string", "minLength": 1 },
+              "runner_os": { "enum": ["Linux", "macOS", "Windows"] },
+              "environment": { "type": ["string", "null"] },
+              "job_conclusion": { "enum": ["success", "failure", "cancelled", "timed_out"] }
+            }
+          },
+          "artifact": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "sha256"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[^/\\\\]+$" },
+              "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+            }
+          },
+          "service_images": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "@sha256:[a-f0-9]{64}$" }
+          },
+          "tests": {
+            "type": "object",
+            "required": ["passed_count"],
+            "properties": {
+              "passed_count": { "type": "integer", "minimum": 0 },
+              "observed_passes": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    }
+  }
+}

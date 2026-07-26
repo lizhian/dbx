@@ -1644,7 +1644,7 @@ mod tests {
     async fn fixed_webhdfs_service_contract() {
         use crate::commands::file_manager::{
             save_file_connection, test_file_connection, FileConnectionConfig, FileConnectionInput,
-            FileConnectionSecrets, FileManagerRuntime, HdfsConnectionConfig,
+            FileConnectionSecrets, FileManagerRuntime, HdfsConnectionConfig, TEST_FILE_SECRET_KEY,
         };
         use dbx_core::connection::AppState;
         use futures::TryStreamExt;
@@ -1672,7 +1672,12 @@ mod tests {
             write_options: WebhdfsWriteOptions::default(),
         };
         let directory = tempfile::tempdir().unwrap();
-        let storage = dbx_core::storage::Storage::open(&directory.path().join("dbx.sqlite")).await.unwrap();
+        let storage = dbx_core::storage::Storage::open_with_file_secret_key(
+            &directory.path().join("dbx.sqlite"),
+            TEST_FILE_SECRET_KEY,
+        )
+        .await
+        .unwrap();
         let state = Arc::new(AppState::new(storage));
         let app = tauri::test::mock_builder()
             .manage(state.clone())

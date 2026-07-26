@@ -129,21 +129,20 @@ export DBX_TEST_WEBHDFS_FAULT_CONTROL="http://127.0.0.1:${proxy_control_port}"
 export DBX_TEST_WEBHDFS_FAULT_TRACE="${proxy_trace}"
 export DBX_TEST_WEBHDFS_USER="${contract_user}"
 
-cargo test -p dbx --lib \
-  commands::file_manager_webhdfs::tests::fixed_webhdfs_service_contract \
-  -- --ignored --exact --nocapture
-cargo test -p dbx --lib \
-  commands::file_transfer::tests::fixed_webhdfs_file_transfer_worker_contract \
-  -- --ignored --exact --nocapture
-cargo test -p dbx --lib \
-  commands::file_transfer::tests::fixed_webhdfs_permission_failure_contract \
-  -- --ignored --exact --nocapture
-cargo test -p dbx --lib \
-  commands::file_transfer::tests::fixed_webhdfs_quota_failure_contract \
-  -- --ignored --exact --nocapture
-cargo test -p dbx --lib \
-  commands::file_transfer::tests::fixed_webhdfs_datanode_disconnect_contract \
-  -- --ignored --exact --nocapture
+run_exact_contract() {
+  local test_name="$1"
+  local output="${workspace}/contract-result-${test_name//::/-}.log"
+  cargo test -p dbx --lib "${test_name}" -- \
+    --ignored --exact --nocapture --test-threads=1 2>&1 | tee "${output}"
+  grep -Fx "test ${test_name} ... ok" "${output}" >/dev/null
+  grep -F 'test result: ok. 1 passed; 0 failed;' "${output}" >/dev/null
+}
+
+run_exact_contract commands::file_manager_webhdfs::tests::fixed_webhdfs_service_contract
+run_exact_contract commands::file_transfer::tests::fixed_webhdfs_file_transfer_worker_contract
+run_exact_contract commands::file_transfer::tests::fixed_webhdfs_permission_failure_contract
+run_exact_contract commands::file_transfer::tests::fixed_webhdfs_quota_failure_contract
+run_exact_contract commands::file_transfer::tests::fixed_webhdfs_datanode_disconnect_contract
 
 rss_sizes="${DBX_TEST_WEBHDFS_RSS_SIZES_GIB:-}"
 if [[ -n "${rss_sizes//[[:space:]]/}" ]]; then
@@ -335,4 +334,7 @@ NODE
   done
 
   cat "${rss_results}"
+elif [[ "${DBX_REQUIRE_WEBHDFS_RSS:-0}" == "1" ]]; then
+  echo "The WebHDFS production RSS gate was required but DBX_TEST_WEBHDFS_RSS_SIZES_GIB was not set" >&2
+  exit 3
 fi

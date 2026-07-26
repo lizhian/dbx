@@ -8,6 +8,7 @@ stall_port="${DBX_TEST_SFTP_STALL_PORT:-22221}"
 proxy_port="${DBX_TEST_SFTP_PROXY_PORT:-22222}"
 proxy_control_port="${DBX_TEST_SFTP_PROXY_CONTROL_PORT:-22223}"
 smoke_only="${DBX_TEST_SFTP_SMOKE_ONLY:-0}"
+require_full_contract="${DBX_REQUIRE_FULL_CONTRACT:-0}"
 container=""
 agent_pid=""
 stall_pid=""
@@ -410,6 +411,12 @@ smoke_sftp_fixture() {
 
 run_contract() {
   local test_name="$1"
+  local module="commands::file_transfer::tests"
+  local output="${workspace}/contract-result-${test_name}.log"
+  if [[ "${test_name}" == "fixed_sftp_service_contract" ]]; then
+    module="commands::file_manager::tests"
+  fi
+  local qualified="${module}::${test_name}"
   env \
     "HOME=${contract_home}" \
     "TMPDIR=${runtime_tmp}" \
@@ -438,13 +445,20 @@ run_contract() {
     "DBX_TEST_SFTP_CRASH_RESIDUE_FILE=${key_residue_file}" \
     "DBX_TEST_SFTP_PROXY_TRACE=${proxy_trace}" \
     "DBX_TEST_SFTP_CONTAINER=${container}" \
-    cargo test -p dbx --lib "${test_name}" --no-default-features -- --ignored --test-threads=1
+    cargo test -p dbx --lib "${qualified}" --no-default-features -- \
+      --ignored --exact --test-threads=1 2>&1 | tee "${output}"
+  grep -Fx "test ${qualified} ... ok" "${output}" >/dev/null
+  grep -F 'test result: ok. 1 passed; 0 failed;' "${output}" >/dev/null
 }
 
 start_sftp "service"
 write_ssh_configs
 smoke_sftp_fixture
 if [[ "${smoke_only}" == "1" ]]; then
+  if [[ "${require_full_contract}" == "1" ]]; then
+    echo "SFTP fixture smoke completed, but the required product contract did not run" >&2
+    exit 3
+  fi
   exit 0
 fi
 install_crash_residue_fixture

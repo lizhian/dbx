@@ -74,10 +74,22 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-DBX_TEST_WEBDAV_ENDPOINT="http://127.0.0.1:${proxy_port}" \
-DBX_TEST_WEBDAV_USERNAME="dbx" \
-DBX_TEST_WEBDAV_PASSWORD="dbx-password" \
-  cargo test -p dbx --lib fixed_webdav_ --no-default-features -- --ignored --test-threads=1
+run_exact_contract() {
+  local test_name="$1"
+  local output
+  output="$(mktemp "${TMPDIR:-/tmp}/dbx-webdav-contract-result.XXXXXX")"
+  DBX_TEST_WEBDAV_ENDPOINT="http://127.0.0.1:${proxy_port}" \
+  DBX_TEST_WEBDAV_USERNAME="dbx" \
+  DBX_TEST_WEBDAV_PASSWORD="dbx-password" \
+    cargo test -p dbx --lib "${test_name}" --no-default-features -- \
+      --ignored --exact --test-threads=1 2>&1 | tee "${output}"
+  grep -Fx "test ${test_name} ... ok" "${output}" >/dev/null
+  grep -F 'test result: ok. 1 passed; 0 failed;' "${output}" >/dev/null
+  rm -f "${output}"
+}
+
+run_exact_contract commands::file_manager_webdav::tests::fixed_webdav_service_contract
+run_exact_contract commands::file_transfer::tests::fixed_webdav_file_transfer_worker_contract
 
 timeout_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
   --user dbx:dbx-password --request PROPFIND --header 'Depth: 0' \
