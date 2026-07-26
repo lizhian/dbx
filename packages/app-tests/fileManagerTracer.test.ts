@@ -16,9 +16,20 @@ test("file manager frontend uses the dedicated Tauri command contract", () => {
   assert.doesNotMatch(tauriBackend, /list_file_root|listFileRoot/);
 });
 
-test("FTP connection editor exposes CRUD, staged testing, root browsing, and plaintext warning", () => {
-  assert.match(page, /t\("fileManager.security"\)/);
-  assert.match(english, /FTP is unencrypted/);
+test("connection editor exposes CRUD, staged testing, root browsing, and protocol-level security guidance", () => {
+  for (const key of ["ftpSecurity", "sftpSecurity", "s3Security", "webdavSecurity", "hdfsSecurity", "webhdfsSecurity"]) {
+    assert.match(page, new RegExp(`${key}: t\\("fileManager\\.${key}"\\)`));
+  }
+  assert.match(english, /ftpSecurity: "FTP is unencrypted\. Usernames, passwords, and file contents travel over the network in plaintext\."/);
+
+  const securitySelector = page.match(/const connectionSecurityText = computed\(\(\) =>([\s\S]*?)\n\);/)?.[1];
+  assert.ok(securitySelector, "connectionSecurityText selector must exist");
+  assert.match(securitySelector, /form\.value\.type === "ftp"\s*\?\s*text\.value\.ftpSecurity/);
+  assert.match(securitySelector, /form\.value\.type === "sftp"\s*\?\s*sftpSupported\s*\?\s*text\.value\.sftpSecurity\s*:\s*text\.value\.sftpUnsupported/);
+  assert.match(securitySelector, /form\.value\.type === "s3"\s*\?\s*text\.value\.s3Security/);
+  assert.match(securitySelector, /form\.value\.type === "hdfs"\s*\?\s*form\.value\.hdfsImplementation === "webhdfs"\s*\?\s*text\.value\.webhdfsSecurity\s*:\s*text\.value\.hdfsSecurity/);
+  assert.match(securitySelector, /:\s*text\.value\.webdavSecurity/);
+
   assert.match(page, /configuration: t\("fileManager.stageConfiguration"\)/);
   assert.match(page, /authentication: t\("fileManager.stageAuthentication"\)/);
   assert.match(page, /api\.saveFileConnection/);
@@ -55,7 +66,7 @@ test("file manager reports root errors, prevents duplicate deletion, and exposes
 test("file mutations expose accessible create and guarded delete controls", () => {
   assert.match(page, /:aria-label="text\.createDirectory"/);
   assert.match(page, /:aria-label="`\$\{text\.deleteEntry\}: \$\{entry\.name\}`"/);
-  assert.match(page, /api\.deleteFileEntry\(connectionId, entry\.path, false\)/);
+  assert.match(page, /api\.deleteFileEntry\(connectionId, entry\.path, false, entry\.kind\)/);
   assert.match(page, /!directoryPath\.value \|\| mutating/);
   assert.match(english, /Only files and empty directories can be deleted/);
 });
