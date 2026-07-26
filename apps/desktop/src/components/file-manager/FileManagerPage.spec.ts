@@ -90,6 +90,7 @@ async function mountPage() {
   app.use(i18n);
   app.mount(container);
   await flushPage();
+  return container;
 }
 
 function buttonWithTitle(title: string): HTMLButtonElement | undefined {
@@ -108,6 +109,15 @@ afterEach(() => {
 });
 
 describe("FileManagerPage browsing", () => {
+  it("exposes one layout root so parent visibility directives apply", async () => {
+    const container = await mountPage();
+
+    expect(container.childElementCount).toBe(1);
+    expect(container.firstElementChild?.classList.contains("flex")).toBe(true);
+    expect(container.firstElementChild?.classList.contains("min-h-0")).toBe(true);
+    expect(container.firstElementChild?.classList.contains("flex-1")).toBe(true);
+  });
+
   it("opens the connection root, displays metadata, navigates into a directory, and returns to root", async () => {
     await mountPage();
     buttonWithTitle("Open")?.click();
