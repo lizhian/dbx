@@ -1,0 +1,21 @@
+[package]
+name = "dbx-opendal-connection-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+opendal = { version = "=0.57.0", default-features = false, features = [
+  "executors-tokio",
+  "reqwest-rustls-tls",
+  "services-ftp",
+  "services-sftp",
+  "services-s3",
+  "services-webdav",
+  "services-webhdfs",
+  "services-hdfs-native",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
