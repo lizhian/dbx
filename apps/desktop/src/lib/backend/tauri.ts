@@ -1473,6 +1473,14 @@ export async function testFileConnection(request: import("@/types/fileManager").
   return invoke("test_file_connection", { request });
 }
 
+export async function statFilePath(connectionId: string, path: string): Promise<import("@/types/fileManager").FileEntry> {
+  return invoke("stat_file_path", { connectionId, path });
+}
+
+export async function listFilePath(connectionId: string, path: string): Promise<import("@/types/fileManager").FileEntry[]> {
+  return invoke("list_file_path", { connectionId, path });
+}
+
 export async function deleteDatabaseBackupFiles(paths: string[]): Promise<number> {
   return invoke("delete_database_backup_files", { paths });
 }

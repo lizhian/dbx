@@ -106,3 +106,11 @@ export interface TestFileConnectionRequest {
   config: FileConnectionConfig;
   secrets?: FileSecretUpdates;
 }
+
+export interface FileEntry {
+  path: string;
+  name: string;
+  kind: "file" | "directory" | "unknown";
+  size: number;
+  modifiedAt?: string;
+}

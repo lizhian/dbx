@@ -409,6 +409,11 @@ function openFileManagerPage() {
   settingsStore.settingsPageActive = false;
 }
 
+function closeFileManagerPage() {
+  fileManagerTabOpen.value = false;
+  fileManagerActive.value = false;
+}
+
 function closeDriverStorePage() {
   driverStoreTabOpen.value = false;
   driverStoreActive.value = false;
@@ -2198,9 +2203,13 @@ onUnmounted(() => {
                 :driver-store-active="driverStoreActive"
                 :settings-page-open="settingsPageTabOpen"
                 :settings-page-active="settingsStore.settingsPageActive"
+                :file-manager-open="fileManagerTabOpen"
+                :file-manager-active="fileManagerActive"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
                 @activate-driver-store="openDriverStorePage"
                 @activate-settings-page="activateSettingsPage"
+                @activate-file-manager="openFileManagerPage"
+                @close-file-manager="closeFileManagerPage"
                 @activate-tab="
                   driverStoreActive = false;
                   settingsStore.settingsPageActive = false;

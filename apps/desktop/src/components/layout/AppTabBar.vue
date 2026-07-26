@@ -2,7 +2,7 @@
 import { computed, ref, watch, nextTick, onUnmounted } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { X, Pin, ChevronDown, Table2, Code2, TableProperties, PencilRuler, KeyRound, Pencil, Package, Lock, Copy, AlertTriangle, Network, Minimize2, Maximize2, Settings, CalendarClock, Activity, Gauge } from "@lucide/vue";
+import { X, Pin, ChevronDown, Table2, Code2, TableProperties, PencilRuler, KeyRound, Pencil, Package, Lock, Copy, AlertTriangle, Network, Minimize2, Maximize2, Settings, CalendarClock, Activity, Gauge, FolderOpen } from "@lucide/vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -25,6 +25,8 @@ const props = defineProps<{
   driverStoreActive?: boolean;
   settingsPageOpen?: boolean;
   settingsPageActive?: boolean;
+  fileManagerOpen?: boolean;
+  fileManagerActive?: boolean;
   agentDriverUpdateCount?: number;
 }>();
 
@@ -34,6 +36,8 @@ const emit = defineEmits<{
   "close-driver-store": [];
   "activate-settings-page": [];
   "close-settings-page": [];
+  "activate-file-manager": [];
+  "close-file-manager": [];
   "save-tab": [tabId: string];
   "discard-tab-close": [];
   "save-all-tab-close": [];
@@ -56,7 +60,7 @@ const isWrapLayout = computed(() => settingsStore.editorSettings.tabLayout === "
 const fixedTabs = computed(() => queryStore.tabs.filter((tab) => tab.pinned));
 const regularTabs = computed(() => queryStore.tabs.filter((tab) => !tab.pinned));
 const hasFixedTabs = computed(() => fixedTabs.value.length > 0);
-const regularSurfaceCount = computed(() => regularTabs.value.length + (props.driverStoreOpen ? 1 : 0) + (props.settingsPageOpen ? 1 : 0));
+const regularSurfaceCount = computed(() => regularTabs.value.length + (props.driverStoreOpen ? 1 : 0) + (props.settingsPageOpen ? 1 : 0) + (props.fileManagerOpen ? 1 : 0));
 const closeConfirmDirtyCount = computed(() => queryStore.closeConfirmDirtyTabIds.length);
 const showCloseConfirmBulkActions = computed(() => closeConfirmDirtyCount.value > 1);
 const closeConfirmDirtyTabs = computed(() => queryStore.closeConfirmDirtyTabIds.map((id) => queryStore.tabs.find((tab) => tab.id === id)).filter((tab): tab is QueryTab => !!tab));
@@ -168,11 +172,12 @@ function tabTitleStyle(tab: QueryTab): CSSProperties | undefined {
   };
 }
 
-type SpecialRegularSurface = "driverStore" | "settings";
+type SpecialRegularSurface = "driverStore" | "settings" | "fileManager";
 
 function closeSpecialRegularSurfaces(keep?: SpecialRegularSurface) {
   if (keep !== "driverStore" && props.driverStoreOpen) emit("close-driver-store");
   if (keep !== "settings" && props.settingsPageOpen) emit("close-settings-page");
+  if (keep !== "fileManager" && props.fileManagerOpen) emit("close-file-manager");
 }
 
 function closeOtherRegularTabsFromTab(tab: QueryTab) {
@@ -196,6 +201,11 @@ function closeOtherActiveTabs() {
     closeSpecialRegularSurfaces("driverStore");
     return;
   }
+  if (props.fileManagerActive) {
+    queryStore.closeRegularTabs();
+    closeSpecialRegularSurfaces("fileManager");
+    return;
+  }
 
   const tab = queryStore.tabs.find((item) => item.id === queryStore.activeTabId);
   if (!tab) return;
@@ -207,7 +217,7 @@ defineExpose({ closeOtherActiveTabs });
 
 function getSpecialRegularTabMenuItems(surface: SpecialRegularSurface): ContextMenuItem[] {
   const keep = surface;
-  const closeCurrent = surface === "driverStore" ? () => emit("close-driver-store") : () => emit("close-settings-page");
+  const closeCurrent = surface === "driverStore" ? () => emit("close-driver-store") : surface === "settings" ? () => emit("close-settings-page") : () => emit("close-file-manager");
   const closeOtherDisabled = regularSurfaceCount.value <= 1;
   const closeOtherLabel = hasFixedTabs.value ? t("contextMenu.closeOtherRegularTabs") : t("contextMenu.closeOtherTabs");
   const closeAllLabel = hasFixedTabs.value ? t("contextMenu.closeAllRegularTabs") : t("contextMenu.closeAllTabs");
@@ -599,12 +609,16 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
                         ? [
                             compactTabTitle ? 'min-w-24' : 'min-w-38',
                             'h-full border-r border-border/80 font-medium dark:border-border/45',
-                            tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90',
+                            tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive && !fileManagerActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90',
                           ]
-                        : [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-7 rounded-md border', tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
+                        : [
+                            compactTabTitle ? 'min-w-24' : 'min-w-38',
+                            'h-7 rounded-md border',
+                            tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive && !fileManagerActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90',
+                          ]
                     "
                     :style="[tabColorStyle(tab), tabDropStyle(tab.id)]"
-                    :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive"
+                    :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive && !fileManagerActive"
                     @click="handleTabClick(tab)"
                     @dblclick.stop="startRenameTab(tab)"
                     @mousedown.middle.prevent="queryStore.closeTab(tab.id)"
@@ -660,6 +674,33 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
                   </template>
                 </TooltipContent>
               </Tooltip>
+            </div>
+          </CustomContextMenu>
+
+          <!-- File Manager Tab -->
+          <CustomContextMenu v-if="fileManagerOpen" :items="getSpecialRegularTabMenuItems('fileManager')" v-slot="{ onContextMenu }">
+            <div :class="isClassicLayout ? 'h-full' : ''" @contextmenu="onContextMenu">
+              <div
+                data-file-manager-tab
+                class="app-tab-pill group flex min-w-36 items-center gap-1 px-2 text-xs cursor-pointer transition-colors whitespace-nowrap"
+                :class="
+                  isClassicLayout
+                    ? ['h-full border-r border-border/80 dark:border-border/45 font-medium', fileManagerActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90']
+                    : ['h-7 rounded-md border font-medium', fileManagerActive ? 'border-ring text-foreground' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
+                "
+                :style="isClassicLayout && fileManagerActive ? { boxShadow: '0 1px 0 0 var(--color-background)' } : {}"
+                :data-active-tab="fileManagerActive"
+                @click="emit('activate-file-manager')"
+                @mousedown.middle.prevent="emit('close-file-manager')"
+              >
+                <span class="shrink-0 text-emerald-600 dark:text-emerald-400">
+                  <FolderOpen class="h-3.5 w-3.5" />
+                </span>
+                <span class="min-w-0 truncate flex-1">{{ t("fileManager.title") }}</span>
+                <button class="rounded hover:bg-muted-foreground/20 p-0.5 shrink-0" @click.stop="emit('close-file-manager')">
+                  <X class="h-3 w-3" />
+                </button>
+              </div>
             </div>
           </CustomContextMenu>
 
@@ -733,7 +774,7 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
             <CustomContextMenu v-for="tab in queryStore.tabs" :key="tab.id" :items="getTabMenuItems(tab)" v-slot="{ onContextMenu }">
               <div
                 class="group flex w-full items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-sm outline-hidden hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground"
-                :class="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'bg-accent/70 text-accent-foreground' : ''"
+                :class="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive && !fileManagerActive ? 'bg-accent/70 text-accent-foreground' : ''"
                 :title="tabTitleLabel(tab)"
                 role="menuitem"
                 tabindex="0"
@@ -792,12 +833,16 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
                         ? [
                             compactTabTitle ? 'min-w-24' : 'min-w-38',
                             'h-full border-r border-border/80 font-medium dark:border-border/45',
-                            tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90',
+                            tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive && !fileManagerActive ? 'bg-background text-foreground' : 'text-foreground/70 hover:text-foreground/90',
                           ]
-                        : [compactTabTitle ? 'min-w-24' : 'min-w-38', 'h-7 rounded-md border', tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90']
+                        : [
+                            compactTabTitle ? 'min-w-24' : 'min-w-38',
+                            'h-7 rounded-md border',
+                            tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive && !fileManagerActive ? 'text-foreground font-medium' : 'border-border/60 text-foreground/70 hover:border-border hover:text-foreground/90',
+                          ]
                     "
                     :style="[tabColorStyle(tab), tabDropStyle(tab.id)]"
-                    :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive"
+                    :data-active-tab="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive && !fileManagerActive"
                     @click="handleTabClick(tab)"
                     @dblclick.stop="startRenameTab(tab)"
                     @mousedown.middle.prevent="queryStore.closeTab(tab.id)"
@@ -872,7 +917,7 @@ function onOverflowItemKeydown(event: KeyboardEvent, tabId: string, kind: "regul
             <CustomContextMenu v-for="tab in fixedTabs" :key="tab.id" :items="getTabMenuItems(tab)" v-slot="{ onContextMenu }">
               <div
                 class="group flex w-full items-center gap-2 rounded-md px-1.5 py-1.5 text-left text-sm outline-hidden hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground"
-                :class="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive ? 'bg-accent/70 text-accent-foreground' : ''"
+                :class="tab.id === queryStore.activeTabId && !driverStoreActive && !settingsPageActive && !fileManagerActive ? 'bg-accent/70 text-accent-foreground' : ''"
                 :title="tabTitleLabel(tab)"
                 role="menuitem"
                 tabindex="0"

@@ -1380,6 +1380,8 @@ pub fn run() {
             commands::file_manager::save_file_connection,
             commands::file_manager::delete_file_connection,
             commands::file_manager::test_file_connection,
+            commands::file_manager::stat_file_path,
+            commands::file_manager::list_file_path,
             commands::plugins::list_plugins,
             commands::plugins::list_jdbc_drivers,
             commands::plugins::list_jdbc_maven_bundles,

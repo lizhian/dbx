@@ -5,7 +5,7 @@ use tauri::State;
 
 use crate::file_manager;
 use crate::file_manager::models::{
-    FileConnection, FileManagerError, SaveFileConnectionRequest, TestFileConnectionRequest,
+    FileConnection, FileEntry, FileManagerError, SaveFileConnectionRequest, TestFileConnectionRequest,
 };
 
 #[tauri::command]
@@ -32,4 +32,22 @@ pub async fn test_file_connection(
     request: TestFileConnectionRequest,
 ) -> Result<(), FileManagerError> {
     file_manager::service::test_connection(&state.storage, request).await
+}
+
+#[tauri::command]
+pub async fn stat_file_path(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    path: String,
+) -> Result<FileEntry, FileManagerError> {
+    file_manager::service::stat_path(&state.storage, &connection_id, &path).await
+}
+
+#[tauri::command]
+pub async fn list_file_path(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    path: String,
+) -> Result<Vec<FileEntry>, FileManagerError> {
+    file_manager::service::list_path(&state.storage, &connection_id, &path).await
 }
