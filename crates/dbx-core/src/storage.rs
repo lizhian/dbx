@@ -33,6 +33,8 @@ const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instruction
 const USER_DATA_TABLES: &[&str] = &[
     "connections",
     "connection_secrets",
+    "file_connections",
+    "file_connection_secrets",
     "history",
     "ai_conversations",
     "mq_token_records",
@@ -263,6 +265,17 @@ const SCHEMA_STATEMENTS: &[&str] = &[
         key TEXT NOT NULL,
         secret TEXT NOT NULL,
         PRIMARY KEY (connection_id, key)
+    )",
+    "CREATE TABLE IF NOT EXISTS file_connections (
+        id TEXT PRIMARY KEY,
+        config_json TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS file_connection_secrets (
+        connection_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        secret TEXT NOT NULL,
+        PRIMARY KEY (connection_id, key),
+        FOREIGN KEY (connection_id) REFERENCES file_connections(id) ON DELETE CASCADE
     )",
     "CREATE TABLE IF NOT EXISTS history (
         id TEXT PRIMARY KEY,
@@ -2705,6 +2718,107 @@ impl Storage {
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
+        })
+        .await
+    }
+}
+
+// File connections are deliberately stored outside the database connection
+// catalog. Protocol-specific types and OpenDAL remain in the desktop crate.
+impl Storage {
+    pub async fn save_file_connection(
+        &self,
+        id: &str,
+        config: &serde_json::Value,
+        secret_updates: &[(String, Option<String>)],
+    ) -> Result<(), String> {
+        let id = id.to_string();
+        let config_json = serde_json::to_string(config).map_err(|error| error.to_string())?;
+        let secret_updates = secret_updates.to_vec();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            tx.execute(
+                "INSERT INTO file_connections (id, config_json) VALUES (?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
+                params![id, config_json],
+            )
+            .map_err(|error| error.to_string())?;
+            for (key, value) in secret_updates {
+                match value {
+                    Some(secret) => {
+                        tx.execute(
+                            "INSERT OR REPLACE INTO file_connection_secrets (connection_id, key, secret)
+                             VALUES (?1, ?2, ?3)",
+                            params![id, key, secret],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                    None => {
+                        tx.execute(
+                            "DELETE FROM file_connection_secrets WHERE connection_id = ?1 AND key = ?2",
+                            params![id, key],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            tx.commit().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_file_connections(&self) -> Result<Vec<serde_json::Value>, String> {
+        self.with_conn(|conn| {
+            let mut statement = conn
+                .prepare("SELECT config_json FROM file_connections ORDER BY id")
+                .map_err(|error| error.to_string())?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?;
+            rows.map(|row| {
+                let json = row.map_err(|error| error.to_string())?;
+                serde_json::from_str(&json).map_err(|error| error.to_string())
+            })
+            .collect()
+        })
+        .await
+    }
+
+    pub async fn delete_file_connection(&self, id: &str) -> Result<bool, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            tx.execute("DELETE FROM file_connection_secrets WHERE connection_id = ?1", [&id])
+                .map_err(|error| error.to_string())?;
+            let deleted =
+                tx.execute("DELETE FROM file_connections WHERE id = ?1", [&id]).map_err(|error| error.to_string())? > 0;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(deleted)
+        })
+        .await
+    }
+
+    pub async fn get_file_connection_secret(&self, id: &str, key: &str) -> Result<Option<String>, String> {
+        let id = id.to_string();
+        let key = key.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT secret FROM file_connection_secrets WHERE connection_id = ?1 AND key = ?2",
+                params![id, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
+        })
+        .await
+    }
+
+    pub async fn file_connection_secret_keys(&self, id: &str) -> Result<Vec<String>, String> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            let mut statement = conn
+                .prepare("SELECT key FROM file_connection_secrets WHERE connection_id = ?1 ORDER BY key")
+                .map_err(|error| error.to_string())?;
+            let rows = statement.query_map([id], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?;
+            rows.map(|row| row.map_err(|error| error.to_string())).collect()
         })
         .await
     }

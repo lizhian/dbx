@@ -1,0 +1,199 @@
+use std::collections::HashMap;
+
+use dbx_core::storage::Storage;
+use opendal::{services, ErrorKind, Operator};
+
+use super::models::{
+    FileConnectionConfig, FileManagerError, HdfsConfig, SecretUpdate, SftpAuthentication, TestFileConnectionRequest,
+    WebdavAuthentication,
+};
+
+#[derive(Default)]
+pub struct ResolvedSecrets {
+    values: HashMap<&'static str, String>,
+}
+
+impl ResolvedSecrets {
+    pub fn get(&self, key: &'static str) -> &str {
+        self.values.get(key).map(String::as_str).unwrap_or_default()
+    }
+}
+
+pub async fn resolve_secrets(
+    storage: &Storage,
+    request: &TestFileConnectionRequest,
+) -> Result<ResolvedSecrets, FileManagerError> {
+    let fields = [
+        ("password", &request.secrets.password),
+        ("private_key", &request.secrets.private_key),
+        ("access_key", &request.secrets.access_key),
+        ("secret_key", &request.secrets.secret_key),
+        ("session_token", &request.secrets.session_token),
+        ("bearer_token", &request.secrets.bearer_token),
+        ("delegation_token", &request.secrets.delegation_token),
+    ];
+    let mut values = HashMap::new();
+    for (key, update) in fields {
+        let value = match update {
+            SecretUpdate::Set(value) if !value.is_empty() => Some(value.clone()),
+            SecretUpdate::Set(_) => {
+                return Err(FileManagerError::configuration(
+                    "A secret value cannot be empty; leave it unchanged or clear it explicitly",
+                ));
+            }
+            SecretUpdate::Clear => None,
+            SecretUpdate::Keep => match request.id.as_deref() {
+                Some(id) => storage
+                    .get_file_connection_secret(id, key)
+                    .await
+                    .map_err(|_| FileManagerError::new("storage", "Failed to read saved credentials"))?,
+                None => None,
+            },
+        };
+        if let Some(value) = value {
+            values.insert(key, value);
+        }
+    }
+    Ok(ResolvedSecrets { values })
+}
+
+pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) -> Result<Operator, FileManagerError> {
+    match config {
+        FileConnectionConfig::Ftp { endpoint, port, root, username } => {
+            validate_required("FTP endpoint", endpoint)?;
+            let endpoint = endpoint_with_port(endpoint, "ftp", *port);
+            Operator::new(
+                services::Ftp::default()
+                    .endpoint(&endpoint)
+                    .root(root)
+                    .user(username)
+                    .password(secrets.get("password")),
+            )
+            .map(|builder| builder.finish())
+            .map_err(map_build_error)
+        }
+        FileConnectionConfig::Sftp { endpoint, port, root, username, authentication } => {
+            #[cfg(not(unix))]
+            {
+                let _ = (endpoint, port, root, username, authentication, secrets);
+                Err(FileManagerError::new("unsupported", "SFTP file connections are supported on macOS and Linux only"))
+            }
+            #[cfg(unix)]
+            {
+                validate_required("SFTP endpoint", endpoint)?;
+                let endpoint = endpoint_with_port(endpoint, "ssh", *port);
+                let mut builder = services::Sftp::default()
+                    .endpoint(&endpoint)
+                    .root(root)
+                    .user(username)
+                    .known_hosts_strategy("Strict");
+                if matches!(authentication, SftpAuthentication::PrivateKey) {
+                    let key = secrets.get("private_key");
+                    validate_required("SFTP private key", key)?;
+                    builder = builder.key(key);
+                }
+                Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
+            }
+        }
+        FileConnectionConfig::S3 { endpoint, region, bucket, root, path_style } => {
+            validate_required("S3 bucket", bucket)?;
+            let mut builder = services::S3::default()
+                .endpoint(endpoint)
+                .region(region)
+                .bucket(bucket)
+                .root(root)
+                .access_key_id(secrets.get("access_key"))
+                .secret_access_key(secrets.get("secret_key"))
+                .disable_config_load()
+                .disable_ec2_metadata();
+            if !secrets.get("session_token").is_empty() {
+                builder = builder.session_token(secrets.get("session_token"));
+            }
+            if !path_style {
+                builder = builder.enable_virtual_host_style();
+            }
+            Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
+        }
+        FileConnectionConfig::Webdav { endpoint, root, authentication } => {
+            validate_required("WebDAV endpoint", endpoint)?;
+            let mut builder = services::Webdav::default().endpoint(endpoint).root(root);
+            match authentication {
+                WebdavAuthentication::Basic { username } => {
+                    builder = builder.username(username).password(secrets.get("password"));
+                }
+                WebdavAuthentication::Bearer => {
+                    builder = builder.token(secrets.get("bearer_token"));
+                }
+            }
+            Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
+        }
+        FileConnectionConfig::Hdfs { config } => match config {
+            HdfsConfig::Webhdfs { endpoint, root, simple_user, use_delegation_token } => {
+                validate_required("WebHDFS endpoint", endpoint)?;
+                let mut builder = services::Webhdfs::default().endpoint(endpoint).root(root);
+                if *use_delegation_token {
+                    builder = builder.delegation(secrets.get("delegation_token"));
+                } else {
+                    builder = builder.user_name(simple_user);
+                }
+                Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
+            }
+            HdfsConfig::Native { name_node_uri, root, hadoop_config_directory: _ } => {
+                validate_required("HDFS NameNode URI", name_node_uri)?;
+                let builder = services::HdfsNative::default().name_node(name_node_uri).root(root);
+                Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
+            }
+        },
+    }
+}
+
+fn validate_required(label: &str, value: &str) -> Result<(), FileManagerError> {
+    if value.trim().is_empty() {
+        Err(FileManagerError::configuration(format!("{label} is required")))
+    } else {
+        Ok(())
+    }
+}
+
+fn endpoint_with_port(endpoint: &str, scheme: &str, port: u16) -> String {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let endpoint = if endpoint.contains("://") { endpoint.to_string() } else { format!("{scheme}://{endpoint}") };
+    let authority = endpoint.split_once("://").map(|(_, authority)| authority).unwrap_or(&endpoint);
+    if authority.rsplit_once(':').is_some_and(|(_, value)| value.parse::<u16>().is_ok()) {
+        endpoint
+    } else {
+        format!("{endpoint}:{port}")
+    }
+}
+
+fn map_build_error(error: opendal::Error) -> FileManagerError {
+    match error.kind() {
+        ErrorKind::ConfigInvalid => FileManagerError::configuration("The file connection configuration is invalid"),
+        ErrorKind::Unsupported => FileManagerError::new("unsupported", "This operation is not supported"),
+        _ => FileManagerError::new("backend", "Failed to initialize the file connection"),
+    }
+}
+
+pub fn map_operation_error(error: opendal::Error) -> FileManagerError {
+    match error.kind() {
+        ErrorKind::ConfigInvalid => FileManagerError::configuration("The file connection configuration is invalid"),
+        ErrorKind::NotFound => FileManagerError::new("not_found", "The requested file or directory does not exist"),
+        ErrorKind::PermissionDenied => FileManagerError::new("permission_denied", "Permission was denied"),
+        ErrorKind::AlreadyExists => FileManagerError::new("already_exists", "The destination already exists"),
+        ErrorKind::Unsupported => FileManagerError::new("unsupported", "This operation is not supported"),
+        ErrorKind::RateLimited => FileManagerError::new("rate_limited", "The remote service rate limit was reached"),
+        _ => FileManagerError::new("backend", "The remote file operation failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_with_port;
+
+    #[test]
+    fn endpoint_port_is_added_once() {
+        assert_eq!(endpoint_with_port("127.0.0.1", "ftp", 2121), "ftp://127.0.0.1:2121");
+        assert_eq!(endpoint_with_port("ftp://127.0.0.1", "ftp", 2121), "ftp://127.0.0.1:2121");
+        assert_eq!(endpoint_with_port("ftp://127.0.0.1:2021", "ftp", 2121), "ftp://127.0.0.1:2021");
+    }
+}

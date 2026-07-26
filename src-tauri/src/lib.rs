@@ -1,6 +1,7 @@
 mod commands;
 mod data_dir;
 mod db;
+mod file_manager;
 #[cfg(target_os = "macos")]
 mod macos_app_delegate;
 mod models;
@@ -1375,6 +1376,10 @@ pub fn run() {
             commands::connection::load_connections,
             commands::connection::save_sidebar_layout,
             commands::connection::load_sidebar_layout,
+            commands::file_manager::list_file_connections,
+            commands::file_manager::save_file_connection,
+            commands::file_manager::delete_file_connection,
+            commands::file_manager::test_file_connection,
             commands::plugins::list_plugins,
             commands::plugins::list_jdbc_drivers,
             commands::plugins::list_jdbc_maven_bundles,

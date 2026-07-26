@@ -1457,6 +1457,22 @@ export async function revealPathInFileManager(path: string): Promise<void> {
   return invoke("reveal_path_in_file_manager", { path });
 }
 
+export async function listFileConnections(): Promise<import("@/types/fileManager").FileConnection[]> {
+  return invoke("list_file_connections");
+}
+
+export async function saveFileConnection(request: import("@/types/fileManager").SaveFileConnectionRequest): Promise<import("@/types/fileManager").FileConnection> {
+  return invoke("save_file_connection", { request });
+}
+
+export async function deleteFileConnection(id: string): Promise<void> {
+  return invoke("delete_file_connection", { id });
+}
+
+export async function testFileConnection(request: import("@/types/fileManager").TestFileConnectionRequest): Promise<void> {
+  return invoke("test_file_connection", { request });
+}
+
 export async function deleteDatabaseBackupFiles(paths: string[]): Promise<number> {
   return invoke("delete_database_backup_files", { paths });
 }

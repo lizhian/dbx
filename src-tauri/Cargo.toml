@@ -65,11 +65,23 @@ axum = { version = "0.8", features = ["ws"] }
 font-kit = "0.14.3"
 tauri-plugin-clipboard-manager = "2.3.2"
 sys-locale = "0.3"
+opendal = { version = "=0.57.0", default-features = false, features = [
+  "executors-tokio",
+  "reqwest-rustls-tls",
+  "services-ftp",
+  "services-s3",
+  "services-webdav",
+  "services-webhdfs",
+  "services-hdfs-native",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDockTile", "NSImage", "NSResponder", "NSView", "NSWindow"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData", "NSString"] }
+
+[target.'cfg(unix)'.dependencies]
+opendal = { version = "=0.57.0", default-features = false, features = ["services-sftp"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libloading = "0.8"
