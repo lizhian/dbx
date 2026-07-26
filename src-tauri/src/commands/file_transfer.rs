@@ -169,7 +169,12 @@ struct TestBlockingBarrier {
 static TEST_CREATE_TEMP_BARRIER: std::sync::OnceLock<Mutex<Option<TestBlockingBarrier>>> = std::sync::OnceLock::new();
 
 #[cfg(test)]
-static TEST_LEAF_MUTATION_BARRIER: std::sync::OnceLock<Mutex<Option<TestBlockingBarrier>>> = std::sync::OnceLock::new();
+static TEST_PUBLISH_LEAF_MUTATION_BARRIER: std::sync::OnceLock<Mutex<Option<TestBlockingBarrier>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+static TEST_CLEANUP_LEAF_MUTATION_BARRIER: std::sync::OnceLock<Mutex<Option<TestBlockingBarrier>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 static TEST_UNSUPPORTED_ATOMIC_RENAME: std::sync::OnceLock<Mutex<Option<OsString>>> = std::sync::OnceLock::new();
@@ -4368,7 +4373,8 @@ fn wait_at_test_create_temp_barrier(_entry_name: &OsStr) {}
 
 #[cfg(test)]
 fn wait_at_test_leaf_mutation_barrier(entry_name: &OsStr) {
-    wait_at_test_blocking_barrier(&TEST_LEAF_MUTATION_BARRIER, entry_name);
+    wait_at_test_blocking_barrier(&TEST_PUBLISH_LEAF_MUTATION_BARRIER, entry_name);
+    wait_at_test_blocking_barrier(&TEST_CLEANUP_LEAF_MUTATION_BARRIER, entry_name);
 }
 
 #[cfg(not(test))]
@@ -4506,7 +4512,7 @@ impl AnchoredDestination {
             )));
         }
         quarantine.remove_file(payload_name)?;
-        quarantine.try_clone()?.into_std_file().sync_all()?;
+        sync_capability_directory(&quarantine)?;
         self.directory.remove_dir(&quarantine_name)?;
         self.sync_directory()?;
         Ok(true)
@@ -4579,7 +4585,7 @@ impl AnchoredDestination {
     }
 
     fn sync_directory(&self) -> io::Result<()> {
-        self.directory.try_clone()?.into_std_file().sync_all()
+        sync_capability_directory(&self.directory)
     }
 }
 
@@ -4675,6 +4681,14 @@ fn atomic_rename_noreplace(
     if let Some(error) = test_atomic_rename_error(source_name) {
         return Err(error);
     }
+    #[cfg(target_os = "linux")]
+    let source_mutation_directory = reopen_linux_directory_for_mutation(source_directory)?;
+    #[cfg(target_os = "linux")]
+    let destination_mutation_directory = reopen_linux_directory_for_mutation(destination_directory)?;
+    #[cfg(target_os = "linux")]
+    let source_directory = &source_mutation_directory;
+    #[cfg(target_os = "linux")]
+    let destination_directory = &destination_mutation_directory;
     rustix::fs::renameat_with(
         source_directory,
         source_name,
@@ -4692,6 +4706,31 @@ fn atomic_rename_noreplace(
             io::Error::from(error)
         }
     })
+}
+
+#[cfg(target_os = "linux")]
+fn reopen_linux_directory_for_mutation(directory: &Dir) -> io::Result<std::os::fd::OwnedFd> {
+    rustix::fs::openat(
+        directory,
+        ".",
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(io::Error::from)
+}
+
+#[cfg(target_os = "linux")]
+fn sync_capability_directory(directory: &Dir) -> io::Result<()> {
+    let mutation_directory = reopen_linux_directory_for_mutation(directory)?;
+    rustix::fs::fsync(&mutation_directory).map_err(io::Error::from)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sync_capability_directory(directory: &Dir) -> io::Result<()> {
+    directory.try_clone()?.into_std_file().sync_all()
 }
 
 #[cfg(windows)]
@@ -6281,6 +6320,15 @@ mod tests {
         let temp_path = parent.join(".dbx-download-test-first.part");
         let identity = canonical_directory_identity(&parent);
         let anchored = AnchoredDestination::open(&target, &temp_path, &identity).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let anchor_flags = rustix::fs::fcntl_getfl(anchored.directory.as_ref()).unwrap();
+            assert!(anchor_flags.contains(rustix::fs::OFlags::PATH));
+            let mutation_directory = reopen_linux_directory_for_mutation(&anchored.directory).unwrap();
+            let mutation_flags = rustix::fs::fcntl_getfl(&mutation_directory).unwrap();
+            assert!(!mutation_flags.contains(rustix::fs::OFlags::PATH));
+            assert!(mutation_flags.contains(rustix::fs::OFlags::DIRECTORY));
+        }
         let (mut temp, temp_identity) = anchored.create_temp().unwrap();
         use std::io::Write;
         temp.write_all(b"payload").unwrap();
@@ -6368,7 +6416,8 @@ mod tests {
         temp.sync_all().unwrap();
         drop(temp);
 
-        let barrier = install_test_blocking_barrier(&TEST_LEAF_MUTATION_BARRIER, temp_path.file_name().unwrap());
+        let barrier =
+            install_test_blocking_barrier(&TEST_PUBLISH_LEAF_MUTATION_BARRIER, temp_path.file_name().unwrap());
         let publish_target = anchored.clone();
         let publish_identity = identity.clone();
         let publishing = tokio::task::spawn_blocking(move || publish_target.publish(&publish_identity));
@@ -6404,7 +6453,8 @@ mod tests {
         temp.sync_all().unwrap();
         drop(temp);
 
-        let barrier = install_test_blocking_barrier(&TEST_LEAF_MUTATION_BARRIER, temp_path.file_name().unwrap());
+        let barrier =
+            install_test_blocking_barrier(&TEST_CLEANUP_LEAF_MUTATION_BARRIER, temp_path.file_name().unwrap());
         let cleanup_target = anchored.clone();
         let cleanup_identity = identity.clone();
         let cleanup = tokio::task::spawn_blocking(move || cleanup_target.remove_owned_temp(&cleanup_identity));

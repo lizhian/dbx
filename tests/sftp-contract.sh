@@ -200,13 +200,18 @@ start_sftp() {
     -v "${public_keys}:/contract-public-keys:ro" \
     "${image}" >/dev/null
 
-  for _ in $(seq 1 60); do
+  ready=0
+  for _ in $(seq 1 180); do
     if nc -z 127.0.0.1 "${port}" >/dev/null 2>&1; then
+      ready=1
       break
     fi
     sleep 1
   done
-  nc -z 127.0.0.1 "${port}" >/dev/null 2>&1
+  if [[ "${ready}" -ne 1 ]]; then
+    echo "SFTP fixture did not accept TCP connections on port ${port} within 180 seconds" >&2
+    exit 1
+  fi
 
   version="$(docker exec "${container}" ssh -V 2>&1)"
   [[ "${version}" == OpenSSH_10.0p1* ]]
