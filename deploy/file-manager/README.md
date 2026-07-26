@@ -64,6 +64,26 @@ cargo run --locked --manifest-path deploy/file-manager/tests/Cargo.toml
 
 测试会输出每个协议实际采用的原生或回退路径。任何协议失败时程序返回非零退出码，但会继续验证其他协议，便于一次看到完整结果。
 
+## DBX 产品级验收门禁
+
+服务健康后，以下命令串行运行桌面 Tauri 产品代码中的六协议 contract。它覆盖连接生命周期、路径边界、Secret 状态、read、write、stat、list、delete、同连接 Copy 和 Rename，并验证各协议的原生或回退路径：
+
+```bash
+cargo test -p dbx --lib --no-default-features file_manager:: -- \
+  --ignored --nocapture --test-threads=1
+```
+
+工程门禁沿用仓库 CI 命令：
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --locked --all-targets -- -D warnings
+cargo test --workspace --locked
+pnpm check
+```
+
+macOS 或 Linux UI smoke 使用 `pnpm dev:tauri` 启动桌面应用。对 FTP、SFTP、S3、WebDAV、WebHDFS 和 HDFS Native 逐一创建、测试并打开连接，然后通过文件管理页面完成上传、目录浏览/stat、下载、同连接 Copy、Rename 和 Delete。确认默认覆盖保护、Replace/Delete 确认、FTP 明文警告、流式 Copy 提示及非原子 Rename 提示符合 capability。真实云认证、生产性能、完整三平台 conformance 和 packaged E2E 不属于此门禁。
+
 ## OpenDAL 连接参数
 
 | 协议 | 参数 |
