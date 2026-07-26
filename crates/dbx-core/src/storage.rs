@@ -2734,15 +2734,50 @@ impl Storage {
     ) -> Result<(), String> {
         let id = id.to_string();
         let config_json = serde_json::to_string(config).map_err(|error| error.to_string())?;
+        let name = config.get("name").and_then(serde_json::Value::as_str).unwrap_or("File connection").to_string();
+        let kind = config
+            .get("config")
+            .and_then(|value| value.get("protocol"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("file")
+            .to_string();
         let secret_updates = secret_updates.to_vec();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|error| error.to_string())?;
-            tx.execute(
-                "INSERT INTO file_connections (id, config_json) VALUES (?1, ?2)
-                 ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
-                params![id, config_json],
-            )
-            .map_err(|error| error.to_string())?;
+            let columns = {
+                let mut statement =
+                    tx.prepare("PRAGMA table_info(file_connections)").map_err(|error| error.to_string())?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(1)).map_err(|error| error.to_string())?;
+                rows.collect::<Result<HashSet<_>, _>>().map_err(|error| error.to_string())?
+            };
+            if columns.contains("name")
+                && columns.contains("kind")
+                && columns.contains("revision")
+                && columns.contains("created_at")
+                && columns.contains("updated_at")
+            {
+                let now = chrono::Utc::now().to_rfc3339();
+                tx.execute(
+                    "INSERT INTO file_connections
+                     (id, name, kind, config_json, revision, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)
+                     ON CONFLICT(id) DO UPDATE SET
+                         name = excluded.name,
+                         kind = excluded.kind,
+                         config_json = excluded.config_json,
+                         revision = file_connections.revision + 1,
+                         updated_at = excluded.updated_at",
+                    params![id, name, kind, config_json, now],
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                tx.execute(
+                    "INSERT INTO file_connections (id, config_json) VALUES (?1, ?2)
+                     ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json",
+                    params![id, config_json],
+                )
+                .map_err(|error| error.to_string())?;
+            }
             for (key, value) in secret_updates {
                 match value {
                     Some(secret) => {
@@ -3608,6 +3643,58 @@ mod tests {
             rollback_sql: None,
             details_json: None,
         }
+    }
+
+    #[tokio::test]
+    async fn file_connections_write_through_the_legacy_table_shape() {
+        let path = temp_db_path("legacy-file-connections");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE file_connections (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        config_json TEXT NOT NULL,
+                        revision INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );",
+                )
+                .unwrap();
+        }
+        let storage = Storage::open(&path).await.unwrap();
+        let first = serde_json::json!({
+            "id": "ftp-1",
+            "name": "Local FTP",
+            "config": {
+                "protocol": "ftp",
+                "endpoint": "127.0.0.1",
+                "port": 2121,
+                "root": "/ftp/dbx/",
+                "username": "dbx"
+            }
+        });
+        storage
+            .save_file_connection("ftp-1", &first, &[("password".to_string(), Some("secret".to_string()))])
+            .await
+            .unwrap();
+
+        let second = serde_json::json!({ "id": "ftp-1", "name": "Renamed FTP", "config": first["config"] });
+        storage.save_file_connection("ftp-1", &second, &[]).await.unwrap();
+
+        let (name, kind, revision): (String, String, i64) = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT name, kind, revision FROM file_connections WHERE id = 'ftp-1'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(name, "Renamed FTP");
+        assert_eq!(kind, "ftp");
+        assert_eq!(revision, 2);
+        assert_eq!(storage.get_file_connection_secret("ftp-1", "password").await.unwrap().as_deref(), Some("secret"));
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
