@@ -185,6 +185,10 @@ curl --silent --show-error --fail \
 
 start_sftp() {
   local suffix="$1"
+  local ready=0
+  local deadline=$((SECONDS + 180))
+  local probe_timeout
+  local probe_hosts
   stop_sftp
   container="dbx-sftp-contract-${suffix}-${RANDOM}"
   docker run -d \
@@ -200,15 +204,23 @@ start_sftp() {
     -v "${public_keys}:/contract-public-keys:ro" \
     "${image}" >/dev/null
 
-  ready=0
-  for _ in $(seq 1 180); do
-    probe_hosts="$(ssh-keyscan -T 2 -p "${port}" 127.0.0.1 2>/dev/null || true)"
-    if docker exec "${container}" id -u "${username}" >/dev/null 2>&1 \
-      && [[ -n "${probe_hosts}" ]]; then
-      ready=1
-      break
+  while ((SECONDS < deadline)); do
+    if docker exec "${container}" id -u "${username}" >/dev/null 2>&1; then
+      probe_timeout=$((deadline - SECONDS))
+      if ((probe_timeout > 2)); then
+        probe_timeout=2
+      fi
+      if ((probe_timeout > 0)); then
+        probe_hosts="$(ssh-keyscan -T "${probe_timeout}" -p "${port}" 127.0.0.1 2>/dev/null || true)"
+        if [[ -n "${probe_hosts}" ]]; then
+          ready=1
+          break
+        fi
+      fi
     fi
-    sleep 1
+    if ((SECONDS < deadline)); then
+      sleep 1
+    fi
   done
   if [[ "${ready}" -ne 1 ]]; then
     echo "SFTP fixture did not complete account setup and SSH handshake within 180 seconds" >&2
