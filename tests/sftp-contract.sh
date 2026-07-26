@@ -202,14 +202,16 @@ start_sftp() {
 
   ready=0
   for _ in $(seq 1 180); do
-    if nc -z 127.0.0.1 "${port}" >/dev/null 2>&1; then
+    probe_hosts="$(ssh-keyscan -T 2 -p "${port}" 127.0.0.1 2>/dev/null || true)"
+    if docker exec "${container}" id -u "${username}" >/dev/null 2>&1 \
+      && [[ -n "${probe_hosts}" ]]; then
       ready=1
       break
     fi
     sleep 1
   done
   if [[ "${ready}" -ne 1 ]]; then
-    echo "SFTP fixture did not accept TCP connections on port ${port} within 180 seconds" >&2
+    echo "SFTP fixture did not complete account setup and SSH handshake within 180 seconds" >&2
     exit 1
   fi
 
