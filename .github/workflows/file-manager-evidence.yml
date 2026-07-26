@@ -69,7 +69,36 @@ jobs:
       - name: Install Linux dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libsecret-1-dev jq netcat-openbsd
+          sudo apt-get install -y \
+            curl \
+            jq \
+            libappindicator3-dev \
+            libsecret-1-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            netcat-openbsd \
+            openssh-client \
+            patchelf \
+            ripgrep \
+            librsvg2-dev \
+            time
+      - name: Verify contract command dependencies
+        shell: bash
+        run: |
+          missing=0
+          for dependency in \
+            awk bash cargo curl dd docker find grep mktemp nc node rg sed \
+            ssh ssh-add ssh-agent ssh-keygen ssh-keyscan sftp tee /usr/bin/time; do
+            if ! command -v "$dependency" >/dev/null 2>&1; then
+              echo "::error::Missing contract command dependency: $dependency"
+              missing=1
+            fi
+          done
+          if ! docker compose version; then
+            echo "::error::The Docker Compose plugin is required by the WebHDFS contract"
+            missing=1
+          fi
+          [[ "$missing" == "0" ]]
       - name: Run pinned service contract
         id: contract
         shell: bash
