@@ -15,7 +15,7 @@ use super::models::{FileManagerError, FileTransferRequest};
 use super::service::{operator_for_connection, validate_remote_path};
 
 const TRANSFER_BUFFER_SIZE: usize = 64 * 1024;
-const TRANSFER_TIMEOUT_SECS: u64 = 60;
+pub(crate) const TRANSFER_TIMEOUT_SECS: u64 = 60;
 const GLOBAL_TRANSFER_LIMIT: usize = 8;
 const CONNECTION_TRANSFER_LIMIT: usize = 2;
 
@@ -31,7 +31,7 @@ impl Default for FileTransferState {
 }
 
 impl FileTransferState {
-    async fn acquire(
+    pub(crate) async fn acquire(
         &self,
         connection_id: &str,
     ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit), FileManagerError> {
@@ -168,7 +168,7 @@ pub async fn delete(
     .await
 }
 
-async fn transfer_timeout<T>(
+pub(crate) async fn transfer_timeout<T>(
     operation: impl std::future::Future<Output = Result<T, FileManagerError>>,
 ) -> Result<T, FileManagerError> {
     tokio::time::timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECS), operation)
@@ -176,7 +176,7 @@ async fn transfer_timeout<T>(
         .map_err(|_| FileManagerError::new("timeout", "The file transfer timed out"))?
 }
 
-async fn copy_with_fixed_buffer<R, W>(reader: R, mut writer: W) -> std::io::Result<u64>
+pub(crate) async fn copy_with_fixed_buffer<R, W>(reader: R, mut writer: W) -> std::io::Result<u64>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -187,7 +187,7 @@ where
     Ok(bytes)
 }
 
-fn non_root_remote_path(path: &str) -> Result<String, FileManagerError> {
+pub(crate) fn non_root_remote_path(path: &str) -> Result<String, FileManagerError> {
     let path = validate_remote_path(path)?;
     if path.is_empty() {
         return Err(FileManagerError::configuration("This operation cannot target the connection root"));

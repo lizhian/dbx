@@ -1493,6 +1493,14 @@ export async function deleteFilePath(connectionId: string, path: string): Promis
   return invoke("delete_file_path", { connectionId, path });
 }
 
+export async function copyFilePath(request: import("@/types/fileManager").FileRemoteOperationRequest): Promise<void> {
+  return invoke("copy_file_path", { request });
+}
+
+export async function renameFilePath(request: import("@/types/fileManager").FileRemoteOperationRequest): Promise<void> {
+  return invoke("rename_file_path", { request });
+}
+
 export async function deleteDatabaseBackupFiles(paths: string[]): Promise<number> {
   return invoke("delete_database_backup_files", { paths });
 }

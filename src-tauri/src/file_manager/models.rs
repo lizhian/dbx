@@ -308,6 +308,16 @@ pub struct FileTransferRequest {
     pub replace: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileRemoteOperationRequest {
+    pub connection_id: String,
+    pub source_path: String,
+    pub destination_path: String,
+    #[serde(default)]
+    pub replace: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileManagerError {

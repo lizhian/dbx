@@ -3,11 +3,13 @@
 import { createApp, defineComponent, h, nextTick, type App } from "vue";
 import { createPinia } from "pinia";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { useToast } from "@/composables/useToast";
 import i18n from "@/i18n";
 import FileManagerPage from "./FileManagerPage.vue";
 import { displayFilePath, parentFilePath } from "./filePath";
 
-const { deleteFilePath, downloadFile, listFilePath, uploadFile } = vi.hoisted(() => ({
+const { copyFilePath, deleteFilePath, downloadFile, listFilePath, renameFilePath, uploadFile } = vi.hoisted(() => ({
+  copyFilePath: vi.fn(async (_request: unknown) => undefined),
   deleteFilePath: vi.fn(async (_connectionId: string, _path: string) => undefined),
   downloadFile: vi.fn(async (_request: unknown) => 11),
   listFilePath: vi.fn(async (_connectionId: string, path: string) =>
@@ -18,6 +20,7 @@ const { deleteFilePath, downloadFile, listFilePath, uploadFile } = vi.hoisted(()
           { path: "fixture.txt", name: "fixture.txt", kind: "file", size: 1536, modifiedAt: "2026-07-27T00:00:00Z" },
         ],
   ),
+  renameFilePath: vi.fn(async (_request: unknown) => undefined),
   uploadFile: vi.fn(async (_request: unknown) => 11),
 }));
 
@@ -61,6 +64,8 @@ vi.mock("@/lib/backend/api", () => ({
   uploadFile,
   downloadFile,
   deleteFilePath,
+  copyFilePath,
+  renameFilePath,
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -98,6 +103,8 @@ afterEach(() => {
   uploadFile.mockClear();
   downloadFile.mockClear();
   deleteFilePath.mockClear();
+  copyFilePath.mockClear();
+  renameFilePath.mockClear();
 });
 
 describe("FileManagerPage browsing", () => {
@@ -170,5 +177,71 @@ describe("FileManagerPage browsing", () => {
     deleteButton?.click();
     await flushPage();
     expect(deleteFilePath).toHaveBeenCalledWith("ftp-local", "folder");
+  });
+
+  it("shows capability-driven Copy only for files and sends one connection ID", async () => {
+    copyFilePath.mockRejectedValueOnce({ code: "already_exists", message: "redacted" }).mockResolvedValueOnce(undefined);
+    await mountPage();
+    buttonWithTitle("Open")?.click();
+    await flushPage();
+
+    expect(document.querySelectorAll('button[title="Copy"]')).toHaveLength(1);
+    buttonWithTitle("Copy")?.click();
+    await flushPage();
+    expect(document.body.textContent).toContain("bounded streaming relay");
+    expect(document.body.textContent).toContain("best-effort");
+
+    const destination = document.querySelector<HTMLInputElement>("#file-operation-destination-path");
+    expect(destination?.value).toBe("fixture.txt.copy");
+    const copyButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).filter((button) => button.textContent?.trim() === "Copy");
+    copyButtons[copyButtons.length - 1]?.click();
+    await flushPage();
+
+    expect(copyFilePath).toHaveBeenCalledTimes(1);
+    expect(copyFilePath).toHaveBeenCalledWith({
+      connectionId: "ftp-local",
+      sourcePath: "fixture.txt",
+      destinationPath: "fixture.txt.copy",
+      replace: false,
+    });
+    expect(copyFilePath.mock.calls[0]?.[0]).not.toHaveProperty("destinationConnectionId");
+
+    const replaceButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Replace");
+    replaceButton?.click();
+    await flushPage();
+    expect(copyFilePath).toHaveBeenCalledTimes(2);
+    expect(copyFilePath.mock.calls[1]?.[0]).toMatchObject({ replace: true });
+  });
+
+  it("shows non-atomic Rename risk and preserves partial-success recovery", async () => {
+    renameFilePath.mockRejectedValueOnce({
+      code: "partial_success",
+      message: "The destination was created, but the source file could not be deleted",
+      recovery: "Delete the source manually.",
+    });
+    await mountPage();
+    buttonWithTitle("Open")?.click();
+    await flushPage();
+
+    buttonWithTitle("Rename or move")?.click();
+    await flushPage();
+    expect(document.body.textContent).toContain("non-atomic");
+    const destination = document.querySelector<HTMLInputElement>("#file-operation-destination-path");
+    if (destination) {
+      destination.value = "moved.txt";
+      destination.dispatchEvent(new Event("input"));
+    }
+    await flushPage();
+    const renameButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Rename or move");
+    renameButton?.click();
+    await flushPage();
+
+    expect(renameFilePath).toHaveBeenCalledWith({
+      connectionId: "ftp-local",
+      sourcePath: "fixture.txt",
+      destinationPath: "moved.txt",
+      replace: false,
+    });
+    expect(useToast().message.value).toContain("Delete the source manually.");
   });
 });

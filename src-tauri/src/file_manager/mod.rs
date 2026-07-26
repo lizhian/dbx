@@ -1,5 +1,6 @@
 mod adapter;
 pub mod models;
+pub(crate) mod operations;
 pub(crate) mod service;
 pub(crate) mod transfer;
 

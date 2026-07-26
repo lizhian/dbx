@@ -5,8 +5,8 @@ use tauri::State;
 
 use crate::file_manager;
 use crate::file_manager::models::{
-    FileConnection, FileEntry, FileManagerError, FileTransferRequest, SaveFileConnectionRequest,
-    TestFileConnectionRequest,
+    FileConnection, FileEntry, FileManagerError, FileRemoteOperationRequest, FileTransferRequest,
+    SaveFileConnectionRequest, TestFileConnectionRequest,
 };
 use crate::file_manager::FileTransferState;
 
@@ -86,4 +86,22 @@ pub async fn delete_file_path(
     path: String,
 ) -> Result<(), FileManagerError> {
     file_manager::transfer::delete(&state.storage, &transfer_state, &connection_id, &path).await
+}
+
+#[tauri::command]
+pub async fn copy_file_path(
+    state: State<'_, Arc<AppState>>,
+    transfer_state: State<'_, FileTransferState>,
+    request: FileRemoteOperationRequest,
+) -> Result<(), FileManagerError> {
+    file_manager::operations::copy(&state.storage, &transfer_state, request).await
+}
+
+#[tauri::command]
+pub async fn rename_file_path(
+    state: State<'_, Arc<AppState>>,
+    transfer_state: State<'_, FileTransferState>,
+    request: FileRemoteOperationRequest,
+) -> Result<(), FileManagerError> {
+    file_manager::operations::rename(&state.storage, &transfer_state, request).await
 }

@@ -121,3 +121,10 @@ export interface FileTransferRequest {
   localPath: string;
   replace?: boolean;
 }
+
+export interface FileRemoteOperationRequest {
+  connectionId: string;
+  sourcePath: string;
+  destinationPath: string;
+  replace?: boolean;
+}

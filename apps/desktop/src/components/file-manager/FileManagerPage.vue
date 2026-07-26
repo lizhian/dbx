@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowLeft, ChevronLeft, Download, Folder, FolderOpen, Loader2, Pencil, Plus, RefreshCw, Trash2, Unplug, Upload } from "@lucide/vue";
+import { ArrowLeft, ChevronLeft, Copy, Download, FilePenLine, Folder, FolderOpen, Loader2, Pencil, Plus, RefreshCw, Trash2, Unplug, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
@@ -10,7 +10,7 @@ import { useFileConnectionStore } from "@/stores/fileConnectionStore";
 import { useToast } from "@/composables/useToast";
 import { formatError } from "@/lib/backend/errorUtils";
 import * as api from "@/lib/backend/api";
-import type { FileConnection, FileEntry } from "@/types/fileManager";
+import type { FileConnection, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
 import FileConnectionDialog from "./FileConnectionDialog.vue";
 import { childFilePath, displayFilePath, formatFileSize, parentFilePath } from "./filePath";
 
@@ -33,7 +33,18 @@ const uploadLocalPath = ref("");
 const uploadRemotePath = ref("");
 const operationActive = ref("");
 const deleteEntryTarget = ref<FileEntry>();
-const replaceRequest = ref<{ operation: "upload" | "download"; request: { connectionId: string; remotePath: string; localPath: string; replace: boolean } }>();
+const remoteOperation = ref<{ operation: "copy" | "rename"; entry: FileEntry; destinationPath: string }>();
+const replaceRequest = ref<{ operation: "upload" | "download"; request: FileTransferRequest } | { operation: "copy" | "rename"; request: FileRemoteOperationRequest }>();
+const replaceDestination = computed(() => {
+  const pending = replaceRequest.value;
+  return pending ? ("remotePath" in pending.request ? pending.request.remotePath : pending.request.destinationPath) : "";
+});
+const remoteDestinationPath = computed({
+  get: () => remoteOperation.value?.destinationPath ?? "",
+  set: (value: string) => {
+    if (remoteOperation.value) remoteOperation.value.destinationPath = value;
+  },
+});
 
 onMounted(async () => {
   try {
@@ -130,7 +141,7 @@ async function startDownload(entry: FileEntry) {
   }
 }
 
-async function runTransfer(operation: "upload" | "download", request: { connectionId: string; remotePath: string; localPath: string; replace: boolean }) {
+async function runTransfer(operation: "upload" | "download", request: FileTransferRequest) {
   operationActive.value = `${operation}:${request.remotePath}`;
   try {
     const bytes = operation === "upload" ? await api.uploadFile(request) : await api.downloadFile(request);
@@ -147,10 +158,72 @@ async function runTransfer(operation: "upload" | "download", request: { connecti
   }
 }
 
+function startRemoteOperation(entry: FileEntry, operation: "copy" | "rename") {
+  if (entry.kind !== "file") return;
+  remoteOperation.value = {
+    operation,
+    entry,
+    destinationPath: operation === "copy" ? childFilePath(currentPath.value, `${entry.name}.copy`) : entry.path,
+  };
+}
+
+async function confirmRemoteOperation() {
+  const connection = activeConnection.value;
+  const pending = remoteOperation.value;
+  if (!connection || !pending || !pending.destinationPath.trim()) return;
+  remoteOperation.value = undefined;
+  await runRemoteOperation(pending.operation, {
+    connectionId: connection.id,
+    sourcePath: pending.entry.path,
+    destinationPath: pending.destinationPath.trim(),
+    replace: false,
+  });
+}
+
+async function runRemoteOperation(operation: "copy" | "rename", request: FileRemoteOperationRequest) {
+  operationActive.value = `${operation}:${request.sourcePath}`;
+  try {
+    if (operation === "copy") await api.copyFilePath(request);
+    else await api.renameFilePath(request);
+    toast(t(operation === "copy" ? "fileManager.copySucceeded" : "fileManager.renameSucceeded"));
+    await refreshDirectory();
+  } catch (error) {
+    if (typeof error === "object" && error && "code" in error && error.code === "already_exists") {
+      replaceRequest.value = { operation, request: { ...request, replace: true } };
+    } else {
+      toast(formatFileOperationError(error), 6000);
+    }
+  } finally {
+    operationActive.value = "";
+  }
+}
+
+function formatFileOperationError(error: unknown): string {
+  const message = formatError(error);
+  if (typeof error === "object" && error && "recovery" in error && typeof error.recovery === "string") {
+    return `${message} ${error.recovery}`;
+  }
+  return message;
+}
+
 async function confirmReplace() {
   const pending = replaceRequest.value;
   replaceRequest.value = undefined;
-  if (pending) await runTransfer(pending.operation, pending.request);
+  if (!pending) return;
+  switch (pending.operation) {
+    case "upload":
+      await runTransfer("upload", pending.request);
+      break;
+    case "download":
+      await runTransfer("download", pending.request);
+      break;
+    case "copy":
+      await runRemoteOperation("copy", pending.request);
+      break;
+    case "rename":
+      await runRemoteOperation("rename", pending.request);
+      break;
+  }
 }
 
 async function confirmDeleteEntry() {
@@ -233,7 +306,7 @@ async function removeConnection() {
               <th class="w-28 px-3 py-2 font-medium">{{ t("fileManager.type") }}</th>
               <th class="w-28 px-3 py-2 text-right font-medium">{{ t("fileManager.size") }}</th>
               <th class="w-48 px-3 py-2 font-medium">{{ t("fileManager.modified") }}</th>
-              <th class="w-24 px-3 py-2 text-right font-medium">{{ t("fileManager.actions") }}</th>
+              <th class="w-36 px-3 py-2 text-right font-medium">{{ t("fileManager.actions") }}</th>
             </tr>
           </thead>
           <tbody>
@@ -249,6 +322,14 @@ async function removeConnection() {
               <td class="px-3 py-2 text-right tabular-nums text-muted-foreground">{{ entry.kind === "file" ? formatFileSize(entry.size) : "—" }}</td>
               <td class="truncate px-3 py-2 text-muted-foreground">{{ entry.modifiedAt ? new Date(entry.modifiedAt).toLocaleString() : "—" }}</td>
               <td class="px-3 py-1 text-right">
+                <Button v-if="entry.kind === 'file' && activeConnection.capabilities.copy" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.copy')" @click="startRemoteOperation(entry, 'copy')">
+                  <Loader2 v-if="operationActive === `copy:${entry.path}`" class="h-4 w-4 animate-spin" />
+                  <Copy v-else class="h-4 w-4" />
+                </Button>
+                <Button v-if="entry.kind === 'file' && activeConnection.capabilities.rename" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.rename')" @click="startRemoteOperation(entry, 'rename')">
+                  <Loader2 v-if="operationActive === `rename:${entry.path}`" class="h-4 w-4 animate-spin" />
+                  <FilePenLine v-else class="h-4 w-4" />
+                </Button>
                 <Button v-if="entry.kind === 'file' && activeConnection.capabilities.read" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.download')" @click="startDownload(entry)">
                   <Loader2 v-if="operationActive === `download:${entry.path}`" class="h-4 w-4 animate-spin" />
                   <Download v-else class="h-4 w-4" />
@@ -341,10 +422,39 @@ async function removeConnection() {
         <DialogTitle>{{ t("fileManager.replaceTitle") }}</DialogTitle>
       </DialogHeader>
       <p class="text-sm text-muted-foreground">{{ t("fileManager.replaceMessage") }}</p>
-      <p class="truncate font-mono text-xs">{{ replaceRequest?.request.remotePath }}</p>
+      <p class="truncate font-mono text-xs">{{ replaceDestination }}</p>
       <DialogFooter>
         <Button variant="outline" @click="replaceRequest = undefined">{{ t("common.cancel") }}</Button>
         <Button variant="destructive" @click="confirmReplace">{{ t("fileManager.replace") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog :open="!!remoteOperation" @update:open="(open) => !open && (remoteOperation = undefined)">
+    <DialogContent class="sm:max-w-[500px]">
+      <DialogHeader>
+        <DialogTitle>{{ t(remoteOperation?.operation === "rename" ? "fileManager.rename" : "fileManager.copy") }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-4">
+        <div class="grid gap-1.5">
+          <Label>{{ t("fileManager.sourcePath") }}</Label>
+          <Input :model-value="remoteOperation?.entry.path" disabled />
+        </div>
+        <div class="grid gap-1.5">
+          <Label for="file-operation-destination-path">{{ t("fileManager.destinationPath") }}</Label>
+          <Input id="file-operation-destination-path" v-model="remoteDestinationPath" />
+        </div>
+        <div class="border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs text-muted-foreground">
+          <p v-if="remoteOperation?.operation === 'copy' && activeConnection?.capabilities.copyMode === 'stream_relay'">{{ t("fileManager.streamRelayNotice") }}</p>
+          <p v-if="remoteOperation?.operation === 'rename' && activeConnection?.capabilities.renameMode === 'copy_delete'">{{ t("fileManager.nonAtomicRenameNotice") }}</p>
+          <p v-if="!activeConnection?.capabilities.atomicNoClobber">{{ t("fileManager.bestEffortNoClobberNotice") }}</p>
+        </div>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" @click="remoteOperation = undefined">{{ t("common.cancel") }}</Button>
+        <Button :disabled="!remoteDestinationPath.trim() || remoteDestinationPath.trim() === remoteOperation?.entry.path" @click="confirmRemoteOperation">
+          {{ t(remoteOperation?.operation === "rename" ? "fileManager.rename" : "fileManager.copy") }}
+        </Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

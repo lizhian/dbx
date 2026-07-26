@@ -599,6 +599,14 @@ export async function deleteFilePath(_connectionId: string, _path: string): Prom
   throw new Error("Remote file connections are only available in the desktop app.");
 }
 
+export async function copyFilePath(_request: import("@/types/fileManager").FileRemoteOperationRequest): Promise<void> {
+  throw new Error("Remote file connections are only available in the desktop app.");
+}
+
+export async function renameFilePath(_request: import("@/types/fileManager").FileRemoteOperationRequest): Promise<void> {
+  throw new Error("Remote file connections are only available in the desktop app.");
+}
+
 export async function deleteDatabaseBackupFiles(_paths: string[]): Promise<number> {
   throw new Error("Database backup file management is only available in the desktop app.");
 }
