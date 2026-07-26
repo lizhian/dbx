@@ -1947,6 +1947,7 @@ dependencies = [
  "portpicker",
  "redis",
  "reqwest 0.12.28",
+ "roxmltree",
  "russh",
  "rust_decimal",
  "rustls 0.23.40",

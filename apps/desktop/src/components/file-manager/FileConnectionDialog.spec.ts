@@ -219,6 +219,24 @@ const webhdfsConnection: FileConnection = {
   },
 };
 
+const nativeHdfsConnection: FileConnection = {
+  ...webhdfsConnection,
+  id: "hdfs-native-local",
+  config: {
+    protocol: "hdfs",
+    implementation: "native",
+    nameNodeUri: "hdfs://127.0.0.1:19000",
+    root: "/",
+    hadoopConfigDirectory: "/tmp/hadoop-conf",
+  },
+  capabilities: {
+    ...webhdfsConnection.capabilities,
+    nativeRename: true,
+    atomicRename: true,
+    renameMode: "native",
+  },
+};
+
 async function mountDialog(selectedConnection: FileConnection = connection) {
   const container = document.createElement("div");
   document.body.append(container);
@@ -427,5 +445,22 @@ describe("FileConnectionDialog HDFS lifecycle form", () => {
     draft.delegationToken = "";
     draft.clearDelegationToken = true;
     expect(hdfsDelegationTokenUpdate(draft)).toEqual({ action: "clear" });
+  });
+
+  it("reuses the HDFS discriminator and shows only Native configuration fields", async () => {
+    await mountDialog(nativeHdfsConnection);
+
+    expect(document.body.textContent).toContain("HDFS Native");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-name-node-uri")?.value).toBe("hdfs://127.0.0.1:19000");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-hadoop-config-directory")?.value).toBe("/tmp/hadoop-conf");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-root")?.value).toBe("/");
+    expect(document.querySelector("#file-connection-endpoint")).toBeNull();
+    expect(document.querySelector("#file-connection-simple-user")).toBeNull();
+    expect(document.querySelector("#file-connection-delegation-token")).toBeNull();
+
+    const draft = createFileConnectionDraft(nativeHdfsConnection);
+    const request = fileConnectionRequestFromDraft(draft);
+    expect(request.config).toEqual(nativeHdfsConnection.config);
+    expect(request.secrets?.delegationToken).toEqual({ action: "clear" });
   });
 });

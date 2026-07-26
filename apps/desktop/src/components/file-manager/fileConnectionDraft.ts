@@ -1,4 +1,4 @@
-import type { FileConnection, FileProtocol, FtpFileConnectionConfig, S3FileConnectionConfig, SaveFileConnectionRequest, SecretUpdate, SftpFileConnectionConfig, WebdavFileConnectionConfig, WebhdfsFileConnectionConfig } from "@/types/fileManager";
+import type { FileConnection, FileProtocol, FtpFileConnectionConfig, NativeHdfsFileConnectionConfig, S3FileConnectionConfig, SaveFileConnectionRequest, SecretUpdate, SftpFileConnectionConfig, WebdavFileConnectionConfig, WebhdfsFileConnectionConfig } from "@/types/fileManager";
 
 export type SftpAuthenticationMethod = "ssh_config" | "ssh_agent" | "private_key";
 export type WebdavAuthenticationMethod = "basic" | "bearer";
@@ -35,6 +35,8 @@ export interface FileConnectionDraft {
   useDelegationToken: boolean;
   delegationToken: string;
   clearDelegationToken: boolean;
+  nameNodeUri: string;
+  hadoopConfigDirectory: string;
 }
 
 export type FtpConnectionDraft = FileConnectionDraft;
@@ -70,6 +72,8 @@ function emptyDraft(connection?: FileConnection): FileConnectionDraft {
     useDelegationToken: false,
     delegationToken: "",
     clearDelegationToken: false,
+    nameNodeUri: "hdfs://127.0.0.1:19000",
+    hadoopConfigDirectory: "",
   };
 }
 
@@ -106,6 +110,16 @@ export function createFileConnectionDraft(connection?: FileConnection): FileConn
       hdfsImplementation: "webhdfs",
       simpleUser: config.simpleUser,
       useDelegationToken: config.useDelegationToken,
+    };
+  }
+  if (config?.protocol === "hdfs" && config.implementation === "native") {
+    return {
+      ...draft,
+      protocol: "hdfs",
+      root: config.root,
+      hdfsImplementation: "native",
+      nameNodeUri: config.nameNodeUri,
+      hadoopConfigDirectory: config.hadoopConfigDirectory,
     };
   }
   if (config?.protocol === "sftp") {
@@ -242,6 +256,21 @@ export function fileConnectionRequestFromDraft(draft: FileConnectionDraft): Save
     };
   }
   if (draft.protocol === "hdfs") {
+    if (draft.hdfsImplementation === "native") {
+      const config: NativeHdfsFileConnectionConfig = {
+        protocol: "hdfs",
+        implementation: "native",
+        nameNodeUri: draft.nameNodeUri.trim(),
+        root: draft.root.trim(),
+        hadoopConfigDirectory: draft.hadoopConfigDirectory.trim(),
+      };
+      return {
+        id: draft.id,
+        name: draft.name.trim(),
+        config,
+        secrets: { delegationToken: { action: "clear" } },
+      };
+    }
     const config: WebhdfsFileConnectionConfig = {
       protocol: "hdfs",
       implementation: "webhdfs",

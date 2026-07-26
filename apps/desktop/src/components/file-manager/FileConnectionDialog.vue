@@ -31,8 +31,10 @@ const saving = reactive({ active: false, message: "" });
 const isEditing = computed(() => !!props.connection);
 const isWindows = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
 const canSubmit = computed(() => {
+  const hdfsNative = draft.protocol === "hdfs" && draft.hdfsImplementation === "native";
   const portValid = draft.protocol === "s3" || draft.protocol === "webdav" || draft.protocol === "hdfs" || (draft.port > 0 && draft.port <= 65535);
-  const common = !!draft.name.trim() && !!draft.endpoint.trim() && portValid && !!draft.root.trim();
+  const endpointValid = hdfsNative || !!draft.endpoint.trim();
+  const common = !!draft.name.trim() && endpointValid && portValid && !!draft.root.trim();
   if (!common || (draft.protocol === "sftp" && isWindows)) return false;
   if (draft.protocol === "s3") {
     const accessKey = !!draft.accessKey || (!!props.connection?.secretStatus.accessKey && !draft.clearAccessKey);
@@ -46,6 +48,9 @@ const canSubmit = computed(() => {
     return !!draft.bearerToken || (!!props.connection?.secretStatus.bearerToken && !draft.clearBearerToken);
   }
   if (draft.protocol === "hdfs") {
+    if (draft.hdfsImplementation === "native") {
+      return !!draft.nameNodeUri.trim() && !!draft.hadoopConfigDirectory.trim();
+    }
     if (!draft.useDelegationToken) return !!draft.simpleUser.trim();
     return !!draft.delegationToken || (!!props.connection?.secretStatus.delegationToken && !draft.clearDelegationToken);
   }
@@ -113,6 +118,18 @@ async function selectPrivateKey() {
     testing.error = true;
   }
 }
+
+async function selectHadoopConfigDirectory() {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({ multiple: false, directory: true, title: t("fileManager.selectHadoopConfigDirectory") });
+    if (!selected || Array.isArray(selected)) return;
+    draft.hadoopConfigDirectory = selected;
+  } catch (error) {
+    testing.message = formatError(error);
+    testing.error = true;
+  }
+}
 </script>
 
 <template>
@@ -144,7 +161,20 @@ async function selectPrivateKey() {
           </Select>
         </div>
 
-        <div class="grid gap-3" :class="{ 'grid-cols-[1fr_104px]': draft.protocol !== 's3' && draft.protocol !== 'webdav' && draft.protocol !== 'hdfs' }">
+        <div v-if="draft.protocol === 'hdfs'" class="grid gap-1.5">
+          <Label>{{ t("fileManager.implementation") }}</Label>
+          <Select v-model="draft.hdfsImplementation">
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="webhdfs">WebHDFS</SelectItem>
+              <SelectItem value="native">HDFS Native</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div v-if="draft.protocol !== 'hdfs' || draft.hdfsImplementation === 'webhdfs'" class="grid gap-3" :class="{ 'grid-cols-[1fr_104px]': draft.protocol !== 's3' && draft.protocol !== 'webdav' && draft.protocol !== 'hdfs' }">
           <div class="grid gap-1.5">
             <Label for="file-connection-endpoint">{{ t("fileManager.endpoint") }}</Label>
             <Input id="file-connection-endpoint" v-model="draft.endpoint" autocomplete="off" />
@@ -246,19 +276,7 @@ async function selectPrivateKey() {
           </label>
         </div>
 
-        <template v-if="draft.protocol === 'hdfs'">
-          <div class="grid gap-1.5">
-            <Label>{{ t("fileManager.implementation") }}</Label>
-            <Select v-model="draft.hdfsImplementation">
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="webhdfs">WebHDFS</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-
+        <template v-if="draft.protocol === 'hdfs' && draft.hdfsImplementation === 'webhdfs'">
           <label class="inline-flex w-fit items-center gap-2 text-sm">
             <input v-model="draft.useDelegationToken" type="checkbox" />
             {{ t("fileManager.useDelegationToken") }}
@@ -276,6 +294,23 @@ async function selectPrivateKey() {
               <input v-model="draft.clearDelegationToken" type="checkbox" />
               {{ t("fileManager.clearSavedDelegationToken") }}
             </label>
+          </div>
+        </template>
+
+        <template v-if="draft.protocol === 'hdfs' && draft.hdfsImplementation === 'native'">
+          <div class="grid gap-1.5">
+            <Label for="file-connection-name-node-uri">{{ t("fileManager.nameNodeUri") }}</Label>
+            <Input id="file-connection-name-node-uri" v-model="draft.nameNodeUri" autocomplete="off" />
+          </div>
+
+          <div class="grid gap-1.5">
+            <Label for="file-connection-hadoop-config-directory">{{ t("fileManager.hadoopConfigDirectory") }}</Label>
+            <div class="flex gap-2">
+              <Input id="file-connection-hadoop-config-directory" :model-value="draft.hadoopConfigDirectory" disabled />
+              <Button type="button" variant="outline" size="icon" :title="t('fileManager.selectHadoopConfigDirectory')" :aria-label="t('fileManager.selectHadoopConfigDirectory')" @click="selectHadoopConfigDirectory">
+                <FolderOpen class="h-4 w-4" />
+              </Button>
+            </div>
           </div>
         </template>
 

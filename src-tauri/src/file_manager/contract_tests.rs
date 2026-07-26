@@ -638,3 +638,155 @@ mod webhdfs {
         let _ = tokio::fs::remove_file(database).await;
     }
 }
+
+mod hdfs_native {
+    use dbx_core::storage::Storage;
+    use uuid::Uuid;
+
+    use super::super::models::{
+        FileConnectionConfig, FileEntryKind, FileRemoteOperationRequest, FileSecretUpdates, FileTransferRequest,
+        HdfsConfig, SaveFileConnectionRequest, TestFileConnectionRequest,
+    };
+    use super::super::operations;
+    use super::super::service;
+    use super::super::transfer::{self, FileTransferState};
+
+    #[tokio::test]
+    #[ignore = "requires deploy/file-manager HDFS Native service"]
+    async fn hdfs_native_config_fallback_copy_native_rename_and_path_boundary_contract() {
+        let suffix = Uuid::new_v4();
+        let database = std::env::temp_dir().join(format!("dbx-hdfs-native-contract-{suffix}.db"));
+        let local_source = std::env::temp_dir().join(format!("dbx-hdfs-native-source-{suffix}.txt"));
+        let local_download = std::env::temp_dir().join(format!("dbx-hdfs-native-download-{suffix}.txt"));
+        let hadoop_config_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/file-manager/config/hadoop/client")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let storage = Storage::open(&database).await.unwrap();
+        let config = FileConnectionConfig::Hdfs {
+            config: HdfsConfig::Native {
+                name_node_uri: "hdfs://127.0.0.1:19000".to_string(),
+                root: "/".to_string(),
+                hadoop_config_directory,
+            },
+        };
+        let saved = service::save_connection(
+            &storage,
+            SaveFileConnectionRequest {
+                id: "hdfs-native-contract".to_string(),
+                name: "HDFS Native Contract".to_string(),
+                config: config.clone(),
+                secrets: FileSecretUpdates::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!saved.capabilities.native_copy);
+        assert!(saved.capabilities.native_rename);
+        assert!(saved.capabilities.atomic_rename);
+        service::test_connection(
+            &storage,
+            TestFileConnectionRequest {
+                id: Some("hdfs-native-contract".to_string()),
+                config: config.clone(),
+                secrets: FileSecretUpdates::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let edited = service::save_connection(
+            &storage,
+            SaveFileConnectionRequest {
+                id: "hdfs-native-contract".to_string(),
+                name: "Edited HDFS Native Contract".to_string(),
+                config,
+                secrets: FileSecretUpdates::default(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(edited.name, "Edited HDFS Native Contract");
+
+        for invalid_path in ["/escape", "../escape", "%2e%2e/escape", "directory\\file"] {
+            assert_eq!(
+                service::stat_path(&storage, "hdfs-native-contract", invalid_path).await.unwrap_err().code,
+                "configuration"
+            );
+        }
+
+        let operator = service::operator_for_connection(&storage, "hdfs-native-contract").await.unwrap();
+        assert!(!operator.info().full_capability().copy);
+        assert!(operator.info().full_capability().rename);
+        let source = format!("dbx-hdfs-native-{suffix}-source.txt");
+        let copied = format!("dbx-hdfs-native-{suffix}-copied.txt");
+        let renamed = format!("dbx-hdfs-native-{suffix}-renamed.txt");
+        tokio::fs::write(&local_source, b"HDFS Native seven-operation contract").await.unwrap();
+        let state = FileTransferState::default();
+        transfer::upload(
+            &storage,
+            &state,
+            FileTransferRequest {
+                connection_id: "hdfs-native-contract".to_string(),
+                remote_path: source.clone(),
+                local_path: local_source.to_string_lossy().to_string(),
+                replace: false,
+            },
+        )
+        .await
+        .unwrap();
+        let stat = service::stat_path(&storage, "hdfs-native-contract", &source).await.unwrap();
+        assert_eq!(stat.kind, FileEntryKind::File);
+        assert_eq!(stat.size, b"HDFS Native seven-operation contract".len() as u64);
+        assert!(service::list_path(&storage, "hdfs-native-contract", "")
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.path == source));
+
+        let copy_request = FileRemoteOperationRequest {
+            connection_id: "hdfs-native-contract".to_string(),
+            source_path: source.clone(),
+            destination_path: copied.clone(),
+            replace: false,
+        };
+        operations::copy(&storage, &state, copy_request.clone()).await.unwrap();
+        assert_eq!(operations::copy(&storage, &state, copy_request).await.unwrap_err().code, "already_exists");
+        operations::rename(
+            &storage,
+            &state,
+            FileRemoteOperationRequest {
+                connection_id: "hdfs-native-contract".to_string(),
+                source_path: copied.clone(),
+                destination_path: renamed.clone(),
+                replace: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(service::stat_path(&storage, "hdfs-native-contract", &copied).await.unwrap_err().code, "not_found");
+
+        transfer::download(
+            &storage,
+            &state,
+            FileTransferRequest {
+                connection_id: "hdfs-native-contract".to_string(),
+                remote_path: renamed.clone(),
+                local_path: local_download.to_string_lossy().to_string(),
+                replace: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(tokio::fs::read(&local_download).await.unwrap(), b"HDFS Native seven-operation contract");
+
+        transfer::delete(&storage, &state, "hdfs-native-contract", &source).await.unwrap();
+        transfer::delete(&storage, &state, "hdfs-native-contract", &renamed).await.unwrap();
+        service::delete_connection(&storage, "hdfs-native-contract").await.unwrap();
+        assert!(service::list_connections(&storage).await.unwrap().is_empty());
+        let _ = tokio::fs::remove_file(local_source).await;
+        let _ = tokio::fs::remove_file(local_download).await;
+        let _ = tokio::fs::remove_file(database).await;
+    }
+}

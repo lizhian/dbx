@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::io::Read;
+use std::path::Path;
 
 use dbx_core::storage::Storage;
 use opendal::{services, ErrorKind, Operator};
@@ -144,13 +146,97 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
                 }
                 Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
             }
-            HdfsConfig::Native { name_node_uri, root, hadoop_config_directory: _ } => {
-                validate_required("HDFS NameNode URI", name_node_uri)?;
-                let builder = services::HdfsNative::default().name_node(name_node_uri).root(root);
+            HdfsConfig::Native { name_node_uri, root, hadoop_config_directory } => {
+                validate_hdfs_name_node_uri(name_node_uri)?;
+                let options = load_hadoop_config_options(hadoop_config_directory)?;
+                let builder = services::HdfsNative::default().name_node(name_node_uri).root(root).options(options);
                 Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
             }
         },
     }
+}
+
+fn validate_hdfs_name_node_uri(value: &str) -> Result<(), FileManagerError> {
+    let authority = value.trim().strip_prefix("hdfs://").map(|value| value.trim_end_matches('/')).filter(|value| {
+        !value.is_empty()
+            && !value.contains('/')
+            && !value.chars().any(char::is_whitespace)
+            && value.split(',').all(|node| !node.is_empty())
+    });
+    if authority.is_some() {
+        Ok(())
+    } else {
+        Err(FileManagerError::configuration("The HDFS NameNode URI must use the hdfs:// scheme"))
+    }
+}
+
+const MAX_HADOOP_CONFIG_FILE_SIZE: u64 = 1024 * 1024;
+
+fn load_hadoop_config_options(directory: &str) -> Result<HashMap<String, String>, FileManagerError> {
+    validate_required("Hadoop config directory", directory)?;
+    let directory = Path::new(directory);
+    if !directory.is_absolute() {
+        return Err(FileManagerError::configuration("The Hadoop config directory must be an absolute path"));
+    }
+    if !directory
+        .metadata()
+        .map_err(|_| FileManagerError::configuration("The Hadoop config directory is not accessible"))?
+        .is_dir()
+    {
+        return Err(FileManagerError::configuration("The Hadoop config path must be a directory"));
+    }
+
+    let mut options = HashMap::new();
+    let mut loaded = false;
+    for file_name in ["core-site.xml", "hdfs-site.xml"] {
+        let path = directory.join(file_name);
+        let metadata = match path.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(FileManagerError::configuration("A Hadoop config file is not accessible")),
+        };
+        if !metadata.is_file() || metadata.len() > MAX_HADOOP_CONFIG_FILE_SIZE {
+            return Err(FileManagerError::configuration("A Hadoop config file is invalid or too large"));
+        }
+        let file = std::fs::File::open(&path)
+            .map_err(|_| FileManagerError::configuration("A Hadoop config file is not accessible"))?;
+        let mut bytes = Vec::with_capacity((metadata.len().min(MAX_HADOOP_CONFIG_FILE_SIZE) + 1) as usize);
+        file.take(MAX_HADOOP_CONFIG_FILE_SIZE + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| FileManagerError::configuration("A Hadoop config file is not accessible"))?;
+        if bytes.len() as u64 > MAX_HADOOP_CONFIG_FILE_SIZE {
+            return Err(FileManagerError::configuration("A Hadoop config file is invalid or too large"));
+        }
+        let content = String::from_utf8(bytes)
+            .map_err(|_| FileManagerError::configuration("A Hadoop config file is not valid UTF-8"))?;
+        let document = roxmltree::Document::parse(&content)
+            .map_err(|_| FileManagerError::configuration("A Hadoop config file contains invalid XML"))?;
+        let configuration = document
+            .root_element()
+            .has_tag_name("configuration")
+            .then(|| document.root_element())
+            .ok_or_else(|| FileManagerError::configuration("A Hadoop config file has an invalid root element"))?;
+        for property in configuration.children().filter(|node| node.has_tag_name("property")) {
+            let name = property
+                .children()
+                .find(|node| node.has_tag_name("name"))
+                .and_then(|node| node.text())
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            let value =
+                property.children().find(|node| node.has_tag_name("value")).and_then(|node| node.text()).map(str::trim);
+            if let (Some(name), Some(value)) = (name, value) {
+                options.insert(name.to_string(), value.to_string());
+            }
+        }
+        loaded = true;
+    }
+    if !loaded {
+        return Err(FileManagerError::configuration(
+            "The Hadoop config directory must contain core-site.xml or hdfs-site.xml",
+        ));
+    }
+    Ok(options)
 }
 
 fn validate_required(label: &str, value: &str) -> Result<(), FileManagerError> {
@@ -196,9 +282,9 @@ pub fn map_operation_error(error: opendal::Error) -> FileManagerError {
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_with_port;
     #[cfg(unix)]
     use super::{build_operator, ResolvedSecrets};
+    use super::{endpoint_with_port, load_hadoop_config_options, validate_hdfs_name_node_uri};
     #[cfg(unix)]
     use crate::file_manager::models::{FileConnectionConfig, SftpAuthentication};
 
@@ -207,6 +293,37 @@ mod tests {
         assert_eq!(endpoint_with_port("127.0.0.1", "ftp", 2121), "ftp://127.0.0.1:2121");
         assert_eq!(endpoint_with_port("ftp://127.0.0.1", "ftp", 2121), "ftp://127.0.0.1:2121");
         assert_eq!(endpoint_with_port("ftp://127.0.0.1:2021", "ftp", 2121), "ftp://127.0.0.1:2021");
+    }
+
+    #[test]
+    fn hadoop_config_directory_is_absolute_bounded_and_structured() {
+        let directory = std::env::temp_dir().join(format!("dbx-hadoop-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("hdfs-site.xml"),
+            r#"<?xml version="1.0"?>
+<configuration>
+  <property>
+    <name>dfs.client.use.datanode.hostname</name>
+    <value>true</value>
+  </property>
+</configuration>"#,
+        )
+        .unwrap();
+        let options = load_hadoop_config_options(directory.to_str().unwrap()).unwrap();
+        assert_eq!(options.get("dfs.client.use.datanode.hostname").map(String::as_str), Some("true"));
+        assert_eq!(load_hadoop_config_options("relative/config").unwrap_err().code, "configuration");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn hdfs_name_node_uri_requires_an_hdfs_authority() {
+        for value in ["hdfs://127.0.0.1:19000", "hdfs://nameservice", "hdfs://node-1:9000,node-2:9000/"] {
+            assert!(validate_hdfs_name_node_uri(value).is_ok());
+        }
+        for value in ["", "http://127.0.0.1:19000", "hdfs://", "hdfs://node/path", "hdfs://node one"] {
+            assert!(validate_hdfs_name_node_uri(value).is_err());
+        }
     }
 
     #[cfg(unix)]

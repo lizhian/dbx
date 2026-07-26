@@ -73,7 +73,7 @@ cargo run --locked --manifest-path deploy/file-manager/tests/Cargo.toml
 | S3 | endpoint `http://127.0.0.1:9000`，region `us-east-1`，bucket `dbx`，root `/root/`，access key `dbx-access-key`，secret key `dbx-secret-key`，path-style |
 | WebDAV | endpoint `http://127.0.0.1:8080`，root `/`，Basic 用户名 `dbx`，密码 `dbx-password` |
 | WebHDFS | endpoint `http://127.0.0.1:9870`，root `/`，simple user `dbx` |
-| HDFS Native | NameNode `hdfs://127.0.0.1:19000`，root `/`，`dfs.client.use.datanode.hostname=true` |
+| HDFS Native | NameNode `hdfs://127.0.0.1:19000`，root `/`，Hadoop config directory `deploy/file-manager/config/hadoop/client`（包含 `dfs.client.use.datanode.hostname=true`） |
 
 FTP 镜像默认不 chroot 用户，因此 OpenDAL 的连接 root 必须使用服务端真实目录 `/ftp/dbx/`。客户端测试路径仍然全部相对于该 root。
 

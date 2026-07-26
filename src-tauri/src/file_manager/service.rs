@@ -6,8 +6,9 @@ use percent_encoding::percent_decode_str;
 
 use super::adapter::{build_operator, map_operation_error, resolve_secrets};
 use super::models::{
-    FileCapabilities, FileConnection, FileEntry, FileEntryKind, FileManagerError, FileSecretStatus,
-    SaveFileConnectionRequest, StoredFileConnection, TestFileConnectionRequest,
+    FileCapabilities, FileConnection, FileConnectionConfig, FileEntry, FileEntryKind, FileManagerError,
+    FileSecretStatus, FileSecretUpdates, HdfsConfig, SaveFileConnectionRequest, SecretUpdate, SftpAuthentication,
+    StoredFileConnection, TestFileConnectionRequest, WebdavAuthentication,
 };
 
 const CONNECTION_TEST_TIMEOUT_SECS: u64 = 15;
@@ -33,9 +34,10 @@ pub async fn list_connections(storage: &Storage) -> Result<Vec<FileConnection>, 
 
 pub async fn save_connection(
     storage: &Storage,
-    request: SaveFileConnectionRequest,
+    mut request: SaveFileConnectionRequest,
 ) -> Result<FileConnection, FileManagerError> {
     validate_identity(&request.id, &request.name)?;
+    clear_inactive_secret_updates(&request.config, &mut request.secrets);
     let validation_request = TestFileConnectionRequest {
         id: Some(request.id.clone()),
         config: request.config.clone(),
@@ -56,6 +58,37 @@ pub async fn save_connection(
         .await
         .map_err(|_| FileManagerError::new("storage", "Failed to load file connection credential status"))?;
     Ok(public_connection(stored, FileSecretStatus::from_keys(&keys)))
+}
+
+fn clear_inactive_secret_updates(config: &FileConnectionConfig, secrets: &mut FileSecretUpdates) {
+    let (password, private_key, access_key, secret_key, session_token, bearer_token, delegation_token) = match config {
+        FileConnectionConfig::Ftp { .. } => (true, false, false, false, false, false, false),
+        FileConnectionConfig::Sftp { authentication, .. } => {
+            (false, matches!(authentication, SftpAuthentication::PrivateKey), false, false, false, false, false)
+        }
+        FileConnectionConfig::S3 { .. } => (false, false, true, true, true, false, false),
+        FileConnectionConfig::Webdav { authentication, .. } => match authentication {
+            WebdavAuthentication::Basic { .. } => (true, false, false, false, false, false, false),
+            WebdavAuthentication::Bearer => (false, false, false, false, false, true, false),
+        },
+        FileConnectionConfig::Hdfs { config: HdfsConfig::Webhdfs { use_delegation_token: true, .. } } => {
+            (false, false, false, false, false, false, true)
+        }
+        FileConnectionConfig::Hdfs { .. } => (false, false, false, false, false, false, false),
+    };
+    for (active, update) in [
+        (password, &mut secrets.password),
+        (private_key, &mut secrets.private_key),
+        (access_key, &mut secrets.access_key),
+        (secret_key, &mut secrets.secret_key),
+        (session_token, &mut secrets.session_token),
+        (bearer_token, &mut secrets.bearer_token),
+        (delegation_token, &mut secrets.delegation_token),
+    ] {
+        if !active {
+            *update = SecretUpdate::Clear;
+        }
+    }
 }
 
 pub async fn delete_connection(storage: &Storage, id: &str) -> Result<(), FileManagerError> {
@@ -435,6 +468,60 @@ mod tests {
         let stored = serde_json::to_string(&storage.load_file_connections().await.unwrap()).unwrap();
         assert!(!public.contains("secret-delegation-token"));
         assert!(!stored.contains("secret-delegation-token"));
+    }
+
+    #[tokio::test]
+    async fn native_hdfs_reuses_the_hdfs_product_contract_and_requires_config_directory() {
+        let storage = storage("native-hdfs-config").await;
+        let hadoop_config_directory =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/file-manager/config/hadoop/client");
+        save_connection(
+            &storage,
+            SaveFileConnectionRequest {
+                id: "hdfs-native".to_string(),
+                name: "Local HDFS".to_string(),
+                config: FileConnectionConfig::Hdfs {
+                    config: HdfsConfig::Webhdfs {
+                        endpoint: "http://127.0.0.1:9870".to_string(),
+                        root: "/".to_string(),
+                        simple_user: String::new(),
+                        use_delegation_token: true,
+                    },
+                },
+                secrets: FileSecretUpdates {
+                    delegation_token: SecretUpdate::Set("old-delegation-token".to_string()),
+                    ..Default::default()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(storage.get_file_connection_secret("hdfs-native", "delegation_token").await.unwrap().is_some());
+        let request = |directory: String| SaveFileConnectionRequest {
+            id: "hdfs-native".to_string(),
+            name: "Local HDFS".to_string(),
+            config: FileConnectionConfig::Hdfs {
+                config: HdfsConfig::Native {
+                    name_node_uri: "hdfs://127.0.0.1:19000".to_string(),
+                    root: "/".to_string(),
+                    hadoop_config_directory: directory,
+                },
+            },
+            secrets: FileSecretUpdates::default(),
+        };
+        assert_eq!(save_connection(&storage, request(String::new())).await.unwrap_err().code, "configuration");
+        let saved = save_connection(
+            &storage,
+            request(hadoop_config_directory.canonicalize().unwrap().to_string_lossy().to_string()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(saved.config, FileConnectionConfig::Hdfs { config: HdfsConfig::Native { .. } }));
+        assert!(!saved.capabilities.native_copy);
+        assert!(saved.capabilities.native_rename);
+        assert!(saved.capabilities.atomic_rename);
+        assert!(!saved.secret_status.delegation_token);
+        assert_eq!(storage.get_file_connection_secret("hdfs-native", "delegation_token").await.unwrap(), None);
     }
 
     #[tokio::test]
