@@ -1246,6 +1246,7 @@ pub fn run() {
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
             app.manage(commands::update::PendingUpdateState::default());
+            app.manage(file_manager::FileTransferState::default());
             app.manage(commands::ssh_prompt::SshPromptState::new());
             commands::ssh_prompt::install_ssh_prompt_bridge(app.handle());
             commands::ssh_prompt::install_ssh_notice_bridge(app.handle());
@@ -1382,6 +1383,9 @@ pub fn run() {
             commands::file_manager::test_file_connection,
             commands::file_manager::stat_file_path,
             commands::file_manager::list_file_path,
+            commands::file_manager::upload_file,
+            commands::file_manager::download_file,
+            commands::file_manager::delete_file_path,
             commands::plugins::list_plugins,
             commands::plugins::list_jdbc_drivers,
             commands::plugins::list_jdbc_maven_bundles,

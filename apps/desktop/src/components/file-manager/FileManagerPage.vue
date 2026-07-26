@@ -1,16 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowLeft, ChevronLeft, Folder, FolderOpen, Loader2, Pencil, Plus, RefreshCw, Trash2, Unplug } from "@lucide/vue";
+import { ArrowLeft, ChevronLeft, Download, Folder, FolderOpen, Loader2, Pencil, Plus, RefreshCw, Trash2, Unplug, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useFileConnectionStore } from "@/stores/fileConnectionStore";
 import { useToast } from "@/composables/useToast";
 import { formatError } from "@/lib/backend/errorUtils";
 import * as api from "@/lib/backend/api";
 import type { FileConnection, FileEntry } from "@/types/fileManager";
 import FileConnectionDialog from "./FileConnectionDialog.vue";
-import { displayFilePath, formatFileSize, parentFilePath } from "./filePath";
+import { childFilePath, displayFilePath, formatFileSize, parentFilePath } from "./filePath";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -26,6 +28,12 @@ const entries = ref<FileEntry[]>([]);
 const browsing = ref(false);
 const browseError = ref("");
 const visiblePath = computed(() => displayFilePath(currentPath.value));
+const uploadDialogOpen = ref(false);
+const uploadLocalPath = ref("");
+const uploadRemotePath = ref("");
+const operationActive = ref("");
+const deleteEntryTarget = ref<FileEntry>();
+const replaceRequest = ref<{ operation: "upload" | "download"; request: { connectionId: string; remotePath: string; localPath: string; replace: boolean } }>();
 
 onMounted(async () => {
   try {
@@ -77,6 +85,91 @@ async function refreshDirectory() {
   }
 }
 
+async function selectUploadFile() {
+  if (!activeConnection.value?.capabilities.write) return;
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({ multiple: false, directory: false, title: t("fileManager.selectUpload") });
+    if (!selected || Array.isArray(selected)) return;
+    uploadLocalPath.value = selected;
+    const name = selected.split(/[/\\]/).pop() ?? "";
+    uploadRemotePath.value = childFilePath(currentPath.value, name);
+    uploadDialogOpen.value = true;
+  } catch (error) {
+    toast(formatError(error), 4000);
+  }
+}
+
+async function startUpload() {
+  const connection = activeConnection.value;
+  if (!connection || !uploadRemotePath.value.trim()) return;
+  uploadDialogOpen.value = false;
+  await runTransfer("upload", {
+    connectionId: connection.id,
+    remotePath: uploadRemotePath.value.trim(),
+    localPath: uploadLocalPath.value,
+    replace: false,
+  });
+}
+
+async function startDownload(entry: FileEntry) {
+  const connection = activeConnection.value;
+  if (!connection?.capabilities.read || entry.kind !== "file") return;
+  try {
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const localPath = await save({ defaultPath: entry.name, title: t("fileManager.selectDownload") });
+    if (!localPath) return;
+    await runTransfer("download", {
+      connectionId: connection.id,
+      remotePath: entry.path,
+      localPath,
+      replace: false,
+    });
+  } catch (error) {
+    toast(formatError(error), 4000);
+  }
+}
+
+async function runTransfer(operation: "upload" | "download", request: { connectionId: string; remotePath: string; localPath: string; replace: boolean }) {
+  operationActive.value = `${operation}:${request.remotePath}`;
+  try {
+    const bytes = operation === "upload" ? await api.uploadFile(request) : await api.downloadFile(request);
+    toast(t(operation === "upload" ? "fileManager.uploadSucceeded" : "fileManager.downloadSucceeded", { size: formatFileSize(bytes) }));
+    if (operation === "upload") await refreshDirectory();
+  } catch (error) {
+    if (typeof error === "object" && error && "code" in error && error.code === "already_exists") {
+      replaceRequest.value = { operation, request: { ...request, replace: true } };
+    } else {
+      toast(formatError(error), 4000);
+    }
+  } finally {
+    operationActive.value = "";
+  }
+}
+
+async function confirmReplace() {
+  const pending = replaceRequest.value;
+  replaceRequest.value = undefined;
+  if (pending) await runTransfer(pending.operation, pending.request);
+}
+
+async function confirmDeleteEntry() {
+  const connection = activeConnection.value;
+  const entry = deleteEntryTarget.value;
+  if (!connection || !entry) return;
+  deleteEntryTarget.value = undefined;
+  operationActive.value = `delete:${entry.path}`;
+  try {
+    await api.deleteFilePath(connection.id, entry.path);
+    toast(t("fileManager.deleteSucceeded"));
+    await refreshDirectory();
+  } catch (error) {
+    toast(formatError(error), 4000);
+  } finally {
+    operationActive.value = "";
+  }
+}
+
 function closeBrowser() {
   activeConnection.value = undefined;
   currentPath.value = "";
@@ -123,6 +216,12 @@ async function removeConnection() {
           <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': browsing }" />
         </Button>
         <span class="min-w-0 flex-1 truncate px-2 font-mono text-xs" :title="visiblePath">{{ visiblePath }}</span>
+        <Button v-if="activeConnection.capabilities.write" variant="outline" size="sm" class="h-7" :disabled="!!operationActive" @click="selectUploadFile">
+          <Loader2 v-if="operationActive.startsWith('upload:')" class="h-4 w-4 animate-spin" />
+          <Upload v-else class="h-4 w-4" />
+          {{ t("fileManager.upload") }}
+        </Button>
+        <span v-if="operationActive" role="status" class="sr-only">{{ t("fileManager.transferring") }}</span>
       </div>
 
       <div v-if="browseError" role="alert" class="border-b px-3 py-2 text-sm text-destructive">{{ browseError }}</div>
@@ -134,6 +233,7 @@ async function removeConnection() {
               <th class="w-28 px-3 py-2 font-medium">{{ t("fileManager.type") }}</th>
               <th class="w-28 px-3 py-2 text-right font-medium">{{ t("fileManager.size") }}</th>
               <th class="w-48 px-3 py-2 font-medium">{{ t("fileManager.modified") }}</th>
+              <th class="w-24 px-3 py-2 text-right font-medium">{{ t("fileManager.actions") }}</th>
             </tr>
           </thead>
           <tbody>
@@ -148,6 +248,16 @@ async function removeConnection() {
               <td class="px-3 py-2 text-muted-foreground">{{ t(`fileManager.kind.${entry.kind}`) }}</td>
               <td class="px-3 py-2 text-right tabular-nums text-muted-foreground">{{ entry.kind === "file" ? formatFileSize(entry.size) : "—" }}</td>
               <td class="truncate px-3 py-2 text-muted-foreground">{{ entry.modifiedAt ? new Date(entry.modifiedAt).toLocaleString() : "—" }}</td>
+              <td class="px-3 py-1 text-right">
+                <Button v-if="entry.kind === 'file' && activeConnection.capabilities.read" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.download')" @click="startDownload(entry)">
+                  <Loader2 v-if="operationActive === `download:${entry.path}`" class="h-4 w-4 animate-spin" />
+                  <Download v-else class="h-4 w-4" />
+                </Button>
+                <Button v-if="activeConnection.capabilities.delete" variant="ghost" size="icon" class="h-7 w-7 text-destructive" :disabled="!!operationActive" :title="t('common.delete')" @click="deleteEntryTarget = entry">
+                  <Loader2 v-if="operationActive === `delete:${entry.path}`" class="h-4 w-4 animate-spin" />
+                  <Trash2 v-else class="h-4 w-4" />
+                </Button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -202,6 +312,55 @@ async function removeConnection() {
   </section>
 
   <FileConnectionDialog v-model:open="dialogOpen" :connection="editing" @saved="toast(t('fileManager.connectionSaved'))" />
+
+  <Dialog v-model:open="uploadDialogOpen">
+    <DialogContent class="sm:max-w-[480px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("fileManager.upload") }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-4">
+        <div class="grid gap-1.5">
+          <Label>{{ t("fileManager.localFile") }}</Label>
+          <Input :model-value="uploadLocalPath" disabled />
+        </div>
+        <div class="grid gap-1.5">
+          <Label for="file-upload-remote-path">{{ t("fileManager.remotePath") }}</Label>
+          <Input id="file-upload-remote-path" v-model="uploadRemotePath" />
+        </div>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" @click="uploadDialogOpen = false">{{ t("common.cancel") }}</Button>
+        <Button :disabled="!uploadRemotePath.trim()" @click="startUpload">{{ t("fileManager.upload") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog :open="!!replaceRequest" @update:open="(open) => !open && (replaceRequest = undefined)">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("fileManager.replaceTitle") }}</DialogTitle>
+      </DialogHeader>
+      <p class="text-sm text-muted-foreground">{{ t("fileManager.replaceMessage") }}</p>
+      <p class="truncate font-mono text-xs">{{ replaceRequest?.request.remotePath }}</p>
+      <DialogFooter>
+        <Button variant="outline" @click="replaceRequest = undefined">{{ t("common.cancel") }}</Button>
+        <Button variant="destructive" @click="confirmReplace">{{ t("fileManager.replace") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog :open="!!deleteEntryTarget" @update:open="(open) => !open && (deleteEntryTarget = undefined)">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("fileManager.deleteEntryTitle") }}</DialogTitle>
+      </DialogHeader>
+      <p class="text-sm text-muted-foreground">{{ t("fileManager.deleteEntryMessage", { name: deleteEntryTarget?.name }) }}</p>
+      <DialogFooter>
+        <Button variant="outline" @click="deleteEntryTarget = undefined">{{ t("common.cancel") }}</Button>
+        <Button variant="destructive" @click="confirmDeleteEntry">{{ t("common.delete") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
 
   <Dialog :open="!!deleting" @update:open="(open) => !open && (deleting = undefined)">
     <DialogContent class="sm:max-w-[400px]">

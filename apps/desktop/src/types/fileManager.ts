@@ -114,3 +114,10 @@ export interface FileEntry {
   size: number;
   modifiedAt?: string;
 }
+
+export interface FileTransferRequest {
+  connectionId: string;
+  remotePath: string;
+  localPath: string;
+  replace?: boolean;
+}

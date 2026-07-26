@@ -298,6 +298,16 @@ pub struct FileEntry {
     pub modified_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTransferRequest {
+    pub connection_id: String,
+    pub remote_path: String,
+    pub local_path: String,
+    #[serde(default)]
+    pub replace: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileManagerError {

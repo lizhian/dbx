@@ -5,8 +5,10 @@ use tauri::State;
 
 use crate::file_manager;
 use crate::file_manager::models::{
-    FileConnection, FileEntry, FileManagerError, SaveFileConnectionRequest, TestFileConnectionRequest,
+    FileConnection, FileEntry, FileManagerError, FileTransferRequest, SaveFileConnectionRequest,
+    TestFileConnectionRequest,
 };
+use crate::file_manager::FileTransferState;
 
 #[tauri::command]
 pub async fn list_file_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<FileConnection>, FileManagerError> {
@@ -22,8 +24,14 @@ pub async fn save_file_connection(
 }
 
 #[tauri::command]
-pub async fn delete_file_connection(state: State<'_, Arc<AppState>>, id: String) -> Result<(), FileManagerError> {
-    file_manager::service::delete_connection(&state.storage, &id).await
+pub async fn delete_file_connection(
+    state: State<'_, Arc<AppState>>,
+    transfer_state: State<'_, FileTransferState>,
+    id: String,
+) -> Result<(), FileManagerError> {
+    file_manager::service::delete_connection(&state.storage, &id).await?;
+    transfer_state.forget_connection(&id).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -50,4 +58,32 @@ pub async fn list_file_path(
     path: String,
 ) -> Result<Vec<FileEntry>, FileManagerError> {
     file_manager::service::list_path(&state.storage, &connection_id, &path).await
+}
+
+#[tauri::command]
+pub async fn upload_file(
+    state: State<'_, Arc<AppState>>,
+    transfer_state: State<'_, FileTransferState>,
+    request: FileTransferRequest,
+) -> Result<u64, FileManagerError> {
+    file_manager::transfer::upload(&state.storage, &transfer_state, request).await
+}
+
+#[tauri::command]
+pub async fn download_file(
+    state: State<'_, Arc<AppState>>,
+    transfer_state: State<'_, FileTransferState>,
+    request: FileTransferRequest,
+) -> Result<u64, FileManagerError> {
+    file_manager::transfer::download(&state.storage, &transfer_state, request).await
+}
+
+#[tauri::command]
+pub async fn delete_file_path(
+    state: State<'_, Arc<AppState>>,
+    transfer_state: State<'_, FileTransferState>,
+    connection_id: String,
+    path: String,
+) -> Result<(), FileManagerError> {
+    file_manager::transfer::delete(&state.storage, &transfer_state, &connection_id, &path).await
 }

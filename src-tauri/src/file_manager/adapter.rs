@@ -179,7 +179,9 @@ pub fn map_operation_error(error: opendal::Error) -> FileManagerError {
         ErrorKind::ConfigInvalid => FileManagerError::configuration("The file connection configuration is invalid"),
         ErrorKind::NotFound => FileManagerError::new("not_found", "The requested file or directory does not exist"),
         ErrorKind::PermissionDenied => FileManagerError::new("permission_denied", "Permission was denied"),
-        ErrorKind::AlreadyExists => FileManagerError::new("already_exists", "The destination already exists"),
+        ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch => {
+            FileManagerError::new("already_exists", "The destination already exists")
+        }
         ErrorKind::Unsupported => FileManagerError::new("unsupported", "This operation is not supported"),
         ErrorKind::RateLimited => FileManagerError::new("rate_limited", "The remote service rate limit was reached"),
         _ => FileManagerError::new("backend", "The remote file operation failed"),

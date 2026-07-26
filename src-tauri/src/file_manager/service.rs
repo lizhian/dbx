@@ -151,7 +151,10 @@ fn validate_path_representation(path: &str) -> Result<(), FileManagerError> {
     Ok(())
 }
 
-async fn operator_for_connection(storage: &Storage, connection_id: &str) -> Result<Operator, FileManagerError> {
+pub(crate) async fn operator_for_connection(
+    storage: &Storage,
+    connection_id: &str,
+) -> Result<Operator, FileManagerError> {
     let stored = stored_connection(storage, connection_id).await?;
     let request = TestFileConnectionRequest { id: Some(stored.id), config: stored.config, secrets: Default::default() };
     let secrets = resolve_secrets(storage, &request).await?;

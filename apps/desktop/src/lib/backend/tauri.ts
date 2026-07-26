@@ -1481,6 +1481,18 @@ export async function listFilePath(connectionId: string, path: string): Promise<
   return invoke("list_file_path", { connectionId, path });
 }
 
+export async function uploadFile(request: import("@/types/fileManager").FileTransferRequest): Promise<number> {
+  return invoke("upload_file", { request });
+}
+
+export async function downloadFile(request: import("@/types/fileManager").FileTransferRequest): Promise<number> {
+  return invoke("download_file", { request });
+}
+
+export async function deleteFilePath(connectionId: string, path: string): Promise<void> {
+  return invoke("delete_file_path", { connectionId, path });
+}
+
 export async function deleteDatabaseBackupFiles(paths: string[]): Promise<number> {
   return invoke("delete_database_backup_files", { paths });
 }
