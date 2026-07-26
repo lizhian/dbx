@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type { FileConnection } from "@/types/fileManager";
 import FileConnectionDialog from "./FileConnectionDialog.vue";
-import { createFileConnectionDraft, createFtpConnectionDraft, fileConnectionRequestFromDraft, ftpPasswordUpdate, s3AccessKeyUpdate, s3SecretKeyUpdate, s3SessionTokenUpdate, sftpPrivateKeyUpdate, webdavBearerTokenUpdate } from "./fileConnectionDraft";
+import { createFileConnectionDraft, createFtpConnectionDraft, fileConnectionRequestFromDraft, ftpPasswordUpdate, hdfsDelegationTokenUpdate, s3AccessKeyUpdate, s3SecretKeyUpdate, s3SessionTokenUpdate, sftpPrivateKeyUpdate, webdavBearerTokenUpdate } from "./fileConnectionDraft";
 
 vi.mock("@/lib/backend/api", () => ({
   listFileConnections: vi.fn(async () => []),
@@ -182,6 +182,43 @@ const webdavBearerConnection: FileConnection = {
   },
 };
 
+const webhdfsConnection: FileConnection = {
+  id: "webhdfs-local",
+  name: "Local HDFS",
+  config: {
+    protocol: "hdfs",
+    implementation: "webhdfs",
+    endpoint: "http://127.0.0.1:9870",
+    root: "/",
+    simpleUser: "dbx",
+    useDelegationToken: false,
+  },
+  capabilities: {
+    read: true,
+    write: true,
+    stat: true,
+    list: true,
+    delete: true,
+    copy: true,
+    rename: true,
+    nativeCopy: false,
+    nativeRename: false,
+    atomicRename: false,
+    atomicNoClobber: false,
+    copyMode: "stream_relay",
+    renameMode: "copy_delete",
+  },
+  secretStatus: {
+    password: false,
+    privateKey: false,
+    accessKey: false,
+    secretKey: false,
+    sessionToken: false,
+    bearerToken: false,
+    delegationToken: false,
+  },
+};
+
 async function mountDialog(selectedConnection: FileConnection = connection) {
   const container = document.createElement("div");
   document.body.append(container);
@@ -345,5 +382,50 @@ describe("FileConnectionDialog WebDAV lifecycle form", () => {
     draft.clearBearerToken = true;
     request = fileConnectionRequestFromDraft(draft);
     expect(request.secrets?.bearerToken).toEqual({ action: "clear" });
+  });
+});
+
+describe("FileConnectionDialog HDFS lifecycle form", () => {
+  it("shows the shared HDFS discriminator and only WebHDFS simple-user fields", async () => {
+    await mountDialog(webhdfsConnection);
+
+    expect(document.querySelector<HTMLInputElement>("#file-connection-endpoint")?.value).toBe("http://127.0.0.1:9870");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-root")?.value).toBe("/");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-simple-user")?.value).toBe("dbx");
+    expect(document.body.textContent).toContain("WebHDFS");
+    expect(document.querySelector("#file-connection-port")).toBeNull();
+    expect(document.querySelector("#file-connection-username")).toBeNull();
+    expect(document.querySelector("#file-connection-delegation-token")).toBeNull();
+  });
+
+  it("models simple user and delegation token as exclusive structured authentication", () => {
+    const draft = createFileConnectionDraft(webhdfsConnection);
+    let request = fileConnectionRequestFromDraft(draft);
+    expect(request.config).toEqual({
+      protocol: "hdfs",
+      implementation: "webhdfs",
+      endpoint: "http://127.0.0.1:9870",
+      root: "/",
+      simpleUser: "dbx",
+      useDelegationToken: false,
+    });
+    expect(request.secrets?.delegationToken).toEqual({ action: "clear" });
+
+    draft.useDelegationToken = true;
+    expect(hdfsDelegationTokenUpdate(draft)).toEqual({ action: "keep" });
+    draft.delegationToken = "replacement-delegation";
+    request = fileConnectionRequestFromDraft(draft);
+    expect(request.config).toMatchObject({
+      protocol: "hdfs",
+      implementation: "webhdfs",
+      simpleUser: "",
+      useDelegationToken: true,
+    });
+    expect(request.secrets?.delegationToken).toEqual({ action: "set", value: "replacement-delegation" });
+    expect(JSON.stringify(request.config)).not.toContain("replacement-delegation");
+
+    draft.delegationToken = "";
+    draft.clearDelegationToken = true;
+    expect(hdfsDelegationTokenUpdate(draft)).toEqual({ action: "clear" });
   });
 });

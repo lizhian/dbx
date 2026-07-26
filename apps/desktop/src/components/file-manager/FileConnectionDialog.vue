@@ -31,7 +31,7 @@ const saving = reactive({ active: false, message: "" });
 const isEditing = computed(() => !!props.connection);
 const isWindows = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
 const canSubmit = computed(() => {
-  const portValid = draft.protocol === "s3" || draft.protocol === "webdav" || (draft.port > 0 && draft.port <= 65535);
+  const portValid = draft.protocol === "s3" || draft.protocol === "webdav" || draft.protocol === "hdfs" || (draft.port > 0 && draft.port <= 65535);
   const common = !!draft.name.trim() && !!draft.endpoint.trim() && portValid && !!draft.root.trim();
   if (!common || (draft.protocol === "sftp" && isWindows)) return false;
   if (draft.protocol === "s3") {
@@ -44,6 +44,10 @@ const canSubmit = computed(() => {
       return !!draft.username.trim() && (!!draft.password || (!!props.connection?.secretStatus.password && !draft.clearPassword));
     }
     return !!draft.bearerToken || (!!props.connection?.secretStatus.bearerToken && !draft.clearBearerToken);
+  }
+  if (draft.protocol === "hdfs") {
+    if (!draft.useDelegationToken) return !!draft.simpleUser.trim();
+    return !!draft.delegationToken || (!!props.connection?.secretStatus.delegationToken && !draft.clearDelegationToken);
   }
   if (draft.protocol !== "sftp" || draft.authentication !== "private_key") return true;
   return !!draft.privateKey || (!!props.connection?.secretStatus.privateKey && !draft.clearPrivateKey);
@@ -93,7 +97,7 @@ async function saveConnection() {
 }
 
 function changeProtocol(value: unknown) {
-  if (value !== "ftp" && value !== "sftp" && value !== "s3" && value !== "webdav") return;
+  if (value !== "ftp" && value !== "sftp" && value !== "s3" && value !== "webdav" && value !== "hdfs") return;
   Object.assign(draft, createProtocolDraft(value, draft));
 }
 
@@ -135,16 +139,17 @@ async function selectPrivateKey() {
               <SelectItem value="sftp">SFTP</SelectItem>
               <SelectItem value="s3">S3</SelectItem>
               <SelectItem value="webdav">WebDAV</SelectItem>
+              <SelectItem value="hdfs">HDFS</SelectItem>
             </SelectContent>
           </Select>
         </div>
 
-        <div class="grid gap-3" :class="{ 'grid-cols-[1fr_104px]': draft.protocol !== 's3' && draft.protocol !== 'webdav' }">
+        <div class="grid gap-3" :class="{ 'grid-cols-[1fr_104px]': draft.protocol !== 's3' && draft.protocol !== 'webdav' && draft.protocol !== 'hdfs' }">
           <div class="grid gap-1.5">
             <Label for="file-connection-endpoint">{{ t("fileManager.endpoint") }}</Label>
             <Input id="file-connection-endpoint" v-model="draft.endpoint" autocomplete="off" />
           </div>
-          <div v-if="draft.protocol !== 's3' && draft.protocol !== 'webdav'" class="grid gap-1.5">
+          <div v-if="draft.protocol !== 's3' && draft.protocol !== 'webdav' && draft.protocol !== 'hdfs'" class="grid gap-1.5">
             <Label for="file-connection-port">{{ t("fileManager.port") }}</Label>
             <Input id="file-connection-port" v-model.number="draft.port" type="number" min="1" max="65535" />
           </div>
@@ -240,6 +245,39 @@ async function selectPrivateKey() {
             {{ t("fileManager.clearSavedBearerToken") }}
           </label>
         </div>
+
+        <template v-if="draft.protocol === 'hdfs'">
+          <div class="grid gap-1.5">
+            <Label>{{ t("fileManager.implementation") }}</Label>
+            <Select v-model="draft.hdfsImplementation">
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="webhdfs">WebHDFS</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <label class="inline-flex w-fit items-center gap-2 text-sm">
+            <input v-model="draft.useDelegationToken" type="checkbox" />
+            {{ t("fileManager.useDelegationToken") }}
+          </label>
+
+          <div v-if="!draft.useDelegationToken" class="grid gap-1.5">
+            <Label for="file-connection-simple-user">{{ t("fileManager.simpleUser") }}</Label>
+            <Input id="file-connection-simple-user" v-model="draft.simpleUser" autocomplete="username" />
+          </div>
+
+          <div v-else class="grid gap-1.5">
+            <Label for="file-connection-delegation-token">{{ t("fileManager.delegationToken") }}</Label>
+            <PasswordInput id="file-connection-delegation-token" v-model="draft.delegationToken" :disabled="draft.clearDelegationToken" :placeholder="connection?.secretStatus.delegationToken ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
+            <label v-if="connection?.secretStatus.delegationToken" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
+              <input v-model="draft.clearDelegationToken" type="checkbox" />
+              {{ t("fileManager.clearSavedDelegationToken") }}
+            </label>
+          </div>
+        </template>
 
         <template v-if="draft.protocol === 'sftp'">
           <div class="grid gap-1.5">

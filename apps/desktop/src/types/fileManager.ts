@@ -33,26 +33,26 @@ export interface WebdavFileConnectionConfig {
   authentication: { method: "basic"; username: string } | { method: "bearer" };
 }
 
-export type FileConnectionConfig =
-  | FtpFileConnectionConfig
-  | SftpFileConnectionConfig
-  | S3FileConnectionConfig
-  | WebdavFileConnectionConfig
-  | {
-      protocol: "hdfs";
-      implementation: "webhdfs";
-      endpoint: string;
-      root: string;
-      simpleUser: string;
-      useDelegationToken: boolean;
-    }
-  | {
-      protocol: "hdfs";
-      implementation: "native";
-      nameNodeUri: string;
-      root: string;
-      hadoopConfigDirectory: string;
-    };
+export interface WebhdfsFileConnectionConfig {
+  protocol: "hdfs";
+  implementation: "webhdfs";
+  endpoint: string;
+  root: string;
+  simpleUser: string;
+  useDelegationToken: boolean;
+}
+
+export interface NativeHdfsFileConnectionConfig {
+  protocol: "hdfs";
+  implementation: "native";
+  nameNodeUri: string;
+  root: string;
+  hadoopConfigDirectory: string;
+}
+
+export type HdfsFileConnectionConfig = WebhdfsFileConnectionConfig | NativeHdfsFileConnectionConfig;
+
+export type FileConnectionConfig = FtpFileConnectionConfig | SftpFileConnectionConfig | S3FileConnectionConfig | WebdavFileConnectionConfig | HdfsFileConnectionConfig;
 
 export interface FileCapabilities {
   read: boolean;

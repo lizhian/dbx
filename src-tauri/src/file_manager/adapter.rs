@@ -136,8 +136,10 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
                 validate_required("WebHDFS endpoint", endpoint)?;
                 let mut builder = services::Webhdfs::default().endpoint(endpoint).root(root);
                 if *use_delegation_token {
+                    validate_required("WebHDFS delegation token", secrets.get("delegation_token"))?;
                     builder = builder.delegation(secrets.get("delegation_token"));
                 } else {
+                    validate_required("WebHDFS simple user", simple_user)?;
                     builder = builder.user_name(simple_user);
                 }
                 Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)

@@ -1,8 +1,9 @@
-import type { FileConnection, FileProtocol, FtpFileConnectionConfig, S3FileConnectionConfig, SaveFileConnectionRequest, SecretUpdate, SftpFileConnectionConfig, WebdavFileConnectionConfig } from "@/types/fileManager";
+import type { FileConnection, FileProtocol, FtpFileConnectionConfig, S3FileConnectionConfig, SaveFileConnectionRequest, SecretUpdate, SftpFileConnectionConfig, WebdavFileConnectionConfig, WebhdfsFileConnectionConfig } from "@/types/fileManager";
 
 export type SftpAuthenticationMethod = "ssh_config" | "ssh_agent" | "private_key";
 export type WebdavAuthenticationMethod = "basic" | "bearer";
-export type SupportedFileProtocol = Extract<FileProtocol, "ftp" | "sftp" | "s3" | "webdav">;
+export type HdfsImplementation = "webhdfs" | "native";
+export type SupportedFileProtocol = Extract<FileProtocol, "ftp" | "sftp" | "s3" | "webdav" | "hdfs">;
 
 export interface FileConnectionDraft {
   id: string;
@@ -29,6 +30,11 @@ export interface FileConnectionDraft {
   webdavAuthentication: WebdavAuthenticationMethod;
   bearerToken: string;
   clearBearerToken: boolean;
+  hdfsImplementation: HdfsImplementation;
+  simpleUser: string;
+  useDelegationToken: boolean;
+  delegationToken: string;
+  clearDelegationToken: boolean;
 }
 
 export type FtpConnectionDraft = FileConnectionDraft;
@@ -59,6 +65,11 @@ function emptyDraft(connection?: FileConnection): FileConnectionDraft {
     webdavAuthentication: "basic",
     bearerToken: "",
     clearBearerToken: false,
+    hdfsImplementation: "webhdfs",
+    simpleUser: "dbx",
+    useDelegationToken: false,
+    delegationToken: "",
+    clearDelegationToken: false,
   };
 }
 
@@ -84,6 +95,17 @@ export function createFileConnectionDraft(connection?: FileConnection): FileConn
       root: config.root,
       username: config.authentication.method === "basic" ? config.authentication.username : "",
       webdavAuthentication: config.authentication.method,
+    };
+  }
+  if (config?.protocol === "hdfs" && config.implementation === "webhdfs") {
+    return {
+      ...draft,
+      protocol: "hdfs",
+      endpoint: config.endpoint,
+      root: config.root,
+      hdfsImplementation: "webhdfs",
+      simpleUser: config.simpleUser,
+      useDelegationToken: config.useDelegationToken,
     };
   }
   if (config?.protocol === "sftp") {
@@ -123,6 +145,8 @@ export function createProtocolDraft(protocol: SupportedFileProtocol, current: Pi
     draft.endpoint = "http://127.0.0.1:9000";
   } else if (protocol === "webdav") {
     draft.endpoint = "http://127.0.0.1:8080";
+  } else if (protocol === "hdfs") {
+    draft.endpoint = "http://127.0.0.1:9870";
   }
   return draft;
 }
@@ -155,6 +179,10 @@ export function s3SessionTokenUpdate(draft: Pick<FileConnectionDraft, "sessionTo
 
 export function webdavBearerTokenUpdate(draft: Pick<FileConnectionDraft, "bearerToken" | "clearBearerToken">): SecretUpdate {
   return secretUpdate(draft.bearerToken, draft.clearBearerToken);
+}
+
+export function hdfsDelegationTokenUpdate(draft: Pick<FileConnectionDraft, "delegationToken" | "clearDelegationToken">): SecretUpdate {
+  return secretUpdate(draft.delegationToken, draft.clearDelegationToken);
 }
 
 export function fileConnectionRequestFromDraft(draft: FileConnectionDraft): SaveFileConnectionRequest {
@@ -210,6 +238,24 @@ export function fileConnectionRequestFromDraft(draft: FileConnectionDraft): Save
       secrets: {
         password: draft.webdavAuthentication === "basic" ? ftpPasswordUpdate(draft) : { action: "clear" },
         bearerToken: draft.webdavAuthentication === "bearer" ? webdavBearerTokenUpdate(draft) : { action: "clear" },
+      },
+    };
+  }
+  if (draft.protocol === "hdfs") {
+    const config: WebhdfsFileConnectionConfig = {
+      protocol: "hdfs",
+      implementation: "webhdfs",
+      endpoint: draft.endpoint.trim(),
+      root: draft.root.trim(),
+      simpleUser: draft.useDelegationToken ? "" : draft.simpleUser.trim(),
+      useDelegationToken: draft.useDelegationToken,
+    };
+    return {
+      id: draft.id,
+      name: draft.name.trim(),
+      config,
+      secrets: {
+        delegationToken: draft.useDelegationToken ? hdfsDelegationTokenUpdate(draft) : { action: "clear" },
       },
     };
   }

@@ -238,8 +238,8 @@ mod tests {
         test_connection, validate_remote_path,
     };
     use crate::file_manager::models::{
-        FileConnectionConfig, FileSecretUpdates, SaveFileConnectionRequest, SecretUpdate, SftpAuthentication,
-        TestFileConnectionRequest, WebdavAuthentication,
+        FileConnectionConfig, FileSecretUpdates, HdfsConfig, SaveFileConnectionRequest, SecretUpdate,
+        SftpAuthentication, TestFileConnectionRequest, WebdavAuthentication,
     };
 
     async fn storage(label: &str) -> Storage {
@@ -387,6 +387,54 @@ mod tests {
             assert!(!public.contains(secret));
             assert!(!stored.contains(secret));
         }
+    }
+
+    #[tokio::test]
+    async fn webhdfs_authentication_is_structured_and_delegation_token_is_redacted() {
+        let storage = storage("webhdfs-secrets").await;
+        let request = |id: &str, simple_user: &str, use_delegation_token, delegation_token| SaveFileConnectionRequest {
+            id: id.to_string(),
+            name: "Local HDFS".to_string(),
+            config: FileConnectionConfig::Hdfs {
+                config: HdfsConfig::Webhdfs {
+                    endpoint: "http://127.0.0.1:9870".to_string(),
+                    root: "/".to_string(),
+                    simple_user: simple_user.to_string(),
+                    use_delegation_token,
+                },
+            },
+            secrets: FileSecretUpdates { delegation_token, ..Default::default() },
+        };
+
+        assert_eq!(
+            save_connection(&storage, request("webhdfs-simple-invalid", "", false, SecretUpdate::Keep))
+                .await
+                .unwrap_err()
+                .code,
+            "configuration"
+        );
+        let simple =
+            save_connection(&storage, request("webhdfs-simple", "dbx", false, SecretUpdate::Clear)).await.unwrap();
+        assert!(matches!(
+            simple.config,
+            FileConnectionConfig::Hdfs { config: HdfsConfig::Webhdfs { use_delegation_token: false, .. } }
+        ));
+
+        assert_eq!(
+            save_connection(&storage, request("webhdfs-token", "", true, SecretUpdate::Keep)).await.unwrap_err().code,
+            "configuration"
+        );
+        let token = save_connection(
+            &storage,
+            request("webhdfs-token", "", true, SecretUpdate::Set("secret-delegation-token".to_string())),
+        )
+        .await
+        .unwrap();
+        assert!(token.secret_status.delegation_token);
+        let public = serde_json::to_string(&list_connections(&storage).await.unwrap()).unwrap();
+        let stored = serde_json::to_string(&storage.load_file_connections().await.unwrap()).unwrap();
+        assert!(!public.contains("secret-delegation-token"));
+        assert!(!stored.contains("secret-delegation-token"));
     }
 
     #[tokio::test]
