@@ -6,6 +6,10 @@ function connection(id: string, label: string): TreeNode {
   return { id, label, type: "connection", connectionId: id, children: [] };
 }
 
+function fileConnection(id: string, label: string): TreeNode {
+  return { id: `file-connection:${id}`, label, type: "file-connection", fileConnectionId: id, children: [] };
+}
+
 function group(id: string, label: string, children: TreeNode[]): TreeNode {
   return { id, label, type: "connection-group", isExpanded: true, children };
 }
@@ -35,5 +39,10 @@ describe("connection list display sort", () => {
     expect(manualTree.map((node) => node.id)).toEqual(["zebra", "team", "alpha-root", "alpha-root-two"]);
     expect(manualTree[1]?.children?.map((node) => node.id)).toEqual(["beta", "alpha", "alpha-two"]);
     expect(sorted[1]).not.toBe(manualTree[1]);
+  });
+
+  it("sorts database and file connections together without moving groups", () => {
+    const tree = [connection("database-z", "Zulu"), group("team", "Team", []), fileConnection("files-a", "Alpha")];
+    expect(sortConnectionListForDisplay(tree, "asc").map((node) => node.id)).toEqual(["file-connection:files-a", "team", "database-z"]);
   });
 });

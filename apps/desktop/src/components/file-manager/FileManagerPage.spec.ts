@@ -93,6 +93,20 @@ async function mountPage() {
   return container;
 }
 
+async function mountPageHandle() {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const app = createApp(FileManagerPage);
+  mountedApps.push(app);
+  app.use(createPinia());
+  app.use(i18n);
+  const page = app.mount(container) as unknown as {
+    openConnectionById: (connectionId: string) => Promise<void>;
+  };
+  await flushPage();
+  return page;
+}
+
 function buttonWithTitle(title: string): HTMLButtonElement | undefined {
   return Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.title === title);
 }
@@ -143,6 +157,12 @@ describe("FileManagerPage browsing", () => {
     expect(parentFilePath("folder")).toBe("");
     expect(parentFilePath("folder/child")).toBe("folder");
     expect(displayFilePath("")).toBe("/");
+  });
+
+  it("reports a stale sidebar connection instead of silently ignoring it", async () => {
+    const page = await mountPageHandle();
+
+    await expect(page.openConnectionById("missing")).rejects.toThrow("File connection no longer exists");
   });
 
   it("requires explicit Replace before retrying an existing upload", async () => {

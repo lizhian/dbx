@@ -7,16 +7,23 @@ export const useFileConnectionStore = defineStore("fileConnections", () => {
   const connections = ref<FileConnection[]>([]);
   const loaded = ref(false);
   const loading = ref(false);
+  let loadPromise: Promise<void> | null = null;
 
-  async function load(force = false) {
-    if ((loaded.value && !force) || loading.value) return;
+  function load(force = false): Promise<void> {
+    if (loaded.value && !force) return Promise.resolve();
+    if (loadPromise) return loadPromise;
     loading.value = true;
-    try {
-      connections.value = await api.listFileConnections();
-      loaded.value = true;
-    } finally {
-      loading.value = false;
-    }
+    loadPromise = api
+      .listFileConnections()
+      .then((saved) => {
+        connections.value = saved;
+        loaded.value = true;
+      })
+      .finally(() => {
+        loading.value = false;
+        loadPromise = null;
+      });
+    return loadPromise;
   }
 
   async function save(request: SaveFileConnectionRequest) {

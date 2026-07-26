@@ -1,4 +1,16 @@
-import type { FileConnection, FileProtocol, FtpFileConnectionConfig, NativeHdfsFileConnectionConfig, S3FileConnectionConfig, SaveFileConnectionRequest, SecretUpdate, SftpFileConnectionConfig, WebdavFileConnectionConfig, WebhdfsFileConnectionConfig } from "@/types/fileManager";
+import type {
+  FileConnection,
+  FileConnectionImplementation,
+  FileProtocol,
+  FtpFileConnectionConfig,
+  NativeHdfsFileConnectionConfig,
+  S3FileConnectionConfig,
+  SaveFileConnectionRequest,
+  SecretUpdate,
+  SftpFileConnectionConfig,
+  WebdavFileConnectionConfig,
+  WebhdfsFileConnectionConfig,
+} from "@/types/fileManager";
 
 export type SftpAuthenticationMethod = "ssh_config" | "ssh_agent" | "private_key";
 export type WebdavAuthenticationMethod = "basic" | "bearer";
@@ -77,7 +89,8 @@ function emptyDraft(connection?: FileConnection): FileConnectionDraft {
   };
 }
 
-export function createFileConnectionDraft(connection?: FileConnection): FileConnectionDraft {
+export function createFileConnectionDraft(connection?: FileConnection, implementation: FileConnectionImplementation = "ftp"): FileConnectionDraft {
+  if (!connection) return createFileConnectionImplementationDraft(implementation);
   const draft = emptyDraft(connection);
   const config = connection?.config;
   if (config?.protocol === "s3") {
@@ -142,6 +155,13 @@ export function createFileConnectionDraft(connection?: FileConnection): FileConn
     root: ftp?.root ?? "/",
     username: ftp?.username ?? "",
   };
+}
+
+export function createFileConnectionImplementationDraft(implementation: FileConnectionImplementation, current: Pick<FileConnectionDraft, "id" | "name"> = emptyDraft()): FileConnectionDraft {
+  const protocol: SupportedFileProtocol = implementation === "webhdfs" || implementation === "hdfs-native" ? "hdfs" : implementation;
+  const draft = createProtocolDraft(protocol, current);
+  if (implementation === "hdfs-native") draft.hdfsImplementation = "native";
+  return draft;
 }
 
 export function createFtpConnectionDraft(connection?: FileConnection): FtpConnectionDraft {

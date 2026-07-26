@@ -46,6 +46,9 @@ import { formatSidebarObjectStorage, sidebarTableStorageScopes, supportsSidebarT
 import { sidebarScrollbarGeometry as calculateSidebarScrollbarGeometry } from "@/lib/sidebar/sidebarScrollbar";
 
 const { t } = useI18n();
+const emit = defineEmits<{
+  "open-file-connection": [connectionId: string];
+}>();
 const store = useConnectionStore();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
@@ -216,7 +219,7 @@ const isTreeSearchFiltering = computed(() => sidebarFilterGuards.value.isTreeSea
 const isRootListPartial = computed(() => sidebarFilterGuards.value.isRootListPartial);
 
 const SEARCH_SCOPE_TO_NODE_TYPES: Record<SearchScope, TreeNodeType[]> = {
-  connection: ["connection"],
+  connection: ["connection", "file-connection"],
   database: ["database", "redis-db", "mq-tenant", "nacos-namespace", "mongo-db"],
   schema: ["schema"],
   table: ["table", "mongo-collection", "mongo-bucket", "vector-collection", "elasticsearch-index"],
@@ -486,7 +489,7 @@ watch(
 const flatTreeIndex = computed(() =>
   createFlatTreeIndex(flatNodes.value, {
     isSelectable: (node) => !isSidebarTableSearchControlNode(node),
-    isBoundary: (type) => type === "connection" || type === "connection-group",
+    isBoundary: (type) => type === "connection" || type === "file-connection" || type === "connection-group",
     isDatabaseContainer: (type) => DATABASE_LEVEL_TYPES.has(type),
     isSchemaContainer: (type) => SCHEMA_LEVEL_TYPES.has(type),
   }),
@@ -1609,6 +1612,7 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes });
       @open-danger-dialog="openSidebarDangerDialog"
       @open-dialog-controller="updateSidebarTreeItemDialogController"
       @open-install-extension="openSidebarInstallExtension"
+      @open-file-connection="emit('open-file-connection', $event)"
     />
     <div class="connection-tree-search sticky top-0 z-10 bg-background px-2 py-1">
       <div class="relative flex items-center gap-1">

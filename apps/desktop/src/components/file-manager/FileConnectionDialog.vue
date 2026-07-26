@@ -10,12 +10,13 @@ import PasswordInput from "@/components/ui/PasswordInput.vue";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useFileConnectionStore } from "@/stores/fileConnectionStore";
 import { formatError } from "@/lib/backend/errorUtils";
-import type { FileConnection } from "@/types/fileManager";
+import type { FileConnection, FileConnectionImplementation } from "@/types/fileManager";
 import { createFileConnectionDraft, createProtocolDraft, fileConnectionRequestFromDraft, type FileConnectionDraft } from "./fileConnectionDraft";
 
 const props = defineProps<{
   open: boolean;
   connection?: FileConnection;
+  initialImplementation?: FileConnectionImplementation;
 }>();
 
 const emit = defineEmits<{
@@ -62,7 +63,7 @@ watch(
   () => [props.open, props.connection] as const,
   ([open]) => {
     if (!open) return;
-    Object.assign(draft, createFileConnectionDraft(props.connection));
+    Object.assign(draft, createFileConnectionDraft(props.connection, props.initialImplementation));
     testing.message = "";
     testing.error = false;
     saving.message = "";

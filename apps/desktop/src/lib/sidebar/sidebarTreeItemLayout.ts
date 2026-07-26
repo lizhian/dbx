@@ -1,6 +1,7 @@
 import type { TreeNode, TreeNodeType } from "@/types/database";
 
 const leafTypes: Set<TreeNodeType> = new Set([
+  "file-connection",
   "column",
   "index",
   "fkey",

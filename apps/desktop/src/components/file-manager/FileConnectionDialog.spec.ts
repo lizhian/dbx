@@ -253,6 +253,22 @@ async function mountDialog(selectedConnection: FileConnection = connection) {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+async function mountNewDialog(initialImplementation: "ftp" | "sftp" | "s3" | "webdav" | "webhdfs" | "hdfs-native") {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const app = createApp(
+    defineComponent({
+      setup: () => () => h(FileConnectionDialog, { open: true, initialImplementation }),
+    }),
+  );
+  mountedApps.push(app);
+  app.use(createPinia());
+  app.use(i18n);
+  app.mount(container);
+  await nextTick();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 afterEach(() => {
   for (const app of mountedApps.splice(0)) app.unmount();
   document.body.innerHTML = "";
@@ -404,6 +420,22 @@ describe("FileConnectionDialog WebDAV lifecycle form", () => {
 });
 
 describe("FileConnectionDialog HDFS lifecycle form", () => {
+  it("maps the six picker implementations to the shared protocol discriminator", () => {
+    expect(createFileConnectionDraft(undefined, "ftp")).toMatchObject({ protocol: "ftp" });
+    expect(createFileConnectionDraft(undefined, "sftp")).toMatchObject({ protocol: "sftp", port: 22 });
+    expect(createFileConnectionDraft(undefined, "s3")).toMatchObject({ protocol: "s3" });
+    expect(createFileConnectionDraft(undefined, "webdav")).toMatchObject({ protocol: "webdav" });
+    expect(createFileConnectionDraft(undefined, "webhdfs")).toMatchObject({ protocol: "hdfs", hdfsImplementation: "webhdfs" });
+    expect(createFileConnectionDraft(undefined, "hdfs-native")).toMatchObject({ protocol: "hdfs", hdfsImplementation: "native" });
+  });
+
+  it("opens the shared form with the picker implementation preselected", async () => {
+    await mountNewDialog("hdfs-native");
+    expect(document.body.textContent).toContain("HDFS Native");
+    expect(document.querySelector("#file-connection-name-node-uri")).not.toBeNull();
+    expect(document.querySelector("#file-connection-endpoint")).toBeNull();
+  });
+
   it("shows the shared HDFS discriminator and only WebHDFS simple-user fields", async () => {
     await mountDialog(webhdfsConnection);
 

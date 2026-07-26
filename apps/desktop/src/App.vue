@@ -52,6 +52,7 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { openQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
 import type { ConnectionConfig, ObjectSourceKind, QueryTab } from "@/types/database";
+import type { FileConnectionImplementation } from "@/types/fileManager";
 import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import {
   isBrowserReloadShortcut,
@@ -175,6 +176,8 @@ const driverStoreTabOpen = ref(false);
 const driverStoreActive = ref(false);
 const fileManagerTabOpen = ref(false);
 const fileManagerActive = ref(false);
+const fileManagerPageRef = ref<{ createConnection: (implementation?: FileConnectionImplementation) => void; openConnectionById: (connectionId: string) => Promise<void> } | null>(null);
+const pendingFileManagerAction = ref<{ type: "create"; implementation: FileConnectionImplementation } | { type: "open"; connectionId: string } | null>(null);
 const driverStoreActiveTab = ref<"agent" | "jdbc" | "storage" | "runtime">("agent");
 const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome");
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
@@ -408,6 +411,41 @@ function openFileManagerPage() {
   driverStoreActive.value = false;
   settingsStore.settingsPageActive = false;
 }
+
+async function flushPendingFileManagerAction() {
+  const page = fileManagerPageRef.value;
+  const action = pendingFileManagerAction.value;
+  if (!page || !action) return;
+  pendingFileManagerAction.value = null;
+  if (action.type === "create") {
+    page.createConnection(action.implementation);
+    return;
+  }
+  try {
+    await page.openConnectionById(action.connectionId);
+  } catch (error: any) {
+    toast(translateBackendError(t, error?.message || String(error)), 5000);
+  }
+}
+
+async function openNewFileConnection(implementation: FileConnectionImplementation) {
+  setConnectionDialogOpen(false);
+  pendingFileManagerAction.value = { type: "create", implementation };
+  openFileManagerPage();
+  await nextTick();
+  await flushPendingFileManagerAction();
+}
+
+async function openFileConnection(connectionId: string) {
+  pendingFileManagerAction.value = { type: "open", connectionId };
+  openFileManagerPage();
+  await nextTick();
+  await flushPendingFileManagerAction();
+}
+
+watch(fileManagerPageRef, () => {
+  void flushPendingFileManagerAction();
+});
 
 function closeFileManagerPage() {
   fileManagerTabOpen.value = false;
@@ -2188,7 +2226,17 @@ onUnmounted(() => {
         />
 
         <div :class="isClassicLayout ? 'app-layout-classic flex-1 flex min-h-0' : 'app-panel-gutter flex-1 flex min-h-0 gap-1 p-1'">
-          <AppSidebar v-show="sidebarOpen" ref="appSidebarRef" :sidebar-width="sidebarWidth" :classic-layout="isClassicLayout" @import="dialogs.onImportClick" @export="dialogs.onExportClick" @start-resize="startSidebarResize" @collapse="setSidebarOpen(false)" />
+          <AppSidebar
+            v-show="sidebarOpen"
+            ref="appSidebarRef"
+            :sidebar-width="sidebarWidth"
+            :classic-layout="isClassicLayout"
+            @import="dialogs.onImportClick"
+            @export="dialogs.onExportClick"
+            @start-resize="startSidebarResize"
+            @collapse="setSidebarOpen(false)"
+            @open-file-connection="openFileConnection"
+          />
           <div v-show="!sidebarOpen" class="flex h-full w-8 shrink-0 items-start justify-center border-r bg-background/80 pt-2" :class="isClassicLayout ? '' : 'rounded-md border border-border/80'">
             <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('sidebar.expand')" :aria-label="t('sidebar.expand')" @click="setSidebarOpen(true)">
               <ChevronsRight class="h-4 w-4" />
@@ -2224,7 +2272,7 @@ onUnmounted(() => {
                 @cancel-tab-close="cancelPendingAppClose"
               />
               <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
-              <FileManagerPage v-if="fileManagerTabOpen" v-show="fileManagerActive" class="flex-1 min-h-0" />
+              <FileManagerPage v-if="fileManagerTabOpen" ref="fileManagerPageRef" v-show="fileManagerActive" class="flex-1 min-h-0" />
               <EditorSettingsPage
                 v-if="settingsPageTabOpen"
                 v-show="settingsStore.settingsPageActive"
@@ -2444,6 +2492,7 @@ onUnmounted(() => {
             setConnectionDialogOpen(false);
             openSettings('tunnels');
           "
+          @create-file-connection="openNewFileConnection"
           @open-lineage-target="openLineageTarget"
           @open-database-search-target="openDatabaseSearchTarget"
           @open-diagram-target="openDiagramTarget"

@@ -1,4 +1,5 @@
 import type { ConnectionConfig, ConnectionGroup, SidebarLayout, SidebarOrderEntry, TreeNode } from "@/types/database";
+import type { FileConnection } from "@/types/fileManager";
 import { uuid } from "@/lib/common/utils";
 import { orderPinnedTreeNodes } from "@/lib/app/pinnedItems";
 
@@ -53,39 +54,57 @@ function entryChildren(entry: Extract<SidebarOrderEntry, { type: "group" }>): Si
   return entry.children ?? entry.connectionIds?.map((id) => ({ type: "connection" as const, id })) ?? [];
 }
 
-function normalizeEntry(entry: SidebarOrderEntry, validIds: Set<string>, validGroups: Set<string>, seenConnections: Set<string>, seenGroups: Set<string>): SidebarOrderEntry | null {
-  if (entry.type === "connection") {
-    if (!validIds.has(entry.id) || seenConnections.has(entry.id)) return null;
-    seenConnections.add(entry.id);
-    return { type: "connection", id: entry.id };
+function normalizeEntry(entry: SidebarOrderEntry, validConnectionIds: Set<string>, validFileConnectionIds: Set<string>, validGroups: Set<string>, seenEntries: Set<string>, seenGroups: Set<string>): SidebarOrderEntry | null {
+  if (entry.type !== "group") {
+    const validIds = entry.type === "connection" ? validConnectionIds : validFileConnectionIds;
+    const key = sidebarEntryTreeId(entry);
+    if (!validIds.has(entry.id) || seenEntries.has(key)) return null;
+    seenEntries.add(key);
+    return { type: entry.type, id: entry.id };
   }
 
   if (!validGroups.has(entry.id) || seenGroups.has(entry.id)) return null;
   seenGroups.add(entry.id);
 
   const children = entryChildren(entry)
-    .map((child) => normalizeEntry(child, validIds, validGroups, seenConnections, seenGroups))
+    .map((child) => normalizeEntry(child, validConnectionIds, validFileConnectionIds, validGroups, seenEntries, seenGroups))
     .filter(Boolean) as SidebarOrderEntry[];
   return { type: "group", id: entry.id, children };
 }
 
-export function reconcileLayout(connectionIds: string[], layout: SidebarLayout | null): SidebarLayout {
+function collectFileConnectionIds(entries: SidebarOrderEntry[], ids: Set<string>) {
+  for (const entry of entries) {
+    if (entry.type === "file-connection") ids.add(entry.id);
+    else if (entry.type === "group") collectFileConnectionIds(entryChildren(entry), ids);
+  }
+}
+
+export function reconcileLayout(connectionIds: string[], layout: SidebarLayout | null, fileConnectionIds?: string[]): SidebarLayout {
   if (!layout) {
     return {
       groups: [],
-      order: connectionIds.map((id) => ({ type: "connection" as const, id })),
+      order: [...connectionIds.map((id) => ({ type: "connection" as const, id })), ...(fileConnectionIds ?? []).map((id) => ({ type: "file-connection" as const, id }))],
     };
   }
 
-  const validIds = new Set(connectionIds);
+  const validConnectionIds = new Set(connectionIds);
+  const validFileConnectionIds = new Set(fileConnectionIds);
+  if (fileConnectionIds === undefined) collectFileConnectionIds(layout.order, validFileConnectionIds);
   const validGroups = new Set(layout.groups.map((group) => group.id));
-  const seenConnections = new Set<string>();
+  const seenEntries = new Set<string>();
   const seenGroups = new Set<string>();
-  const order = layout.order.map((entry) => normalizeEntry(entry, validIds, validGroups, seenConnections, seenGroups)).filter(Boolean) as SidebarOrderEntry[];
+  const order = layout.order.map((entry) => normalizeEntry(entry, validConnectionIds, validFileConnectionIds, validGroups, seenEntries, seenGroups)).filter(Boolean) as SidebarOrderEntry[];
 
   for (const id of connectionIds) {
-    if (!seenConnections.has(id)) {
+    if (!seenEntries.has(id)) {
       order.push({ type: "connection", id });
+    }
+  }
+  if (fileConnectionIds) {
+    for (const id of fileConnectionIds) {
+      if (!seenEntries.has(fileConnectionTreeNodeId(id))) {
+        order.push({ type: "file-connection", id });
+      }
     }
   }
 
@@ -110,6 +129,7 @@ export function remapSidebarLayoutConnectionIds(layout: SidebarLayout, connectio
         const id = connectionIdMap.get(entry.id);
         return id ? [{ type: "connection", id }] : [];
       }
+      if (entry.type === "file-connection") return [];
 
       const children = entryChildren(entry).flatMap((child): SidebarOrderEntry[] => remapEntries([child]));
       return [{ type: "group", id: entry.id, children }];
@@ -133,8 +153,29 @@ function makeConnectionNode(config: ConnectionConfig, pinned: boolean): TreeNode
   };
 }
 
-export function buildTreeNodesFromLayout(layout: SidebarLayout, connections: ConnectionConfig[], pinnedIds: Set<string>): TreeNode[] {
+export function fileConnectionTreeNodeId(connectionId: string): string {
+  return `file-connection:${connectionId}`;
+}
+
+function sidebarEntryTreeId(entry: Exclude<SidebarOrderEntry, { type: "group" }>): string {
+  return entry.type === "file-connection" ? fileConnectionTreeNodeId(entry.id) : entry.id;
+}
+
+function makeFileConnectionNode(connection: FileConnection): TreeNode {
+  return {
+    id: fileConnectionTreeNodeId(connection.id),
+    label: connection.name,
+    type: "file-connection",
+    fileConnectionId: connection.id,
+    fileProtocol: connection.config.protocol,
+    isExpanded: false,
+    children: [],
+  };
+}
+
+export function buildTreeNodesFromLayout(layout: SidebarLayout, connections: ConnectionConfig[], pinnedIds: Set<string>, fileConnections: FileConnection[] = []): TreeNode[] {
   const configMap = new Map(connections.map((connection) => [connection.id, connection]));
+  const fileConnectionMap = new Map(fileConnections.map((connection) => [connection.id, connection]));
   const groupMap = new Map(layout.groups.map((group) => [group.id, group]));
 
   const build = (entries: SidebarOrderEntry[]): TreeNode[] => {
@@ -143,6 +184,11 @@ export function buildTreeNodesFromLayout(layout: SidebarLayout, connections: Con
       if (entry.type === "connection") {
         const config = configMap.get(entry.id);
         if (config) nodes.push(makeConnectionNode(config, pinnedIds.has(entry.id)));
+        continue;
+      }
+      if (entry.type === "file-connection") {
+        const connection = fileConnectionMap.get(entry.id);
+        if (connection) nodes.push(makeFileConnectionNode(connection));
         continue;
       }
 
@@ -164,10 +210,18 @@ export function buildTreeNodesFromLayout(layout: SidebarLayout, connections: Con
 }
 
 export function findConnectionLocation(layout: SidebarLayout, connectionId: string): { entries: SidebarOrderEntry[]; entryIndex: number; groupId?: string } | null {
+  return findSidebarEntryLocation(layout, "connection", connectionId);
+}
+
+export function findFileConnectionLocation(layout: SidebarLayout, connectionId: string): { entries: SidebarOrderEntry[]; entryIndex: number; groupId?: string } | null {
+  return findSidebarEntryLocation(layout, "file-connection", connectionId);
+}
+
+function findSidebarEntryLocation(layout: SidebarLayout, type: "connection" | "file-connection", connectionId: string): { entries: SidebarOrderEntry[]; entryIndex: number; groupId?: string } | null {
   const visit = (entries: SidebarOrderEntry[], groupId?: string): { entries: SidebarOrderEntry[]; entryIndex: number; groupId?: string } | null => {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
-      if (entry.type === "connection" && entry.id === connectionId) return { entries, entryIndex: i, groupId };
+      if (entry.type === type && entry.id === connectionId) return { entries, entryIndex: i, groupId };
       if (entry.type === "group") {
         const found = visit(entryChildren(entry), entry.id);
         if (found) return found;
@@ -187,8 +241,8 @@ export function findConnectionGroupPath(layout: SidebarLayout, connectionId: str
 
   const visit = (entries: SidebarOrderEntry[], path: string[]): string[] | null => {
     for (const entry of entries) {
-      if (entry.type === "connection") {
-        if (entry.id === connectionId) return path;
+      if (entry.type !== "group") {
+        if (entry.type === "connection" && entry.id === connectionId) return path;
         continue;
       }
 
@@ -210,7 +264,8 @@ export function buildConnectionGroupPathMap(layout: SidebarLayout): Map<string, 
 
   const visit = (entries: SidebarOrderEntry[], path: string[]) => {
     for (const entry of entries) {
-      if (entry.type === "connection") {
+      if (entry.type !== "group") {
+        if (entry.type === "file-connection") continue;
         paths.set(entry.id, path);
         continue;
       }
@@ -239,10 +294,66 @@ function cloneEntries(entries: SidebarOrderEntry[]): SidebarOrderEntry[] {
   return entries.map((entry) => (entry.type === "group" ? { type: "group", id: entry.id, children: cloneEntries(entryChildren(entry)) } : { ...entry }));
 }
 
+function fileConnectionEntries(entries: SidebarOrderEntry[]): SidebarOrderEntry[] {
+  return entries.flatMap((entry): SidebarOrderEntry[] => {
+    if (entry.type === "connection") return [];
+    if (entry.type === "file-connection") return [{ ...entry }];
+    const children = fileConnectionEntries(entryChildren(entry));
+    return children.length > 0 ? [{ type: "group", id: entry.id, children }] : [];
+  });
+}
+
+function findGroupEntryInTree(entries: SidebarOrderEntry[], groupId: string): Extract<SidebarOrderEntry, { type: "group" }> | null {
+  for (const entry of entries) {
+    if (entry.type !== "group") continue;
+    if (entry.id === groupId) return entry;
+    const nested = findGroupEntryInTree(entry.children ?? [], groupId);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function containsFileConnection(entries: SidebarOrderEntry[], connectionId: string): boolean {
+  return entries.some((entry) => {
+    if (entry.type === "file-connection") return entry.id === connectionId;
+    return entry.type === "group" && containsFileConnection(entry.children ?? [], connectionId);
+  });
+}
+
+export function preserveFileConnectionLayout(nextLayout: SidebarLayout, currentLayout: SidebarLayout): SidebarLayout {
+  const order = cloneEntries(nextLayout.order);
+
+  const mergeEntries = (target: SidebarOrderEntry[], source: SidebarOrderEntry[]) => {
+    for (const entry of source) {
+      if (entry.type === "file-connection") {
+        if (!containsFileConnection(order, entry.id)) target.push({ ...entry });
+        continue;
+      }
+      if (entry.type === "connection") continue;
+
+      const existingGroup = findGroupEntryInTree(order, entry.id);
+      if (existingGroup) {
+        mergeEntries(existingGroup.children ?? (existingGroup.children = []), entry.children ?? []);
+      } else {
+        target.push({
+          type: "group",
+          id: entry.id,
+          children: cloneEntries(entry.children ?? []),
+        });
+      }
+    }
+  };
+
+  mergeEntries(order, fileConnectionEntries(currentLayout.order));
+  const groupIds = new Set(nextLayout.groups.map((group) => group.id));
+  const groups = [...nextLayout.groups.map((group) => ({ ...group })), ...currentLayout.groups.filter((group) => !groupIds.has(group.id)).map((group) => ({ ...group }))];
+  return { groups, order };
+}
+
 function removeEntry(entries: SidebarOrderEntry[], id: string): SidebarOrderEntry | null {
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
-    if ((entry.type === "connection" && entry.id === id) || (entry.type === "group" && entry.id === id)) {
+    if ((entry.type === "group" && entry.id === id) || (entry.type !== "group" && sidebarEntryTreeId(entry) === id)) {
       entries.splice(i, 1);
       return entry;
     }
@@ -256,8 +367,40 @@ function removeEntry(entries: SidebarOrderEntry[], id: string): SidebarOrderEntr
 
 function removeConnectionFromEntries(entries: SidebarOrderEntry[], connectionId: string): SidebarOrderEntry[] {
   const next = cloneEntries(entries);
-  removeEntry(next, connectionId);
+  removeTypedEntry(next, "connection", connectionId);
   return next;
+}
+
+function removeTypedEntry(entries: SidebarOrderEntry[], type: "connection" | "file-connection", id: string): SidebarOrderEntry | null {
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.type === type && entry.id === id) {
+      entries.splice(i, 1);
+      return entry;
+    }
+    if (entry.type === "group") {
+      const removed = removeTypedEntry(entry.children ?? [], type, id);
+      if (removed) return removed;
+    }
+  }
+  return null;
+}
+
+function moveTypedConnectionToGroup(layout: SidebarLayout, type: "connection" | "file-connection", connectionId: string, targetGroupId: string | null): SidebarLayout {
+  const order = cloneEntries(layout.order);
+  removeTypedEntry(order, type, connectionId);
+  const entry: SidebarOrderEntry = { type, id: connectionId };
+
+  if (targetGroupId) {
+    const group = findGroupEntry(order, targetGroupId);
+    if (group) {
+      group.children = [...(group.children ?? []), entry];
+      return { ...expandGroup(layout, targetGroupId), order };
+    }
+  }
+
+  order.push(entry);
+  return { ...layout, order };
 }
 
 function containsGroup(entry: SidebarOrderEntry, groupId: string): boolean {
@@ -274,19 +417,11 @@ function expandGroup(layout: SidebarLayout, groupId: string): SidebarLayout {
 }
 
 export function moveConnectionToGroup(layout: SidebarLayout, connectionId: string, targetGroupId: string | null): SidebarLayout {
-  const order = removeConnectionFromEntries(layout.order, connectionId);
-  const entry: SidebarOrderEntry = { type: "connection", id: connectionId };
+  return moveTypedConnectionToGroup(layout, "connection", connectionId, targetGroupId);
+}
 
-  if (targetGroupId) {
-    const group = findGroupEntry(order, targetGroupId);
-    if (group) {
-      group.children = [...(group.children ?? []), entry];
-      return { ...expandGroup(layout, targetGroupId), order };
-    }
-  }
-
-  order.push(entry);
-  return { ...layout, order };
+export function moveFileConnectionToGroup(layout: SidebarLayout, connectionId: string, targetGroupId: string | null): SidebarLayout {
+  return moveTypedConnectionToGroup(layout, "file-connection", connectionId, targetGroupId);
 }
 
 export type DropPosition = "before" | "after" | "inside";
@@ -311,7 +446,7 @@ export function reorderEntry(layout: SidebarLayout, draggedId: string, targetId:
   const insertNear = (entries: SidebarOrderEntry[]): boolean => {
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
-      if ((entry.type === "connection" && entry.id === targetId) || (entry.type === "group" && entry.id === targetId)) {
+      if ((entry.type === "group" && entry.id === targetId) || (entry.type !== "group" && sidebarEntryTreeId(entry) === targetId)) {
         entries.splice(position === "after" ? i + 1 : i, 0, dragged);
         return true;
       }
@@ -401,6 +536,16 @@ export function removeConnectionFromSidebarLayout(layout: SidebarLayout, connect
   return { ...layout, order: removeConnectionFromEntries(layout.order, connectionId) };
 }
 
+export function removeFileConnectionFromSidebarLayout(layout: SidebarLayout, connectionId: string): SidebarLayout {
+  const order = cloneEntries(layout.order);
+  removeTypedEntry(order, "file-connection", connectionId);
+  return { ...layout, order };
+}
+
 export function appendConnectionToLayout(layout: SidebarLayout, connectionId: string, groupId?: string | null): SidebarLayout {
   return moveConnectionToGroup(layout, connectionId, groupId ?? null);
+}
+
+export function appendFileConnectionToLayout(layout: SidebarLayout, connectionId: string, groupId?: string | null): SidebarLayout {
+  return moveFileConnectionToGroup(layout, connectionId, groupId ?? null);
 }

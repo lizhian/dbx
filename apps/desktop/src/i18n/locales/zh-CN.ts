@@ -63,9 +63,11 @@ export default withEnglishFallback({
   },
   fileManager: {
     title: "文件管理",
+    storageCategory: "文件存储",
     newConnection: "新建文件连接",
     editConnection: "编辑文件连接",
     noConnections: "暂无文件连接",
+    connectionNotFound: "文件连接已不存在",
     name: "名称",
     protocol: "协议",
     endpoint: "地址",

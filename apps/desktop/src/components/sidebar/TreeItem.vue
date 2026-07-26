@@ -11,6 +11,7 @@ import {
   Loader2,
   FolderOpen,
   FolderClosed,
+  HardDrive,
   TableProperties,
   Key,
   Link,
@@ -191,6 +192,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
   switch (node.type) {
     case "connection":
       return null;
+    case "file-connection":
+      return { icon: HardDrive, colorClass: "text-cyan-500" };
     case "connection-group":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-amber-500" };
     case "database":
@@ -803,7 +806,7 @@ const {
 
 const isDraggable = computed(() => {
   if (props.dragDisabled) return false;
-  return activeNode.value.type === "connection" || activeNode.value.type === "connection-group";
+  return activeNode.value.type === "connection" || activeNode.value.type === "file-connection" || activeNode.value.type === "connection-group";
 });
 
 function isPinnedOrderDrag(): boolean {
@@ -812,7 +815,7 @@ function isPinnedOrderDrag(): boolean {
 
 const dragVisual = computed(() => {
   const targetId = isPinnedOrderDrag() ? pinnedSortKey() : activeNode.value.id;
-  const isDropTarget = isPinnedOrderDrag() ? !!dragState.draggedId && connectionStore.canReorderPinnedTreeNodes(dragState.draggedId, pinnedSortKey()) : activeNode.value.type === "connection" || activeNode.value.type === "connection-group";
+  const isDropTarget = isPinnedOrderDrag() ? !!dragState.draggedId && connectionStore.canReorderPinnedTreeNodes(dragState.draggedId, pinnedSortKey()) : activeNode.value.type === "connection" || activeNode.value.type === "file-connection" || activeNode.value.type === "connection-group";
 
   return {
     isDropTarget,

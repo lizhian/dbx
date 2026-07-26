@@ -61,9 +61,11 @@ export default {
   },
   fileManager: {
     title: "File Manager",
+    storageCategory: "File storage",
     newConnection: "New file connection",
     editConnection: "Edit file connection",
     noConnections: "No file connections yet",
+    connectionNotFound: "File connection no longer exists",
     name: "Name",
     protocol: "Protocol",
     endpoint: "Endpoint",

@@ -1,4 +1,5 @@
 export type FileProtocol = "ftp" | "sftp" | "s3" | "webdav" | "hdfs";
+export type FileConnectionImplementation = "ftp" | "sftp" | "s3" | "webdav" | "webhdfs" | "hdfs-native";
 
 export interface FtpFileConnectionConfig {
   protocol: "ftp";

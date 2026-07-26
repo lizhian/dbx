@@ -20,6 +20,7 @@ const DatabaseExportDialog = defineAsyncComponent(() => import("@/components/exp
 const DataGenerateDialog = defineAsyncComponent(() => import("@/components/generate/DataGenerateDialog.vue"));
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
+import type { FileConnectionImplementation } from "@/types/fileManager";
 import { useDialogSources } from "@/composables/useDialogSources";
 import type { ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
@@ -54,6 +55,7 @@ const emit = defineEmits<{
   connectFailed: [message: string];
   openDriverStore: [focus?: DriverStoreFocus];
   openTunnelProfileSettings: [];
+  createFileConnection: [implementation: FileConnectionImplementation];
   openLineageTarget: [
     target: {
       connectionId: string;
@@ -141,6 +143,7 @@ watch(
     @connect-failed="emit('connectFailed', $event)"
     @open-driver-store="emit('openDriverStore', $event)"
     @open-tunnel-profile-settings="emit('openTunnelProfileSettings')"
+    @create-file-connection="emit('createFileConnection', $event)"
   />
   <DangerConfirmDialog
     v-if="showDangerDialog"

@@ -10,7 +10,7 @@ import { useFileConnectionStore } from "@/stores/fileConnectionStore";
 import { useToast } from "@/composables/useToast";
 import { formatError } from "@/lib/backend/errorUtils";
 import * as api from "@/lib/backend/api";
-import type { FileConnection, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
+import type { FileConnection, FileConnectionImplementation, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
 import FileConnectionDialog from "./FileConnectionDialog.vue";
 import { childFilePath, displayFilePath, formatFileSize, parentFilePath } from "./filePath";
 
@@ -18,6 +18,7 @@ const { t } = useI18n();
 const { toast } = useToast();
 const store = useFileConnectionStore();
 const dialogOpen = ref(false);
+const initialImplementation = ref<FileConnectionImplementation>("ftp");
 const editing = ref<FileConnection>();
 const deleting = ref<FileConnection>();
 const deleteActive = ref(false);
@@ -54,8 +55,9 @@ onMounted(async () => {
   }
 });
 
-function createConnection() {
+function createConnection(implementation: FileConnectionImplementation = "ftp") {
   editing.value = undefined;
+  initialImplementation.value = implementation;
   dialogOpen.value = true;
 }
 
@@ -68,6 +70,13 @@ async function openConnection(connection: FileConnection) {
   activeConnection.value = connection;
   currentPath.value = "";
   await refreshDirectory();
+}
+
+async function openConnectionById(connectionId: string) {
+  await store.load();
+  const connection = store.connections.find((candidate) => candidate.id === connectionId);
+  if (!connection) throw new Error(t("fileManager.connectionNotFound"));
+  await openConnection(connection);
 }
 
 async function openEntry(entry: FileEntry) {
@@ -263,6 +272,8 @@ async function removeConnection() {
     deleteActive.value = false;
   }
 }
+
+defineExpose({ createConnection, openConnectionById });
 </script>
 
 <template>
@@ -393,7 +404,7 @@ async function removeConnection() {
       </template>
     </section>
 
-    <FileConnectionDialog v-model:open="dialogOpen" :connection="editing" @saved="toast(t('fileManager.connectionSaved'))" />
+    <FileConnectionDialog v-model:open="dialogOpen" :connection="editing" :initial-implementation="initialImplementation" @saved="toast(t('fileManager.connectionSaved'))" />
 
     <Dialog v-model:open="uploadDialogOpen">
       <DialogContent class="sm:max-w-[480px]">

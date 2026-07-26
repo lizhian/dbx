@@ -15,6 +15,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import type { ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, HttpTunnelConfig, IdentifierCase, JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
+import type { FileConnectionImplementation } from "@/types/fileManager";
 import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { NacosAdminConfig, NacosAuthConfig, NacosImplementation, NacosRNacosConsoleAuth, NacosVersionMode } from "@/types/nacos";
@@ -70,6 +71,7 @@ import {
   ExternalLink,
   FilePlus2,
   FolderOpen,
+  HardDrive,
   GripVertical,
   Grid3X3,
   KeyRound,
@@ -101,6 +103,7 @@ import { buildElasticsearchExternalConfig, elasticsearchConnectionModeFromConfig
 type DbOption = { value: string; label: string };
 type DbCategoryKey = "sql" | "analytics" | "domestic" | "lightweight" | "document" | "graph_ai" | "timeseries" | "mq" | "registry_config";
 type DbCategory = { key: DbCategoryKey; title: string; options: DbOption[] };
+type ConnectionCategoryKey = DbCategoryKey | "file-storage";
 type DialogStep = "select" | "config";
 export type ConfigTab = "connection" | "advanced" | "tls" | "transport";
 type ProductionScope = "connection" | "databases";
@@ -161,6 +164,7 @@ const emit = defineEmits<{
   connectFailed: [message: string];
   openDriverStore: [focus?: DriverStoreFocus];
   openTunnelProfileSettings: [];
+  "create-file-connection": [implementation: FileConnectionImplementation];
 }>();
 
 const store = useConnectionStore();
@@ -515,7 +519,8 @@ const hiveExtraJavaOptions = ref("");
 const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>(loadConnectionPickerView());
 const dbSearchQuery = ref("");
-const selectedDbCategory = ref<DbCategoryKey>("sql");
+const selectedDbCategory = ref<ConnectionCategoryKey>("sql");
+const selectedFileImplementation = ref<FileConnectionImplementation>("ftp");
 const configTab = ref<ConfigTab>("connection");
 const MQ_KAFKA_SECURITY_PROTOCOL_AUTO = "__auto";
 const mqAdminUrl = ref("http://127.0.0.1:8080");
@@ -2357,6 +2362,15 @@ const dbCategories = computed<DbCategory[]>(() => {
     options: dbOptions.filter((option) => category.optionValues.includes(option.value)),
   }));
 });
+const connectionCategories = computed(() => [{ key: "file-storage" as const, title: t("fileManager.storageCategory") }, ...dbCategories.value.map((category) => ({ key: category.key as ConnectionCategoryKey, title: category.title }))]);
+const fileImplementationOptions: { value: FileConnectionImplementation; label: string }[] = [
+  { value: "ftp", label: "FTP" },
+  { value: "sftp", label: "SFTP" },
+  { value: "s3", label: "S3" },
+  { value: "webdav", label: "WebDAV" },
+  { value: "webhdfs", label: "WebHDFS" },
+  { value: "hdfs-native", label: "HDFS Native" },
+];
 
 function matchesDbOption(option: DbOption, keyword: string, categoryTitle = "") {
   const profile = driverProfiles[option.value];
@@ -2368,6 +2382,7 @@ function matchesDbOption(option: DbOption, keyword: string, categoryTitle = "") 
 }
 
 const isDbSearchActive = computed(() => !!dbSearchQuery.value.trim());
+const isFileStorageCategory = computed(() => !isDbSearchActive.value && selectedDbCategory.value === "file-storage");
 
 const filteredDbCategories = computed<DbCategory[]>(() => {
   const keyword = dbSearchQuery.value.trim().toLowerCase();
@@ -2388,12 +2403,21 @@ const visibleDbCategories = computed<DbCategory[]>(() => {
 const hasDbPickerResults = computed(() => visibleDbCategories.value.some((category) => category.options.length > 0));
 const selectedDbOptionIsVisible = computed(() => visibleDbCategories.value.some((category) => category.options.some((option) => option.value === selectedType.value)));
 
-function selectDbCategory(category: DbCategoryKey) {
+function selectDbCategory(category: ConnectionCategoryKey) {
   selectedDbCategory.value = category;
   dbSearchQuery.value = "";
+  if (category === "file-storage") return;
   const categoryOptions = dbCategoryDefinitions.find((definition) => definition.key === category)?.optionValues ?? [];
   const nextSelection = databaseSelectionForCategory(selectedType.value, categoryOptions);
   if (nextSelection && nextSelection !== selectedType.value) onDbTypeChange(nextSelection);
+}
+
+function selectFileImplementation(implementation: FileConnectionImplementation) {
+  selectedFileImplementation.value = implementation;
+}
+
+function openFileConnection(implementation = selectedFileImplementation.value) {
+  emit("create-file-connection", implementation);
 }
 
 function selectDbPickerView(view: DbPickerView) {
@@ -4623,8 +4647,9 @@ function openExternalUrl(url: string) {
           <div class="connection-db-picker-body min-h-0 flex flex-1 flex-col gap-3 overflow-hidden sm:flex-row sm:gap-4">
             <nav data-connection-category-nav class="flex shrink-0 gap-1 overflow-x-auto border-b px-0.5 pt-0.5 pb-2.5 sm:w-40 sm:flex-col sm:overflow-y-auto sm:border-b-0 sm:border-r sm:py-0.5 sm:pr-3.5" :aria-label="t('connection.databaseCategories')">
               <button
-                v-for="category in dbCategories"
+                v-for="category in connectionCategories"
                 :key="category.key"
+                :data-connection-category="category.key"
                 type="button"
                 class="connection-db-category-option shrink-0 whitespace-nowrap rounded-[4px] px-3 py-2 text-left text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:w-full"
                 :class="!isDbSearchActive && selectedDbCategory === category.key ? 'connection-db-category-option--selected bg-primary/10 font-medium text-primary hover:bg-primary/10' : 'text-muted-foreground hover:bg-muted/70'"
@@ -4638,7 +4663,45 @@ function openExternalUrl(url: string) {
             <div class="connection-db-picker-results min-w-0 flex-1 space-y-5 overflow-y-auto p-0.5 pr-2">
               <div v-if="isDbSearchActive" class="text-sm font-medium">{{ t("connection.searchResults") }}</div>
 
-              <section v-for="category in visibleDbCategories" :key="category.key" class="space-y-2">
+              <section v-if="isFileStorageCategory" class="space-y-2" data-file-storage-picker>
+                <div v-if="dbPickerView === 'icon'" class="connection-db-picker-grid grid grid-cols-2 gap-2 sm:grid-cols-3">
+                  <button
+                    v-for="option in fileImplementationOptions"
+                    :key="option.value"
+                    type="button"
+                    class="connection-db-picker-option group flex min-h-24 flex-col items-center justify-center gap-2 rounded-[4px] border bg-background/70 p-3 text-center transition hover:border-primary/40 hover:bg-muted/40 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    :class="selectedFileImplementation === option.value ? 'connection-db-picker-option--selected shadow-sm' : 'border-border'"
+                    :aria-pressed="selectedFileImplementation === option.value"
+                    :data-file-protocol="option.value"
+                    @click="selectFileImplementation(option.value)"
+                    @dblclick="openFileConnection(option.value)"
+                  >
+                    <span class="flex h-10 w-10 items-center justify-center rounded-xl bg-muted/60 transition group-hover:bg-background">
+                      <HardDrive class="h-6 w-6" />
+                    </span>
+                    <span class="max-w-full truncate text-sm font-medium">{{ option.label }}</span>
+                  </button>
+                </div>
+
+                <div v-else class="grid gap-2">
+                  <button
+                    v-for="option in fileImplementationOptions"
+                    :key="option.value"
+                    type="button"
+                    class="connection-db-picker-option flex items-center gap-3 rounded-[4px] border bg-background px-3 py-2 text-left transition hover:border-primary/40 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    :class="selectedFileImplementation === option.value ? 'connection-db-picker-option--selected' : 'border-border'"
+                    :aria-pressed="selectedFileImplementation === option.value"
+                    :data-file-protocol="option.value"
+                    @click="selectFileImplementation(option.value)"
+                    @dblclick="openFileConnection(option.value)"
+                  >
+                    <HardDrive class="h-5 w-5 shrink-0" />
+                    <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ option.label }}</span>
+                  </button>
+                </div>
+              </section>
+
+              <section v-for="category in visibleDbCategories" v-else :key="category.key" class="space-y-2">
                 <h3 v-if="isDbSearchActive" class="text-sm font-medium">{{ category.title }}</h3>
 
                 <div v-if="dbPickerView === 'icon'" class="connection-db-picker-grid grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-5">
@@ -4677,7 +4740,7 @@ function openExternalUrl(url: string) {
                 </div>
               </section>
 
-              <div v-if="!hasDbPickerResults" class="rounded-xl border border-dashed py-12 text-center text-sm text-muted-foreground">
+              <div v-if="!isFileStorageCategory && !hasDbPickerResults" class="rounded-xl border border-dashed py-12 text-center text-sm text-muted-foreground">
                 {{ t("connection.noDatabaseMatches") }}
               </div>
             </div>
@@ -4685,11 +4748,19 @@ function openExternalUrl(url: string) {
         </div>
 
         <DialogFooter class="flex shrink-0 items-center gap-2">
-          <div class="mr-auto flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
+          <div v-if="isFileStorageCategory" class="mr-auto flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
+            <HardDrive class="h-4 w-4 shrink-0" />
+            <span class="truncate">{{ t("fileManager.protocol") }}: {{ fileImplementationOptions.find((option) => option.value === selectedFileImplementation)?.label }}</span>
+          </div>
+          <div v-else class="mr-auto flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
             <DatabaseIcon :db-type="selectedDbIcon" class="h-4 w-4 shrink-0" />
             <span class="truncate">{{ t("connection.selectedDatabase") }}: {{ selectedProfile().label }}</span>
           </div>
-          <Button :disabled="!hasDbPickerResults || !selectedDbOptionIsVisible" @click="goToConnectionStep()">
+          <Button v-if="isFileStorageCategory" @click="openFileConnection()">
+            {{ t("connection.next") }}
+            <ChevronRight class="h-4 w-4" />
+          </Button>
+          <Button v-else :disabled="!hasDbPickerResults || !selectedDbOptionIsVisible" @click="goToConnectionStep()">
             {{ t("connection.next") }}
             <ChevronRight class="h-4 w-4" />
           </Button>
