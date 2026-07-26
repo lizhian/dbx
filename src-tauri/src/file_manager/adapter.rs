@@ -82,11 +82,8 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
             {
                 validate_required("SFTP endpoint", endpoint)?;
                 let endpoint = endpoint_with_port(endpoint, "ssh", *port);
-                let mut builder = services::Sftp::default()
-                    .endpoint(&endpoint)
-                    .root(root)
-                    .user(username)
-                    .known_hosts_strategy("Strict");
+                let mut builder =
+                    services::Sftp::default().endpoint(&endpoint).root(root).user(username).known_hosts_strategy("Add");
                 if matches!(authentication, SftpAuthentication::PrivateKey) {
                     let key = secrets.get("private_key");
                     validate_required("SFTP private key", key)?;
@@ -191,11 +188,34 @@ pub fn map_operation_error(error: opendal::Error) -> FileManagerError {
 #[cfg(test)]
 mod tests {
     use super::endpoint_with_port;
+    #[cfg(unix)]
+    use super::{build_operator, ResolvedSecrets};
+    #[cfg(unix)]
+    use crate::file_manager::models::{FileConnectionConfig, SftpAuthentication};
 
     #[test]
     fn endpoint_port_is_added_once() {
         assert_eq!(endpoint_with_port("127.0.0.1", "ftp", 2121), "ftp://127.0.0.1:2121");
         assert_eq!(endpoint_with_port("ftp://127.0.0.1", "ftp", 2121), "ftp://127.0.0.1:2121");
         assert_eq!(endpoint_with_port("ftp://127.0.0.1:2021", "ftp", 2121), "ftp://127.0.0.1:2021");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sftp_config_and_agent_use_system_openssh_while_private_key_requires_a_secret_path() {
+        let config = |authentication| FileConnectionConfig::Sftp {
+            endpoint: "127.0.0.1".to_string(),
+            port: 2222,
+            root: "/config".to_string(),
+            username: "dbx".to_string(),
+            authentication,
+        };
+        let secrets = ResolvedSecrets::default();
+        assert!(build_operator(&config(SftpAuthentication::SshConfig), &secrets).is_ok());
+        assert!(build_operator(&config(SftpAuthentication::SshAgent), &secrets).is_ok());
+        assert_eq!(
+            build_operator(&config(SftpAuthentication::PrivateKey), &secrets).unwrap_err().code,
+            "configuration"
+        );
     }
 }

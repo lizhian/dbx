@@ -8,16 +8,18 @@ export interface FtpFileConnectionConfig {
   username: string;
 }
 
+export interface SftpFileConnectionConfig {
+  protocol: "sftp";
+  endpoint: string;
+  port: number;
+  root: string;
+  username: string;
+  authentication: { method: "ssh_config" | "ssh_agent" | "private_key" };
+}
+
 export type FileConnectionConfig =
   | FtpFileConnectionConfig
-  | {
-      protocol: "sftp";
-      endpoint: string;
-      port: number;
-      root: string;
-      username: string;
-      authentication: { method: "ssh_config" | "ssh_agent" | "private_key" };
-    }
+  | SftpFileConnectionConfig
   | {
       protocol: "s3";
       endpoint: string;

@@ -36,6 +36,13 @@ pub async fn save_connection(
     request: SaveFileConnectionRequest,
 ) -> Result<FileConnection, FileManagerError> {
     validate_identity(&request.id, &request.name)?;
+    let validation_request = TestFileConnectionRequest {
+        id: Some(request.id.clone()),
+        config: request.config.clone(),
+        secrets: request.secrets.clone(),
+    };
+    let resolved = resolve_secrets(storage, &validation_request).await?;
+    build_operator(&request.config, &resolved)?;
     let updates = request.secrets.persistence_updates()?;
     let stored = StoredFileConnection { id: request.id, name: request.name, config: request.config };
     let value = serde_json::to_value(&stored)
@@ -231,7 +238,8 @@ mod tests {
         test_connection, validate_remote_path,
     };
     use crate::file_manager::models::{
-        FileConnectionConfig, FileSecretUpdates, SaveFileConnectionRequest, SecretUpdate, TestFileConnectionRequest,
+        FileConnectionConfig, FileSecretUpdates, SaveFileConnectionRequest, SecretUpdate, SftpAuthentication,
+        TestFileConnectionRequest,
     };
 
     async fn storage(label: &str) -> Storage {
@@ -277,6 +285,32 @@ mod tests {
         let saved = save_connection(&storage, ftp_request("ftp-1", SecretUpdate::Clear)).await.unwrap();
         assert!(!saved.secret_status.password);
         assert_eq!(storage.get_file_connection_secret("ftp-1", "password").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn sftp_private_key_is_required_and_never_stored_in_public_config() {
+        let storage = storage("sftp-secret").await;
+        let mut request = SaveFileConnectionRequest {
+            id: "sftp-1".to_string(),
+            name: "Local SFTP".to_string(),
+            config: FileConnectionConfig::Sftp {
+                endpoint: "127.0.0.1".to_string(),
+                port: 2222,
+                root: "/config".to_string(),
+                username: "dbx".to_string(),
+                authentication: SftpAuthentication::PrivateKey,
+            },
+            secrets: FileSecretUpdates::default(),
+        };
+        assert_eq!(save_connection(&storage, request.clone()).await.unwrap_err().code, "configuration");
+
+        request.secrets.private_key = SecretUpdate::Set("/secret/path/id_ed25519".to_string());
+        let saved = save_connection(&storage, request).await.unwrap();
+        assert!(saved.secret_status.private_key);
+        let public = serde_json::to_string(&list_connections(&storage).await.unwrap()).unwrap();
+        assert!(!public.contains("/secret/path/id_ed25519"));
+        let stored = serde_json::to_string(&storage.load_file_connections().await.unwrap()).unwrap();
+        assert!(!stored.contains("/secret/path/id_ed25519"));
     }
 
     #[tokio::test]

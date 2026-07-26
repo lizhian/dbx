@@ -5,3 +5,6 @@ pub(crate) mod service;
 pub(crate) mod transfer;
 
 pub use transfer::FileTransferState;
+
+#[cfg(test)]
+mod contract_tests;

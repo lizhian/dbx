@@ -109,6 +109,27 @@ pub struct FileCapabilities {
 
 impl FileCapabilities {
     pub fn for_config(config: &FileConnectionConfig) -> Self {
+        Self::for_config_on_platform(config, cfg!(unix))
+    }
+
+    fn for_config_on_platform(config: &FileConnectionConfig, unix: bool) -> Self {
+        if matches!(config, FileConnectionConfig::Sftp { .. }) && !unix {
+            return Self {
+                read: false,
+                write: false,
+                stat: false,
+                list: false,
+                delete: false,
+                copy: false,
+                rename: false,
+                native_copy: false,
+                native_rename: false,
+                atomic_rename: false,
+                atomic_no_clobber: false,
+                copy_mode: FileCopyMode::StreamRelay,
+                rename_mode: FileRenameMode::CopyDelete,
+            };
+        }
         let (native_copy, native_rename, atomic_rename) = match config {
             FileConnectionConfig::Ftp { .. } => (false, false, false),
             FileConnectionConfig::Sftp { .. } => (true, true, true),
@@ -343,3 +364,45 @@ impl fmt::Display for FileManagerError {
 }
 
 impl std::error::Error for FileManagerError {}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{FileCapabilities, FileConnectionConfig, SftpAuthentication};
+
+    fn sftp_config(authentication: SftpAuthentication) -> FileConnectionConfig {
+        FileConnectionConfig::Sftp {
+            endpoint: "127.0.0.1".to_string(),
+            port: 2222,
+            root: "/config".to_string(),
+            username: "dbx".to_string(),
+            authentication,
+        }
+    }
+
+    #[test]
+    fn sftp_password_authentication_is_not_part_of_the_discriminator() {
+        let value = json!({
+            "protocol": "sftp",
+            "endpoint": "127.0.0.1",
+            "port": 2222,
+            "root": "/config",
+            "username": "dbx",
+            "authentication": { "method": "password" }
+        });
+        assert!(serde_json::from_value::<FileConnectionConfig>(value).is_err());
+    }
+
+    #[test]
+    fn sftp_capabilities_are_native_on_unix_and_disabled_elsewhere() {
+        let config = sftp_config(SftpAuthentication::PrivateKey);
+        let unix = FileCapabilities::for_config_on_platform(&config, true);
+        assert!(unix.read && unix.write && unix.copy && unix.rename);
+        assert!(unix.native_copy && unix.native_rename && unix.atomic_rename);
+
+        let windows = FileCapabilities::for_config_on_platform(&config, false);
+        assert!(!windows.read && !windows.write && !windows.copy && !windows.rename);
+        assert!(!windows.native_copy && !windows.native_rename && !windows.atomic_rename);
+    }
+}

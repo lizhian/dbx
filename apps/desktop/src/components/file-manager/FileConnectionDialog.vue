@@ -1,16 +1,17 @@
 <script setup lang="ts">
 import { computed, reactive, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { AlertTriangle, Loader2 } from "@lucide/vue";
+import { AlertTriangle, FolderOpen, Loader2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import PasswordInput from "@/components/ui/PasswordInput.vue";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useFileConnectionStore } from "@/stores/fileConnectionStore";
 import { formatError } from "@/lib/backend/errorUtils";
 import type { FileConnection } from "@/types/fileManager";
-import { createFtpConnectionDraft, ftpRequestFromDraft, type FtpConnectionDraft } from "./fileConnectionDraft";
+import { createFileConnectionDraft, createProtocolDraft, fileConnectionRequestFromDraft, type FileConnectionDraft } from "./fileConnectionDraft";
 
 const props = defineProps<{
   open: boolean;
@@ -24,17 +25,24 @@ const emit = defineEmits<{
 
 const { t } = useI18n();
 const store = useFileConnectionStore();
-const draft = reactive<FtpConnectionDraft>(createFtpConnectionDraft());
+const draft = reactive<FileConnectionDraft>(createFileConnectionDraft());
 const testing = reactive({ active: false, message: "", error: false });
 const saving = reactive({ active: false, message: "" });
 const isEditing = computed(() => !!props.connection);
-const canSubmit = computed(() => !!draft.name.trim() && !!draft.endpoint.trim() && draft.port > 0 && draft.port <= 65535 && !!draft.root.trim());
+const isWindows = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+const canSubmit = computed(() => {
+  const common = !!draft.name.trim() && !!draft.endpoint.trim() && draft.port > 0 && draft.port <= 65535 && !!draft.root.trim();
+  if (!common || (draft.protocol === "sftp" && isWindows)) return false;
+  if (draft.protocol !== "sftp") return true;
+  if (draft.authentication !== "private_key") return true;
+  return !!draft.privateKey || (!!props.connection?.secretStatus.privateKey && !draft.clearPrivateKey);
+});
 
 watch(
   () => [props.open, props.connection] as const,
   ([open]) => {
     if (!open) return;
-    Object.assign(draft, createFtpConnectionDraft(props.connection));
+    Object.assign(draft, createFileConnectionDraft(props.connection));
     testing.message = "";
     testing.error = false;
     saving.message = "";
@@ -46,7 +54,7 @@ async function testConnection() {
   testing.active = true;
   testing.message = "";
   try {
-    const request = ftpRequestFromDraft(draft);
+    const request = fileConnectionRequestFromDraft(draft);
     await store.test({ id: isEditing.value ? request.id : undefined, config: request.config, secrets: request.secrets });
     testing.message = t("fileManager.testSucceeded");
     testing.error = false;
@@ -63,13 +71,31 @@ async function saveConnection() {
   saving.active = true;
   saving.message = "";
   try {
-    const saved = await store.save(ftpRequestFromDraft(draft));
+    const saved = await store.save(fileConnectionRequestFromDraft(draft));
     emit("saved", saved);
     emit("update:open", false);
   } catch (error) {
     saving.message = formatError(error);
   } finally {
     saving.active = false;
+  }
+}
+
+function changeProtocol(value: unknown) {
+  if (value !== "ftp" && value !== "sftp") return;
+  Object.assign(draft, createProtocolDraft(value, draft));
+}
+
+async function selectPrivateKey() {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({ multiple: false, directory: false, title: t("fileManager.selectPrivateKey") });
+    if (!selected || Array.isArray(selected)) return;
+    draft.privateKey = selected;
+    draft.clearPrivateKey = false;
+  } catch (error) {
+    testing.message = formatError(error);
+    testing.error = true;
   }
 }
 </script>
@@ -89,7 +115,15 @@ async function saveConnection() {
 
         <div class="grid gap-1.5">
           <Label>{{ t("fileManager.protocol") }}</Label>
-          <Input value="FTP" disabled />
+          <Select :model-value="draft.protocol" :disabled="isEditing" @update:model-value="changeProtocol">
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="ftp">FTP</SelectItem>
+              <SelectItem value="sftp">SFTP</SelectItem>
+            </SelectContent>
+          </Select>
         </div>
 
         <div class="grid grid-cols-[1fr_104px] gap-3">
@@ -113,7 +147,7 @@ async function saveConnection() {
           <Input id="file-connection-username" v-model="draft.username" autocomplete="username" />
         </div>
 
-        <div class="grid gap-1.5">
+        <div v-if="draft.protocol === 'ftp'" class="grid gap-1.5">
           <Label for="file-connection-password">{{ t("fileManager.password") }}</Label>
           <PasswordInput id="file-connection-password" v-model="draft.password" :disabled="draft.clearPassword" :placeholder="connection?.secretStatus.password ? t('fileManager.secretPreserved') : undefined" autocomplete="new-password" />
           <label v-if="connection?.secretStatus.password" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
@@ -122,9 +156,43 @@ async function saveConnection() {
           </label>
         </div>
 
-        <div role="alert" class="flex gap-2 border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200">
+        <template v-if="draft.protocol === 'sftp'">
+          <div class="grid gap-1.5">
+            <Label>{{ t("fileManager.authentication") }}</Label>
+            <Select v-model="draft.authentication">
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="ssh_config">{{ t("fileManager.sshConfig") }}</SelectItem>
+                <SelectItem value="ssh_agent">{{ t("fileManager.sshAgent") }}</SelectItem>
+                <SelectItem value="private_key">{{ t("fileManager.privateKey") }}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div v-if="draft.authentication === 'private_key'" class="grid gap-1.5">
+            <Label for="file-connection-private-key">{{ t("fileManager.privateKey") }}</Label>
+            <div class="flex gap-2">
+              <Input id="file-connection-private-key" :model-value="draft.privateKey" :placeholder="connection?.secretStatus.privateKey ? t('fileManager.privateKeyPreserved') : undefined" disabled />
+              <Button type="button" variant="outline" size="icon" :title="t('fileManager.selectPrivateKey')" :disabled="draft.clearPrivateKey" @click="selectPrivateKey">
+                <FolderOpen class="h-4 w-4" />
+              </Button>
+            </div>
+            <label v-if="connection?.secretStatus.privateKey" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
+              <input v-model="draft.clearPrivateKey" type="checkbox" />
+              {{ t("fileManager.clearSavedPrivateKey") }}
+            </label>
+          </div>
+        </template>
+
+        <div v-if="draft.protocol === 'ftp'" role="alert" class="flex gap-2 border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200">
           <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
           <span>{{ t("fileManager.ftpWarning") }}</span>
+        </div>
+        <div v-else role="alert" class="flex gap-2 border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-200">
+          <AlertTriangle class="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{{ t(isWindows ? "fileManager.sftpWindowsUnsupported" : "fileManager.sftpAuthenticationNotice") }}</span>
         </div>
 
         <p v-if="testing.message" role="status" class="text-xs" :class="testing.error ? 'text-destructive' : 'text-emerald-600'">{{ testing.message }}</p>
