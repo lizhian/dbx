@@ -31,13 +31,19 @@ const saving = reactive({ active: false, message: "" });
 const isEditing = computed(() => !!props.connection);
 const isWindows = typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
 const canSubmit = computed(() => {
-  const portValid = draft.protocol === "s3" || (draft.port > 0 && draft.port <= 65535);
+  const portValid = draft.protocol === "s3" || draft.protocol === "webdav" || (draft.port > 0 && draft.port <= 65535);
   const common = !!draft.name.trim() && !!draft.endpoint.trim() && portValid && !!draft.root.trim();
   if (!common || (draft.protocol === "sftp" && isWindows)) return false;
   if (draft.protocol === "s3") {
     const accessKey = !!draft.accessKey || (!!props.connection?.secretStatus.accessKey && !draft.clearAccessKey);
     const secretKey = !!draft.secretKey || (!!props.connection?.secretStatus.secretKey && !draft.clearSecretKey);
     return !!draft.region.trim() && !!draft.bucket.trim() && accessKey && secretKey;
+  }
+  if (draft.protocol === "webdav") {
+    if (draft.webdavAuthentication === "basic") {
+      return !!draft.username.trim() && (!!draft.password || (!!props.connection?.secretStatus.password && !draft.clearPassword));
+    }
+    return !!draft.bearerToken || (!!props.connection?.secretStatus.bearerToken && !draft.clearBearerToken);
   }
   if (draft.protocol !== "sftp" || draft.authentication !== "private_key") return true;
   return !!draft.privateKey || (!!props.connection?.secretStatus.privateKey && !draft.clearPrivateKey);
@@ -87,7 +93,7 @@ async function saveConnection() {
 }
 
 function changeProtocol(value: unknown) {
-  if (value !== "ftp" && value !== "sftp" && value !== "s3") return;
+  if (value !== "ftp" && value !== "sftp" && value !== "s3" && value !== "webdav") return;
   Object.assign(draft, createProtocolDraft(value, draft));
 }
 
@@ -128,16 +134,17 @@ async function selectPrivateKey() {
               <SelectItem value="ftp">FTP</SelectItem>
               <SelectItem value="sftp">SFTP</SelectItem>
               <SelectItem value="s3">S3</SelectItem>
+              <SelectItem value="webdav">WebDAV</SelectItem>
             </SelectContent>
           </Select>
         </div>
 
-        <div class="grid gap-3" :class="{ 'grid-cols-[1fr_104px]': draft.protocol !== 's3' }">
+        <div class="grid gap-3" :class="{ 'grid-cols-[1fr_104px]': draft.protocol !== 's3' && draft.protocol !== 'webdav' }">
           <div class="grid gap-1.5">
             <Label for="file-connection-endpoint">{{ t("fileManager.endpoint") }}</Label>
             <Input id="file-connection-endpoint" v-model="draft.endpoint" autocomplete="off" />
           </div>
-          <div v-if="draft.protocol !== 's3'" class="grid gap-1.5">
+          <div v-if="draft.protocol !== 's3' && draft.protocol !== 'webdav'" class="grid gap-1.5">
             <Label for="file-connection-port">{{ t("fileManager.port") }}</Label>
             <Input id="file-connection-port" v-model.number="draft.port" type="number" min="1" max="65535" />
           </div>
@@ -148,7 +155,7 @@ async function selectPrivateKey() {
           <Input id="file-connection-root" v-model="draft.root" autocomplete="off" />
         </div>
 
-        <div v-if="draft.protocol !== 's3'" class="grid gap-1.5">
+        <div v-if="draft.protocol === 'ftp' || draft.protocol === 'sftp'" class="grid gap-1.5">
           <Label for="file-connection-username">{{ t("fileManager.username") }}</Label>
           <Input id="file-connection-username" v-model="draft.username" autocomplete="username" />
         </div>
@@ -198,12 +205,39 @@ async function selectPrivateKey() {
           </label>
         </template>
 
-        <div v-if="draft.protocol === 'ftp'" class="grid gap-1.5">
+        <div v-if="draft.protocol === 'webdav'" class="grid gap-1.5">
+          <Label>{{ t("fileManager.authentication") }}</Label>
+          <Select v-model="draft.webdavAuthentication">
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="basic">{{ t("fileManager.basicAuthentication") }}</SelectItem>
+              <SelectItem value="bearer">{{ t("fileManager.bearerAuthentication") }}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div v-if="draft.protocol === 'webdav' && draft.webdavAuthentication === 'basic'" class="grid gap-1.5">
+          <Label for="file-connection-username">{{ t("fileManager.username") }}</Label>
+          <Input id="file-connection-username" v-model="draft.username" autocomplete="username" />
+        </div>
+
+        <div v-if="draft.protocol === 'ftp' || (draft.protocol === 'webdav' && draft.webdavAuthentication === 'basic')" class="grid gap-1.5">
           <Label for="file-connection-password">{{ t("fileManager.password") }}</Label>
           <PasswordInput id="file-connection-password" v-model="draft.password" :disabled="draft.clearPassword" :placeholder="connection?.secretStatus.password ? t('fileManager.secretPreserved') : undefined" autocomplete="new-password" />
           <label v-if="connection?.secretStatus.password" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
             <input v-model="draft.clearPassword" type="checkbox" />
             {{ t("fileManager.clearSavedPassword") }}
+          </label>
+        </div>
+
+        <div v-if="draft.protocol === 'webdav' && draft.webdavAuthentication === 'bearer'" class="grid gap-1.5">
+          <Label for="file-connection-bearer-token">{{ t("fileManager.bearerToken") }}</Label>
+          <PasswordInput id="file-connection-bearer-token" v-model="draft.bearerToken" :disabled="draft.clearBearerToken" :placeholder="connection?.secretStatus.bearerToken ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
+          <label v-if="connection?.secretStatus.bearerToken" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
+            <input v-model="draft.clearBearerToken" type="checkbox" />
+            {{ t("fileManager.clearSavedBearerToken") }}
           </label>
         </div>
 

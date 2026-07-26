@@ -1,7 +1,8 @@
-import type { FileConnection, FileProtocol, FtpFileConnectionConfig, S3FileConnectionConfig, SaveFileConnectionRequest, SecretUpdate, SftpFileConnectionConfig } from "@/types/fileManager";
+import type { FileConnection, FileProtocol, FtpFileConnectionConfig, S3FileConnectionConfig, SaveFileConnectionRequest, SecretUpdate, SftpFileConnectionConfig, WebdavFileConnectionConfig } from "@/types/fileManager";
 
 export type SftpAuthenticationMethod = "ssh_config" | "ssh_agent" | "private_key";
-export type SupportedFileProtocol = Extract<FileProtocol, "ftp" | "sftp" | "s3">;
+export type WebdavAuthenticationMethod = "basic" | "bearer";
+export type SupportedFileProtocol = Extract<FileProtocol, "ftp" | "sftp" | "s3" | "webdav">;
 
 export interface FileConnectionDraft {
   id: string;
@@ -25,6 +26,9 @@ export interface FileConnectionDraft {
   clearSecretKey: boolean;
   sessionToken: string;
   clearSessionToken: boolean;
+  webdavAuthentication: WebdavAuthenticationMethod;
+  bearerToken: string;
+  clearBearerToken: boolean;
 }
 
 export type FtpConnectionDraft = FileConnectionDraft;
@@ -52,6 +56,9 @@ function emptyDraft(connection?: FileConnection): FileConnectionDraft {
     clearSecretKey: false,
     sessionToken: "",
     clearSessionToken: false,
+    webdavAuthentication: "basic",
+    bearerToken: "",
+    clearBearerToken: false,
   };
 }
 
@@ -67,6 +74,16 @@ export function createFileConnectionDraft(connection?: FileConnection): FileConn
       region: config.region,
       bucket: config.bucket,
       pathStyle: config.pathStyle,
+    };
+  }
+  if (config?.protocol === "webdav") {
+    return {
+      ...draft,
+      protocol: "webdav",
+      endpoint: config.endpoint,
+      root: config.root,
+      username: config.authentication.method === "basic" ? config.authentication.username : "",
+      webdavAuthentication: config.authentication.method,
     };
   }
   if (config?.protocol === "sftp") {
@@ -104,6 +121,8 @@ export function createProtocolDraft(protocol: SupportedFileProtocol, current: Pi
     draft.port = 22;
   } else if (protocol === "s3") {
     draft.endpoint = "http://127.0.0.1:9000";
+  } else if (protocol === "webdav") {
+    draft.endpoint = "http://127.0.0.1:8080";
   }
   return draft;
 }
@@ -132,6 +151,10 @@ export function s3SecretKeyUpdate(draft: Pick<FileConnectionDraft, "secretKey" |
 
 export function s3SessionTokenUpdate(draft: Pick<FileConnectionDraft, "sessionToken" | "clearSessionToken">): SecretUpdate {
   return secretUpdate(draft.sessionToken, draft.clearSessionToken);
+}
+
+export function webdavBearerTokenUpdate(draft: Pick<FileConnectionDraft, "bearerToken" | "clearBearerToken">): SecretUpdate {
+  return secretUpdate(draft.bearerToken, draft.clearBearerToken);
 }
 
 export function fileConnectionRequestFromDraft(draft: FileConnectionDraft): SaveFileConnectionRequest {
@@ -170,6 +193,23 @@ export function fileConnectionRequestFromDraft(draft: FileConnectionDraft): Save
       config,
       secrets: {
         privateKey: draft.authentication === "private_key" ? sftpPrivateKeyUpdate(draft) : { action: "clear" },
+      },
+    };
+  }
+  if (draft.protocol === "webdav") {
+    const config: WebdavFileConnectionConfig = {
+      protocol: "webdav",
+      endpoint: draft.endpoint.trim(),
+      root: draft.root.trim(),
+      authentication: draft.webdavAuthentication === "basic" ? { method: "basic", username: draft.username.trim() } : { method: "bearer" },
+    };
+    return {
+      id: draft.id,
+      name: draft.name.trim(),
+      config,
+      secrets: {
+        password: draft.webdavAuthentication === "basic" ? ftpPasswordUpdate(draft) : { action: "clear" },
+        bearerToken: draft.webdavAuthentication === "bearer" ? webdavBearerTokenUpdate(draft) : { action: "clear" },
       },
     };
   }

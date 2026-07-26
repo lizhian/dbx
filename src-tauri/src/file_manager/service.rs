@@ -239,7 +239,7 @@ mod tests {
     };
     use crate::file_manager::models::{
         FileConnectionConfig, FileSecretUpdates, SaveFileConnectionRequest, SecretUpdate, SftpAuthentication,
-        TestFileConnectionRequest,
+        TestFileConnectionRequest, WebdavAuthentication,
     };
 
     async fn storage(label: &str) -> Storage {
@@ -343,6 +343,48 @@ mod tests {
         }
         let stored = serde_json::to_string(&storage.load_file_connections().await.unwrap()).unwrap();
         for secret in ["secret-access", "secret-value", "secret-session"] {
+            assert!(!stored.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn webdav_authentication_secrets_are_required_exclusive_and_redacted() {
+        let storage = storage("webdav-secrets").await;
+        let request = |id: &str, authentication, secrets| SaveFileConnectionRequest {
+            id: id.to_string(),
+            name: "Local WebDAV".to_string(),
+            config: FileConnectionConfig::Webdav {
+                endpoint: "http://127.0.0.1:8080".to_string(),
+                root: "/".to_string(),
+                authentication,
+            },
+            secrets,
+        };
+
+        let basic = request(
+            "webdav-basic",
+            WebdavAuthentication::Basic { username: "dbx".to_string() },
+            FileSecretUpdates::default(),
+        );
+        assert_eq!(save_connection(&storage, basic.clone()).await.unwrap_err().code, "configuration");
+        let mut basic_with_password = basic;
+        basic_with_password.secrets.password = SecretUpdate::Set("secret-basic".to_string());
+        let saved = save_connection(&storage, basic_with_password).await.unwrap();
+        assert!(saved.secret_status.password);
+        assert!(!saved.secret_status.bearer_token);
+
+        let bearer = request("webdav-bearer", WebdavAuthentication::Bearer, FileSecretUpdates::default());
+        assert_eq!(save_connection(&storage, bearer.clone()).await.unwrap_err().code, "configuration");
+        let mut bearer_with_token = bearer;
+        bearer_with_token.secrets.bearer_token = SecretUpdate::Set("secret-bearer".to_string());
+        let saved = save_connection(&storage, bearer_with_token).await.unwrap();
+        assert!(saved.secret_status.bearer_token);
+        assert!(!saved.secret_status.password);
+
+        let public = serde_json::to_string(&list_connections(&storage).await.unwrap()).unwrap();
+        let stored = serde_json::to_string(&storage.load_file_connections().await.unwrap()).unwrap();
+        for secret in ["secret-basic", "secret-bearer"] {
+            assert!(!public.contains(secret));
             assert!(!stored.contains(secret));
         }
     }

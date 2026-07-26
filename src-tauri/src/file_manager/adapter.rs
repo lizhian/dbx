@@ -120,9 +120,12 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
             let mut builder = services::Webdav::default().endpoint(endpoint).root(root);
             match authentication {
                 WebdavAuthentication::Basic { username } => {
+                    validate_required("WebDAV username", username)?;
+                    validate_required("WebDAV password", secrets.get("password"))?;
                     builder = builder.username(username).password(secrets.get("password"));
                 }
                 WebdavAuthentication::Bearer => {
+                    validate_required("WebDAV bearer token", secrets.get("bearer_token"))?;
                     builder = builder.token(secrets.get("bearer_token"));
                 }
             }

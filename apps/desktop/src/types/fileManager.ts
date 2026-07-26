@@ -26,16 +26,18 @@ export interface S3FileConnectionConfig {
   pathStyle: boolean;
 }
 
+export interface WebdavFileConnectionConfig {
+  protocol: "webdav";
+  endpoint: string;
+  root: string;
+  authentication: { method: "basic"; username: string } | { method: "bearer" };
+}
+
 export type FileConnectionConfig =
   | FtpFileConnectionConfig
   | SftpFileConnectionConfig
   | S3FileConnectionConfig
-  | {
-      protocol: "webdav";
-      endpoint: string;
-      root: string;
-      authentication: { method: "basic"; username: string } | { method: "bearer" };
-    }
+  | WebdavFileConnectionConfig
   | {
       protocol: "hdfs";
       implementation: "webhdfs";

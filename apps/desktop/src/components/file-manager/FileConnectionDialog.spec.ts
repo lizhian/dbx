@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type { FileConnection } from "@/types/fileManager";
 import FileConnectionDialog from "./FileConnectionDialog.vue";
-import { createFileConnectionDraft, createFtpConnectionDraft, fileConnectionRequestFromDraft, ftpPasswordUpdate, s3AccessKeyUpdate, s3SecretKeyUpdate, s3SessionTokenUpdate, sftpPrivateKeyUpdate } from "./fileConnectionDraft";
+import { createFileConnectionDraft, createFtpConnectionDraft, fileConnectionRequestFromDraft, ftpPasswordUpdate, s3AccessKeyUpdate, s3SecretKeyUpdate, s3SessionTokenUpdate, sftpPrivateKeyUpdate, webdavBearerTokenUpdate } from "./fileConnectionDraft";
 
 vi.mock("@/lib/backend/api", () => ({
   listFileConnections: vi.fn(async () => []),
@@ -131,6 +131,57 @@ const s3Connection: FileConnection = {
   },
 };
 
+const webdavBasicConnection: FileConnection = {
+  id: "webdav-basic",
+  name: "Local WebDAV",
+  config: {
+    protocol: "webdav",
+    endpoint: "http://127.0.0.1:8080",
+    root: "/",
+    authentication: { method: "basic", username: "dbx" },
+  },
+  capabilities: {
+    read: true,
+    write: true,
+    stat: true,
+    list: true,
+    delete: true,
+    copy: true,
+    rename: true,
+    nativeCopy: true,
+    nativeRename: true,
+    atomicRename: true,
+    atomicNoClobber: false,
+    copyMode: "native",
+    renameMode: "native",
+  },
+  secretStatus: {
+    password: true,
+    privateKey: false,
+    accessKey: false,
+    secretKey: false,
+    sessionToken: false,
+    bearerToken: false,
+    delegationToken: false,
+  },
+};
+
+const webdavBearerConnection: FileConnection = {
+  ...webdavBasicConnection,
+  id: "webdav-bearer",
+  config: {
+    protocol: "webdav",
+    endpoint: "https://dav.example.test",
+    root: "/files/",
+    authentication: { method: "bearer" },
+  },
+  secretStatus: {
+    ...webdavBasicConnection.secretStatus,
+    password: false,
+    bearerToken: true,
+  },
+};
+
 async function mountDialog(selectedConnection: FileConnection = connection) {
   const container = document.createElement("div");
   document.body.append(container);
@@ -252,5 +303,47 @@ describe("FileConnectionDialog S3 lifecycle form", () => {
     const config = JSON.stringify(request.config);
     expect(config).not.toContain("replacement-access");
     expect(config).not.toContain("replacement-secret");
+  });
+});
+
+describe("FileConnectionDialog WebDAV lifecycle form", () => {
+  it("shows only endpoint, root, username, and password for Basic authentication", async () => {
+    await mountDialog(webdavBasicConnection);
+
+    expect(document.querySelector<HTMLInputElement>("#file-connection-endpoint")?.value).toBe("http://127.0.0.1:8080");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-root")?.value).toBe("/");
+    expect(document.querySelector<HTMLInputElement>("#file-connection-username")?.value).toBe("dbx");
+    expect(document.querySelector<HTMLInputElement>("input#file-connection-password")?.value).toBe("");
+    expect(document.querySelector("#file-connection-port")).toBeNull();
+    expect(document.querySelector("#file-connection-region")).toBeNull();
+    expect(document.querySelector("#file-connection-bearer-token")).toBeNull();
+  });
+
+  it("round-trips Bearer authentication with token Set, Keep, and Clear semantics", async () => {
+    await mountDialog(webdavBearerConnection);
+    expect(document.querySelector("#file-connection-username")).toBeNull();
+    expect(document.querySelector("#file-connection-password")).toBeNull();
+    expect(document.querySelector<HTMLInputElement>("input#file-connection-bearer-token")?.value).toBe("");
+
+    const draft = createFileConnectionDraft(webdavBearerConnection);
+    expect(webdavBearerTokenUpdate(draft)).toEqual({ action: "keep" });
+    draft.bearerToken = "replacement-bearer";
+    let request = fileConnectionRequestFromDraft(draft);
+    expect(request.config).toEqual({
+      protocol: "webdav",
+      endpoint: "https://dav.example.test",
+      root: "/files/",
+      authentication: { method: "bearer" },
+    });
+    expect(request.secrets).toEqual({
+      password: { action: "clear" },
+      bearerToken: { action: "set", value: "replacement-bearer" },
+    });
+    expect(JSON.stringify(request.config)).not.toContain("replacement-bearer");
+
+    draft.bearerToken = "";
+    draft.clearBearerToken = true;
+    request = fileConnectionRequestFromDraft(draft);
+    expect(request.secrets?.bearerToken).toEqual({ action: "clear" });
   });
 });
