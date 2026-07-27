@@ -63,7 +63,7 @@ export default withEnglishFallback({
   },
   fileManager: {
     title: "文件管理",
-    storageCategory: "文件存储",
+    storageCategory: "文件管理",
     newConnection: "新建文件连接",
     editConnection: "编辑文件连接",
     noConnections: "暂无文件连接",

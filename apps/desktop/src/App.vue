@@ -1325,6 +1325,10 @@ async function newQuery() {
   if (!conn) return;
   connectionStore.activeConnectionId = target.connectionId;
   const connectionTarget = quickConnectionOpenTarget(conn);
+  if (connectionTarget.kind === "file-manager") {
+    await openFileConnection(target.connectionId);
+    return;
+  }
   if (connectionTarget.kind !== "query") {
     try {
       await connectionStore.ensureConnected(target.connectionId);
@@ -1380,6 +1384,10 @@ async function openConnectionQuery(connectionId: string) {
   if (!connection) return;
   connectionStore.activeConnectionId = connectionId;
   const initialTarget = quickConnectionOpenTarget(connection);
+  if (initialTarget.kind === "file-manager") {
+    await openFileConnection(connectionId);
+    return;
+  }
   if (initialTarget.kind === "mq-admin") {
     queryStore.openMqAdmin(connectionId);
     return;

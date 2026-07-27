@@ -20,6 +20,10 @@ function connection(dbType: ConnectionConfig["db_type"]): ConnectionConfig {
 }
 
 describe("quickConnectionOpenTarget", () => {
+  it("opens file connections in File Manager", () => {
+    expect(quickConnectionOpenTarget(connection("file"))).toEqual({ kind: "file-manager" });
+  });
+
   it("opens message queue connections in the MQ admin console", () => {
     expect(quickConnectionOpenTarget(connection("mq"))).toEqual({ kind: "mq-admin" });
   });
