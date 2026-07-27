@@ -112,6 +112,11 @@ async function flushPage() {
   await nextTick();
 }
 
+async function flushEntrySingleClick() {
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  await flushPage();
+}
+
 async function mountPage() {
   const container = document.createElement("div");
   document.body.append(container);
@@ -186,6 +191,20 @@ describe("FileManagerPage browsing", () => {
     expect(document.body.textContent).not.toContain("New file connection");
   });
 
+  it("uses one toolbar and omits the type column", async () => {
+    await mountOpenPage();
+
+    const toolbar = document.querySelector<HTMLElement>("[data-file-manager-toolbar]");
+    expect(document.querySelectorAll("header")).toHaveLength(1);
+    expect(toolbar?.textContent).toContain("Local FTP");
+    expect(toolbar?.textContent).toContain("/");
+    expect(toolbar?.textContent).toContain("Upload");
+    expect(toolbar?.querySelector('button[title="Refresh"]')).not.toBeNull();
+
+    const headings = Array.from(document.querySelectorAll("thead th")).map((heading) => heading.textContent?.trim());
+    expect(headings).toEqual(["Name", "Size", "Modified", "Actions"]);
+  });
+
   it("opens the connection root, displays metadata, navigates into a directory, and returns to root", async () => {
     await mountOpenPage();
 
@@ -197,8 +216,10 @@ describe("FileManagerPage browsing", () => {
     expect(document.querySelector('tr[data-file-entry-path="/"]')).toBeNull();
     expect(entryRow("fixture.txt")?.querySelector("svg")).not.toBeNull();
 
-    const folderButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("folder"));
-    folderButton?.click();
+    const folderRow = entryRow("folder");
+    folderRow?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+    folderRow?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 2 }));
+    folderRow?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, detail: 2 }));
     await flushPage();
     expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "folder");
     expect(document.body.textContent).toContain("/folder");
@@ -212,14 +233,28 @@ describe("FileManagerPage browsing", () => {
   it("expands folders inline without changing the current directory", async () => {
     await mountOpenPage();
 
-    entryRow("folder")?.querySelector<HTMLButtonElement>('button[title="Expand folder"]')?.click();
-    await flushPage();
+    entryRow("folder")?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+    await flushEntrySingleClick();
 
     expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "folder");
     expect(entryRow("folder/child.txt")).not.toBeNull();
     expect(entryRow("folder/child.txt")?.firstElementChild?.getAttribute("style")).toContain("24px");
     expect(document.body.textContent).toContain("/");
     expect(document.querySelector("[data-file-parent-row]")).toBeNull();
+  });
+
+  it("downloads a file when its row is clicked", async () => {
+    await mountOpenPage();
+
+    entryRow("fixture.txt")?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+    await flushEntrySingleClick();
+
+    expect(downloadFile).toHaveBeenCalledWith({
+      connectionId: "ftp-local",
+      remotePath: "fixture.txt",
+      localPath: "/tmp/fixture.txt",
+      replace: false,
+    });
   });
 
   it("opens shared right-click actions for files and folders", async () => {

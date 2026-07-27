@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Copy, Download, File as FileIcon, FilePenLine, FileQuestion, Folder, FolderOpen, Loader2, RefreshCw, Trash2, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
@@ -47,6 +47,8 @@ const deleteEntryTarget = ref<FileEntry>();
 const remoteOperation = ref<{ operation: "copy" | "rename"; entry: FileEntry; destinationPath: string }>();
 const replaceRequest = ref<{ operation: "upload" | "download"; request: FileTransferRequest } | { operation: "copy" | "rename"; request: FileRemoteOperationRequest; sourceKind: FileEntry["kind"] }>();
 const fileContextMenuItems = ref<ContextMenuItem[]>([]);
+const ENTRY_SINGLE_CLICK_DELAY_MS = 180;
+let entryClickTimer: ReturnType<typeof setTimeout> | undefined;
 const replaceDestination = computed(() => {
   const pending = replaceRequest.value;
   return pending ? ("remotePath" in pending.request ? pending.request.remotePath : pending.request.destinationPath) : "";
@@ -270,6 +272,29 @@ async function startDownload(entry: FileEntry) {
   }
 }
 
+function cancelPendingEntryClick() {
+  if (!entryClickTimer) return;
+  clearTimeout(entryClickTimer);
+  entryClickTimer = undefined;
+}
+
+function handleEntryClick(entry: FileEntry, event: MouseEvent) {
+  if (event.detail > 1 || entry.kind === "unknown") return;
+  cancelPendingEntryClick();
+  entryClickTimer = setTimeout(() => {
+    entryClickTimer = undefined;
+    if (entry.kind === "directory") void toggleDirectory(entry);
+    else void startDownload(entry);
+  }, ENTRY_SINGLE_CLICK_DELAY_MS);
+}
+
+function handleEntryDoubleClick(entry: FileEntry) {
+  cancelPendingEntryClick();
+  if (entry.kind === "directory") void openEntry(entry);
+}
+
+onBeforeUnmount(cancelPendingEntryClick);
+
 async function runTransfer(operation: "upload" | "download", request: FileTransferRequest) {
   operationActive.value = `${operation}:${request.remotePath}`;
   try {
@@ -462,32 +487,30 @@ defineExpose({ openConnectionById });
 <template>
   <div class="flex h-full min-h-0 flex-1 flex-col">
     <section class="flex h-full min-h-0 flex-col bg-background">
-      <header v-if="activeConnection" class="flex h-11 shrink-0 items-center border-b px-3">
-        <div class="flex min-w-0 items-center gap-2">
+      <header v-if="activeConnection" data-file-manager-toolbar class="flex h-11 shrink-0 items-center gap-1 border-b px-2">
+        <div class="flex min-w-0 shrink-0 items-center gap-2">
           <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :title="t('common.close')" @click="closeBrowser">
             <ArrowLeft class="h-4 w-4" />
           </Button>
-          <h1 class="truncate text-sm font-semibold">{{ activeConnection.name }}</h1>
+          <h1 class="max-w-48 truncate text-sm font-semibold" :title="activeConnection.name">{{ activeConnection.name }}</h1>
         </div>
+        <div class="mx-1 h-5 border-l" />
+        <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :disabled="!currentPath || browsing" :title="t('fileManager.up')" @click="goUp">
+          <ChevronLeft class="h-4 w-4" />
+        </Button>
+        <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :disabled="browsing" :title="t('fileManager.refresh')" @click="refreshDirectory">
+          <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': browsing }" />
+        </Button>
+        <span class="min-w-0 flex-1 truncate px-2 font-mono text-xs" :title="visiblePath">{{ visiblePath }}</span>
+        <Button v-if="activeConnection.capabilities.write" variant="outline" size="sm" class="h-7 shrink-0" :disabled="!!operationActive" @click="selectUploadFile">
+          <Loader2 v-if="operationActive.startsWith('upload:')" class="h-4 w-4 animate-spin" />
+          <Upload v-else class="h-4 w-4" />
+          {{ t("fileManager.upload") }}
+        </Button>
+        <span v-if="operationActive" role="status" class="sr-only">{{ t("fileManager.transferring") }}</span>
       </header>
 
       <template v-if="activeConnection">
-        <div class="flex h-10 shrink-0 items-center gap-1 border-b px-2">
-          <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="!currentPath || browsing" :title="t('fileManager.up')" @click="goUp">
-            <ChevronLeft class="h-4 w-4" />
-          </Button>
-          <Button variant="ghost" size="icon" class="h-7 w-7" :disabled="browsing" :title="t('fileManager.refresh')" @click="refreshDirectory">
-            <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': browsing }" />
-          </Button>
-          <span class="min-w-0 flex-1 truncate px-2 font-mono text-xs" :title="visiblePath">{{ visiblePath }}</span>
-          <Button v-if="activeConnection.capabilities.write" variant="outline" size="sm" class="h-7" :disabled="!!operationActive" @click="selectUploadFile">
-            <Loader2 v-if="operationActive.startsWith('upload:')" class="h-4 w-4 animate-spin" />
-            <Upload v-else class="h-4 w-4" />
-            {{ t("fileManager.upload") }}
-          </Button>
-          <span v-if="operationActive" role="status" class="sr-only">{{ t("fileManager.transferring") }}</span>
-        </div>
-
         <div v-if="browseError" role="alert" class="border-b px-3 py-2 text-sm text-destructive">{{ browseError }}</div>
         <CustomContextMenu :items="fileContextMenuItems" v-slot="contextMenuSlot">
           <div class="min-h-0 flex-1 overflow-auto">
@@ -495,7 +518,6 @@ defineExpose({ openConnectionById });
               <thead class="sticky top-0 z-[1] bg-muted/70 text-left text-xs text-muted-foreground">
                 <tr>
                   <th class="px-3 py-2 font-medium">{{ t("fileManager.fileName") }}</th>
-                  <th class="w-28 px-3 py-2 font-medium">{{ t("fileManager.type") }}</th>
                   <th class="w-28 px-3 py-2 text-right font-medium">{{ t("fileManager.size") }}</th>
                   <th class="w-48 px-3 py-2 font-medium">{{ t("fileManager.modified") }}</th>
                   <th class="w-36 px-3 py-2 text-right font-medium">{{ t("fileManager.actions") }}</th>
@@ -510,12 +532,21 @@ defineExpose({ openConnectionById });
                       <span class="truncate">../</span>
                     </span>
                   </td>
-                  <td class="px-3 py-2 text-muted-foreground">{{ t("fileManager.kind.directory") }}</td>
                   <td class="px-3 py-2" />
                   <td class="px-3 py-2" />
                   <td class="px-3 py-2" />
                 </tr>
-                <tr v-for="row in fileTreeRows" :key="row.entry.path" :data-file-entry-path="row.entry.path" :data-file-entry-kind="row.entry.kind" class="border-b hover:bg-muted/50" @contextmenu="(event) => openFileContextMenu(event, row.entry, contextMenuSlot.onContextMenu)">
+                <tr
+                  v-for="row in fileTreeRows"
+                  :key="row.entry.path"
+                  :data-file-entry-path="row.entry.path"
+                  :data-file-entry-kind="row.entry.kind"
+                  class="border-b hover:bg-muted/50"
+                  :class="{ 'cursor-pointer': row.entry.kind !== 'unknown' }"
+                  @click="(event) => handleEntryClick(row.entry, event)"
+                  @dblclick="handleEntryDoubleClick(row.entry)"
+                  @contextmenu="(event) => openFileContextMenu(event, row.entry, contextMenuSlot.onContextMenu)"
+                >
                   <td class="py-2 pr-3" :style="{ paddingLeft: treeItemPaddingLeft(row.depth) }">
                     <span class="flex min-w-0 items-center gap-1.5">
                       <button
@@ -531,35 +562,34 @@ defineExpose({ openConnectionById });
                         <ChevronRight v-else class="h-3.5 w-3.5" />
                       </button>
                       <span v-else class="h-5 w-5 shrink-0" />
-                      <button v-if="row.entry.kind === 'directory'" type="button" class="flex min-w-0 items-center gap-2 text-left" @click="openEntry(row.entry)">
+                      <button v-if="row.entry.kind === 'directory'" type="button" class="flex min-w-0 items-center gap-2 text-left">
                         <FolderOpen v-if="expandedDirectoryPaths.has(row.entry.path)" class="h-4 w-4 shrink-0 text-amber-500" />
                         <Folder v-else class="h-4 w-4 shrink-0 text-amber-500" />
                         <span class="truncate">{{ row.entry.name }}</span>
                       </button>
-                      <span v-else class="flex min-w-0 items-center gap-2">
+                      <button v-else type="button" class="flex min-w-0 items-center gap-2 text-left">
                         <FileIcon v-if="row.entry.kind === 'file'" class="h-4 w-4 shrink-0 text-muted-foreground" />
                         <FileQuestion v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
                         <span class="truncate">{{ row.entry.name }}</span>
-                      </span>
+                      </button>
                     </span>
                   </td>
-                  <td class="px-3 py-2 text-muted-foreground">{{ t(`fileManager.kind.${row.entry.kind}`) }}</td>
                   <td class="px-3 py-2 text-right tabular-nums text-muted-foreground">{{ row.entry.kind === "file" ? formatFileSize(row.entry.size) : "—" }}</td>
                   <td class="truncate px-3 py-2 text-muted-foreground">{{ row.entry.modifiedAt ? new Date(row.entry.modifiedAt).toLocaleString() : "—" }}</td>
                   <td class="px-3 py-1 text-right">
-                    <Button v-if="row.entry.kind === 'file' && activeConnection.capabilities.copy" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.copy')" @click="startRemoteOperation(row.entry, 'copy')">
+                    <Button v-if="row.entry.kind === 'file' && activeConnection.capabilities.copy" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.copy')" @click.stop="startRemoteOperation(row.entry, 'copy')">
                       <Loader2 v-if="operationActive === `copy:${row.entry.path}`" class="h-4 w-4 animate-spin" />
                       <Copy v-else class="h-4 w-4" />
                     </Button>
-                    <Button v-if="row.entry.kind !== 'unknown' && activeConnection.capabilities.rename" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.rename')" @click="startRemoteOperation(row.entry, 'rename')">
+                    <Button v-if="row.entry.kind !== 'unknown' && activeConnection.capabilities.rename" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.rename')" @click.stop="startRemoteOperation(row.entry, 'rename')">
                       <Loader2 v-if="operationActive === `rename:${row.entry.path}`" class="h-4 w-4 animate-spin" />
                       <FilePenLine v-else class="h-4 w-4" />
                     </Button>
-                    <Button v-if="row.entry.kind === 'file' && activeConnection.capabilities.read" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.download')" @click="startDownload(row.entry)">
+                    <Button v-if="row.entry.kind === 'file' && activeConnection.capabilities.read" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.download')" @click.stop="startDownload(row.entry)">
                       <Loader2 v-if="operationActive === `download:${row.entry.path}`" class="h-4 w-4 animate-spin" />
                       <Download v-else class="h-4 w-4" />
                     </Button>
-                    <Button v-if="activeConnection.capabilities.delete" variant="ghost" size="icon" class="h-7 w-7 text-destructive" :disabled="!!operationActive" :title="t('common.delete')" @click="deleteEntryTarget = row.entry">
+                    <Button v-if="activeConnection.capabilities.delete" variant="ghost" size="icon" class="h-7 w-7 text-destructive" :disabled="!!operationActive" :title="t('common.delete')" @click.stop="deleteEntryTarget = row.entry">
                       <Loader2 v-if="operationActive === `delete:${row.entry.path}`" class="h-4 w-4 animate-spin" />
                       <Trash2 v-else class="h-4 w-4" />
                     </Button>
