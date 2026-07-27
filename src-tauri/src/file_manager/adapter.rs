@@ -114,8 +114,11 @@ pub fn build_operator(
                 let endpoint = runtime_endpoint
                     .map(|runtime| endpoint_with_port(&runtime.host, "ssh", runtime.port))
                     .unwrap_or_else(|| endpoint_with_port(endpoint, "ssh", *port));
-                let mut builder =
-                    services::Sftp::default().endpoint(&endpoint).root(root).user(username).known_hosts_strategy("Add");
+                let mut builder = services::Sftp::default()
+                    .endpoint(&endpoint)
+                    .root(root)
+                    .user(username)
+                    .known_hosts_strategy("Accept");
                 if matches!(authentication, SftpAuthentication::PrivateKey) {
                     let key = secrets.get("private_key");
                     validate_required("SFTP private key", key)?;
