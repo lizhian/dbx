@@ -9,8 +9,9 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import FileManagerPage from "./FileManagerPage.vue";
 import { displayFilePath, parentFilePath } from "./filePath";
 
-const { copyFilePath, deleteFilePath, downloadFile, executeWithProductionContextGuard, listFilePath, renameFilePath, revealPathInFileManager, shellOpen, uploadFile } = vi.hoisted(() => ({
+const { copyFilePath, createFileDirectory, deleteFilePath, downloadFile, executeWithProductionContextGuard, listFilePath, renameFilePath, revealPathInFileManager, shellOpen, uploadFile } = vi.hoisted(() => ({
   copyFilePath: vi.fn(async (_request: unknown) => undefined),
+  createFileDirectory: vi.fn(async (_request: unknown) => undefined),
   deleteFilePath: vi.fn(async (_connectionId: string, _path: string) => undefined),
   downloadFile: vi.fn(async (_request: unknown, onProgress?: (progress: { bytesTransferred: number; totalBytes: number }) => void) => {
     onProgress?.({ bytesTransferred: 1536, totalBytes: 1536 });
@@ -153,6 +154,7 @@ vi.mock("@/lib/backend/api", () => ({
   uploadFile,
   downloadFile,
   deleteFilePath,
+  createFileDirectory,
   copyFilePath,
   renameFilePath,
   revealPathInFileManager,
@@ -180,10 +182,10 @@ async function flushEntrySingleClick() {
   await flushPage();
 }
 
-async function mountPage() {
+async function mountPage(connectionId?: string) {
   const container = document.createElement("div");
   document.body.append(container);
-  const app = createApp(FileManagerPage);
+  const app = createApp(FileManagerPage, connectionId ? { connectionId } : undefined);
   mountedApps.push(app);
   app.use(createPinia());
   app.use(i18n);
@@ -231,6 +233,7 @@ afterEach(() => {
   uploadFile.mockClear();
   downloadFile.mockClear();
   deleteFilePath.mockClear();
+  createFileDirectory.mockClear();
   executeWithProductionContextGuard.mockClear();
   copyFilePath.mockClear();
   renameFilePath.mockClear();
@@ -239,6 +242,14 @@ afterEach(() => {
 });
 
 describe("FileManagerPage browsing", () => {
+  it("opens its connection from the tab-scoped prop", async () => {
+    await mountPage("ftp-local");
+
+    expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "");
+    expect(document.body.textContent).toContain("Local FTP");
+    expect(document.body.textContent).toContain("fixture.txt");
+  });
+
   it("exposes one layout root so parent visibility directives apply", async () => {
     const { container } = await mountPage();
 
@@ -263,12 +274,43 @@ describe("FileManagerPage browsing", () => {
     expect(document.querySelectorAll("header")).toHaveLength(1);
     expect(toolbar?.textContent).toContain("Local FTP");
     expect(toolbar?.textContent).toContain("/");
+    expect(toolbar?.textContent).toContain("New folder");
     expect(toolbar?.textContent).toContain("Upload");
     expect(toolbar?.textContent).toContain("Downloads");
     expect(toolbar?.querySelector('button[title="Refresh"]')).not.toBeNull();
 
     const headings = Array.from(document.querySelectorAll("thead th")).map((heading) => heading.textContent?.trim());
     expect(headings).toEqual(["Name", "Size", "Modified", "Actions"]);
+    expect(toolbar!.textContent!.indexOf("New folder")).toBeLessThan(toolbar!.textContent!.indexOf("Upload"));
+  });
+
+  it("creates a folder in the current directory and refreshes the listing", async () => {
+    await mountOpenPage();
+
+    const newFolderButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("New folder"));
+    newFolderButton?.click();
+    await flushPage();
+
+    const input = document.querySelector<HTMLInputElement>("#file-create-directory-name");
+    expect(input).not.toBeNull();
+    input!.value = "reports";
+    input!.dispatchEvent(new Event("input", { bubbles: true }));
+    await flushPage();
+
+    const createButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Create");
+    createButton?.click();
+    await flushPage();
+
+    expect(createFileDirectory).toHaveBeenCalledWith({
+      connectionId: "ftp-local",
+      path: "reports",
+    });
+    expect(executeWithProductionContextGuard).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reviewText: "CREATE DIRECTORY reports",
+      }),
+    );
+    expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "");
   });
 
   it("opens the connection root, displays metadata, navigates into a directory, and returns to root", async () => {
@@ -343,6 +385,10 @@ describe("FileManagerPage browsing", () => {
 
     const task = document.querySelector<HTMLElement>('[data-file-download-task="fixture.txt"]');
     expect(task?.textContent).toContain("fixture.txt");
+    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("Status");
+    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("Size");
+    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("Open file");
+    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("Open folder");
     expect(task?.textContent).toContain("512 B / 1.5 KiB");
     expect(task?.textContent).toContain("33%");
 

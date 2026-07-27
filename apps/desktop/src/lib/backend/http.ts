@@ -601,6 +601,10 @@ export async function deleteFilePath(_connectionId: string, _path: string): Prom
   throw new Error("Remote file connections are only available in the desktop app.");
 }
 
+export async function createFileDirectory(_request: import("@/types/fileManager").FileCreateDirectoryRequest): Promise<void> {
+  throw new Error("Remote file connections are only available in the desktop app.");
+}
+
 export async function copyFilePath(_request: import("@/types/fileManager").FileRemoteOperationRequest): Promise<void> {
   throw new Error("Remote file connections are only available in the desktop app.");
 }

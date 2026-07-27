@@ -1386,6 +1386,7 @@ pub fn run() {
             commands::file_manager::upload_file,
             commands::file_manager::download_file,
             commands::file_manager::delete_file_path,
+            commands::file_manager::create_file_directory,
             commands::file_manager::copy_file_path,
             commands::file_manager::rename_file_path,
             commands::plugins::list_plugins,

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Copy, Download, File as FileIcon, FilePenLine, FileQuestion, Folder, FolderOpen, Loader2, RefreshCw, Trash2, Upload } from "@lucide/vue";
+import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Copy, Download, File as FileIcon, FilePenLine, FileQuestion, Folder, FolderOpen, FolderPlus, Loader2, RefreshCw, Trash2, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -15,7 +15,7 @@ import { copyToClipboard } from "@/lib/common/clipboard";
 import { executeWithProductionContextGuard } from "@/lib/database/productionExecutionGuard";
 import { treeItemPaddingLeft } from "@/lib/sidebar/sidebarTreeItemLayout";
 import type { ConnectionConfig } from "@/types/database";
-import type { FileConnection, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
+import type { FileConnection, FileCreateDirectoryRequest, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
 import FileDownloadList from "./FileDownloadList.vue";
 import type { FileDownloadTask } from "./fileDownload";
 import { childFilePath, displayFilePath, formatFileSize, parentFilePath } from "./filePath";
@@ -23,6 +23,9 @@ import { flattenVisibleFileTree, normalizeFileListing } from "./fileTree";
 
 const emit = defineEmits<{
   close: [];
+}>();
+const props = defineProps<{
+  connectionId?: string;
 }>();
 const { t } = useI18n();
 const { toast } = useToast();
@@ -46,6 +49,8 @@ const visiblePath = computed(() => displayFilePath(currentPath.value));
 const uploadDialogOpen = ref(false);
 const uploadLocalPath = ref("");
 const uploadRemotePath = ref("");
+const createDirectoryDialogOpen = ref(false);
+const createDirectoryName = ref("");
 const operationActive = ref("");
 const deleteEntryTarget = ref<FileEntry>();
 const remoteOperation = ref<{ operation: "copy" | "rename"; entry: FileEntry; destinationPath: string }>();
@@ -108,8 +113,10 @@ onMounted(async () => {
   try {
     await connectionStore.initFromDisk();
     await refreshRuntimeConnections();
+    if (props.connectionId) await openConnectionById(props.connectionId);
   } catch (error) {
     toast(formatError(error), 4000);
+    if (props.connectionId) emit("close");
   }
 });
 
@@ -243,6 +250,43 @@ async function selectUploadFile() {
     uploadDialogOpen.value = true;
   } catch (error) {
     toast(formatError(error), 4000);
+  }
+}
+
+function showCreateDirectoryDialog() {
+  if (!activeConnection.value?.capabilities.write) return;
+  createDirectoryName.value = "";
+  createDirectoryDialogOpen.value = true;
+}
+
+async function startCreateDirectory() {
+  const connection = activeConnection.value;
+  const name = createDirectoryName.value.trim();
+  if (!connection || !name) return;
+  const request: FileCreateDirectoryRequest = {
+    connectionId: connection.id,
+    path: childFilePath(currentPath.value, name),
+  };
+  if (!request.path) return;
+  createDirectoryDialogOpen.value = false;
+  operationActive.value = `create-directory:${request.path}`;
+  try {
+    const executed = await executeWithProductionContextGuard({
+      connection: connectionStore.getConfig(request.connectionId),
+      reviewText: `CREATE DIRECTORY ${request.path}`,
+      source: t("fileManager.title"),
+      execute: async () => {
+        await api.createFileDirectory(request);
+        return true;
+      },
+    });
+    if (!executed) return;
+    toast(t("fileManager.createDirectorySucceeded"));
+    await refreshDirectory();
+  } catch (error) {
+    toast(formatError(error), 4000);
+  } finally {
+    operationActive.value = "";
   }
 }
 
@@ -571,6 +615,11 @@ defineExpose({ openConnectionById });
           <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': browsing }" />
         </Button>
         <span class="min-w-0 flex-1 truncate px-2 font-mono text-xs" :title="visiblePath">{{ visiblePath }}</span>
+        <Button v-if="activeConnection.capabilities.write" variant="outline" size="sm" class="h-7 shrink-0" :disabled="!!operationActive" @click="showCreateDirectoryDialog">
+          <Loader2 v-if="operationActive.startsWith('create-directory:')" class="h-4 w-4 animate-spin" />
+          <FolderPlus v-else class="h-4 w-4" />
+          {{ t("fileManager.newFolder") }}
+        </Button>
         <Button v-if="activeConnection.capabilities.write" variant="outline" size="sm" class="h-7 shrink-0" :disabled="!!operationActive" @click="selectUploadFile">
           <Loader2 v-if="operationActive.startsWith('upload:')" class="h-4 w-4 animate-spin" />
           <Upload v-else class="h-4 w-4" />
@@ -679,6 +728,22 @@ defineExpose({ openConnectionById });
         <Loader2 class="h-5 w-5 animate-spin" />
       </div>
     </section>
+
+    <Dialog v-model:open="createDirectoryDialogOpen">
+      <DialogContent class="sm:max-w-[420px]">
+        <DialogHeader>
+          <DialogTitle>{{ t("fileManager.newFolder") }}</DialogTitle>
+        </DialogHeader>
+        <div class="grid gap-1.5">
+          <Label for="file-create-directory-name">{{ t("fileManager.folderName") }}</Label>
+          <Input id="file-create-directory-name" v-model="createDirectoryName" autofocus @keydown.enter.prevent="startCreateDirectory" />
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="createDirectoryDialogOpen = false">{{ t("common.cancel") }}</Button>
+          <Button :disabled="!createDirectoryName.trim()" @click="startCreateDirectory">{{ t("fileManager.create") }}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
 
     <Dialog v-model:open="uploadDialogOpen">
       <DialogContent class="sm:max-w-[480px]">

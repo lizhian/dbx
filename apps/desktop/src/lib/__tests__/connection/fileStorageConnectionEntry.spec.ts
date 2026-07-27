@@ -8,6 +8,7 @@ const databaseTypesSource = readFileSync(new URL("../../../types/database.ts", i
 const databaseIconSource = readFileSync(new URL("../../../components/icons/DatabaseIcon.vue", import.meta.url), "utf8");
 const fileManagerPageSource = readFileSync(new URL("../../../components/file-manager/FileManagerPage.vue", import.meta.url), "utf8");
 const appSource = readFileSync(new URL("../../../App.vue", import.meta.url), "utf8");
+const appTabBarSource = readFileSync(new URL("../../../components/layout/AppTabBar.vue", import.meta.url), "utf8");
 const appToolbarSource = readFileSync(new URL("../../../components/layout/AppToolbar.vue", import.meta.url), "utf8");
 const sidebarConnectionMutationSource = readFileSync(new URL("../../../composables/useSidebarConnectionMutationRuntime.ts", import.meta.url), "utf8");
 const databaseFeatureSupportSource = readFileSync(new URL("../../database/databaseFeatureSupport.ts", import.meta.url), "utf8");
@@ -70,6 +71,9 @@ describe("file storage connection entry", () => {
     expect(appToolbarSource).not.toContain("showFileManager");
     expect(appSource).not.toContain("@open-file-manager");
     expect(appSource).toContain('@open-file-connection="openFileConnection"');
+    expect(appSource).toContain("queryStore.openFileManagerTab(connection.id, connection.name)");
+    expect(appSource).toContain('v-for="tab in fileManagerTabs"');
+    expect(appTabBarSource).toContain("tab.mode === 'file-manager'");
     expect(fileManagerPageSource).not.toContain("fileManager.newConnection");
     expect(fileManagerPageSource).not.toContain("removeConnection");
     expect(fileManagerPageSource).toContain("defineExpose({ openConnectionById })");

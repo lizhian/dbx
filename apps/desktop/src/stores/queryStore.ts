@@ -1123,6 +1123,16 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openFileManagerTab(connectionId: string, title: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "file-manager" && tab.connectionId === connectionId);
+    if (existing) {
+      existing.title = title;
+      switchTab(existing.id);
+      return existing.id;
+    }
+    return createTab(connectionId, "", title, "file-manager");
+  }
+
   function showExecutedQueryResults(connectionId: string, database: string, sql: string, queryResults: QueryResult[]) {
     const id = createTab(connectionId, database, undefined, "query", undefined, sql);
     const tab = tabs.value.find((item) => item.id === id);
@@ -1680,6 +1690,7 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   function shouldConfirmTabClose(tab: QueryTab): boolean {
+    if (tab.mode === "file-manager") return false;
     if (tab.mode === "structure") return isTabDirty(tab);
     return shouldConfirmUnsavedSqlClose.value && isTabDirty(tab);
   }
@@ -4595,6 +4606,7 @@ export const useQueryStore = defineStore("query", () => {
     hasDirtyTabs,
     isConfirmingAppClose,
     createTab,
+    openFileManagerTab,
     showExecutedQueryResults,
     switchTab,
     closeTab,

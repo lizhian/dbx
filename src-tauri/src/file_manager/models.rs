@@ -163,6 +163,13 @@ pub struct FileTransferProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileCreateDirectoryRequest {
+    pub connection_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileRemoteOperationRequest {
     pub connection_id: String,
     pub source_path: String,

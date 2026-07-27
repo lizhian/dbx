@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use super::adapter::map_operation_error;
-use super::models::{FileManagerError, FileRemoteOperationRequest};
+use super::models::{FileCreateDirectoryRequest, FileManagerError, FileRemoteOperationRequest};
 use super::registry::FileOperatorRegistry;
 #[cfg(test)]
 use super::service::operator_for_connection;
@@ -18,6 +18,34 @@ use super::transfer::TRANSFER_TIMEOUT_SECS;
 use super::transfer::{
     copy_with_fixed_buffer, non_root_remote_path, transfer_with_configured_timeout, FileTransferState,
 };
+
+pub async fn create_directory_cached(
+    app_state: &AppState,
+    registry: &FileOperatorRegistry,
+    state: &FileTransferState,
+    request: FileCreateDirectoryRequest,
+) -> Result<(), FileManagerError> {
+    ensure_writable_connection(&app_state.storage, &request.connection_id).await?;
+    let lease = operator_lease_for_connection(app_state, registry, &request.connection_id).await?;
+    create_directory_with_cached_operator(state, request, (*lease.operator).clone(), lease.operation_timeout).await
+}
+
+async fn create_directory_with_cached_operator(
+    state: &FileTransferState,
+    request: FileCreateDirectoryRequest,
+    operator: Operator,
+    timeout: Option<Duration>,
+) -> Result<(), FileManagerError> {
+    let path = non_root_remote_path(&request.path)?;
+    let _permits = state.acquire(&request.connection_id).await?;
+    transfer_with_configured_timeout(timeout, async {
+        if remote_path_exists(&operator, &path).await? {
+            return Err(FileManagerError::new("already_exists", "The remote destination already exists"));
+        }
+        operator.create_dir(&format!("{path}/")).await.map_err(map_operation_error)
+    })
+    .await
+}
 
 #[cfg(test)]
 pub async fn copy(
@@ -405,12 +433,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        assert_folder_rename_contract, copy, copy_with_operator, fallback_rename_with_delete, rename,
-        rename_with_operator,
+        assert_folder_rename_contract, copy, copy_with_operator, create_directory_with_cached_operator,
+        fallback_rename_with_delete, rename, rename_with_operator,
     };
     use crate::file_manager::models::{
-        FileConnectionConfig, FileManagerError, FileRemoteOperationRequest, FileSecretUpdates, FileTransferRequest,
-        SaveFileConnectionRequest, SecretUpdate,
+        FileConnectionConfig, FileCreateDirectoryRequest, FileManagerError, FileRemoteOperationRequest,
+        FileSecretUpdates, FileTransferRequest, SaveFileConnectionRequest, SecretUpdate,
     };
     use crate::file_manager::service::save_connection;
     use crate::file_manager::transfer::{delete, download, upload, FileTransferState};
@@ -424,6 +452,42 @@ mod tests {
             "destinationPath": "destination.txt"
         });
         assert!(serde_json::from_value::<FileRemoteOperationRequest>(value).is_err());
+    }
+
+    #[tokio::test]
+    async fn create_directory_rejects_root_and_existing_destinations() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        let state = FileTransferState::default();
+
+        let root_error = create_directory_with_cached_operator(
+            &state,
+            FileCreateDirectoryRequest { connection_id: "memory".to_string(), path: String::new() },
+            operator.clone(),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(root_error.code, "configuration");
+
+        create_directory_with_cached_operator(
+            &state,
+            FileCreateDirectoryRequest { connection_id: "memory".to_string(), path: "parent/child".to_string() },
+            operator.clone(),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert!(operator.exists("parent/child/").await.unwrap());
+
+        let existing_error = create_directory_with_cached_operator(
+            &state,
+            FileCreateDirectoryRequest { connection_id: "memory".to_string(), path: "parent/child".to_string() },
+            operator,
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(existing_error.code, "already_exists");
     }
 
     #[tokio::test]

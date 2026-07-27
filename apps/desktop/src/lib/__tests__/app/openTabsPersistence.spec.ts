@@ -57,4 +57,24 @@ describe("openTabsPersistence originalSql round-trip", () => {
     expect(restored.database).toBe("dbx_catalog_completion");
     expect(restored.catalog).toBe("dbx_mysql_catalog");
   });
+
+  it("restores file manager tabs as ordinary connection-scoped tabs", () => {
+    const [restored] = roundTrip([
+      queryTab({
+        id: "file-1",
+        title: "SFTP Files",
+        connectionId: "sftp-1",
+        database: "",
+        mode: "file-manager",
+      }),
+    ]);
+
+    expect(restored).toMatchObject({
+      id: "file-1",
+      title: "SFTP Files",
+      connectionId: "sftp-1",
+      database: "",
+      mode: "file-manager",
+    });
+  });
 });

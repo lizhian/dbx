@@ -8,8 +8,8 @@ use tauri::{ipc::Channel, State};
 
 use crate::file_manager;
 use crate::file_manager::models::{
-    FileConnection, FileEntry, FileManagerError, FileRemoteOperationRequest, FileSecretStatus, FileTransferProgress,
-    FileTransferRequest,
+    FileConnection, FileCreateDirectoryRequest, FileEntry, FileManagerError, FileRemoteOperationRequest,
+    FileSecretStatus, FileTransferProgress, FileTransferRequest,
 };
 use crate::file_manager::{FileOperatorRegistry, FileTransferState};
 
@@ -125,6 +125,16 @@ pub async fn delete_file_path(
     path: String,
 ) -> Result<(), FileManagerError> {
     file_manager::transfer::delete_cached(state.inner(), registry.inner(), &transfer_state, &connection_id, &path).await
+}
+
+#[tauri::command]
+pub async fn create_file_directory(
+    state: State<'_, Arc<AppState>>,
+    registry: State<'_, FileOperatorRegistry>,
+    transfer_state: State<'_, FileTransferState>,
+    request: FileCreateDirectoryRequest,
+) -> Result<(), FileManagerError> {
+    file_manager::operations::create_directory_cached(state.inner(), registry.inner(), &transfer_state, request).await
 }
 
 #[tauri::command]

@@ -1491,6 +1491,10 @@ export async function deleteFilePath(connectionId: string, path: string): Promis
   return invoke("delete_file_path", { connectionId, path });
 }
 
+export async function createFileDirectory(request: import("@/types/fileManager").FileCreateDirectoryRequest): Promise<void> {
+  return invoke("create_file_directory", { request });
+}
+
 export async function copyFilePath(request: import("@/types/fileManager").FileRemoteOperationRequest): Promise<void> {
   return invoke("copy_file_path", { request });
 }

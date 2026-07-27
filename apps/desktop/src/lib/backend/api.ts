@@ -137,6 +137,7 @@ export const listFilePath = forward("listFilePath");
 export const uploadFile = forward("uploadFile");
 export const downloadFile = forward("downloadFile");
 export const deleteFilePath = forward("deleteFilePath");
+export const createFileDirectory = forward("createFileDirectory");
 export const copyFilePath = forward("copyFilePath");
 export const renameFilePath = forward("renameFilePath");
 export const deleteDatabaseBackupFiles = forward("deleteDatabaseBackupFiles");

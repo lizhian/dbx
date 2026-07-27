@@ -173,10 +173,6 @@ const showQueryEditorDdlDialog = ref(false);
 const showQueryEditorObjectSourceDialog = ref(false);
 const driverStoreTabOpen = ref(false);
 const driverStoreActive = ref(false);
-const fileManagerTabOpen = ref(false);
-const fileManagerActive = ref(false);
-const fileManagerPageRef = ref<{ openConnectionById: (connectionId: string) => Promise<void> } | null>(null);
-const pendingFileManagerConnectionId = ref<string | null>(null);
 const driverStoreActiveTab = ref<"agent" | "jdbc" | "storage" | "runtime">("agent");
 const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome");
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
@@ -226,6 +222,7 @@ const pendingAppCloseAction = ref<AppCloseAction | null>(null);
 const pendingCloseActionChoice = ref(false);
 
 const activeTab = computed(() => queryStore.tabs.find((t) => t.id === queryStore.activeTabId));
+const fileManagerTabs = computed(() => queryStore.tabs.filter((tab) => tab.mode === "file-manager"));
 
 const activeConnection = computed(() => {
   const tab = activeTab.value;
@@ -372,7 +369,6 @@ function activateSettingsPage() {
   settingsPageTabOpen.value = true;
   settingsStore.settingsPageActive = true;
   driverStoreActive.value = false;
-  fileManagerActive.value = false;
 }
 
 function closeSettingsPage() {
@@ -400,45 +396,17 @@ function openDriverStorePage(target?: "agent" | "jdbc" | "storage" | "runtime" |
   driverStoreTabOpen.value = true;
   driverStoreActive.value = true;
   settingsStore.settingsPageActive = false;
-  fileManagerActive.value = false;
-}
-
-function activateFileManagerPage() {
-  if (!fileManagerTabOpen.value) return;
-  fileManagerActive.value = true;
-  driverStoreActive.value = false;
-  settingsStore.settingsPageActive = false;
-}
-
-async function flushPendingFileManagerAction() {
-  const page = fileManagerPageRef.value;
-  const connectionId = pendingFileManagerConnectionId.value;
-  if (!page || !connectionId) return;
-  pendingFileManagerConnectionId.value = null;
-  try {
-    await page.openConnectionById(connectionId);
-  } catch (error: any) {
-    toast(translateBackendError(t, error?.message || String(error)), 5000);
-    closeFileManagerPage();
-  }
 }
 
 async function openFileConnection(connectionId: string) {
-  pendingFileManagerConnectionId.value = connectionId;
-  fileManagerTabOpen.value = true;
-  activateFileManagerPage();
-  await nextTick();
-  await flushPendingFileManagerAction();
-}
-
-watch(fileManagerPageRef, () => {
-  void flushPendingFileManagerAction();
-});
-
-function closeFileManagerPage() {
-  pendingFileManagerConnectionId.value = null;
-  fileManagerTabOpen.value = false;
-  fileManagerActive.value = false;
+  const connection = connectionStore.getConfig(connectionId);
+  if (!connection || connection.db_type !== "file") {
+    toast(t("fileManager.connectionNotFound"), 5000);
+    return;
+  }
+  driverStoreActive.value = false;
+  settingsStore.settingsPageActive = false;
+  queryStore.openFileManagerTab(connection.id, connection.name);
 }
 
 function closeDriverStorePage() {
@@ -586,7 +554,6 @@ watch(
     if (id) newQueryContextSource.value = "tab";
     if (id && driverStoreActive.value) driverStoreActive.value = false;
     if (id && settingsStore.settingsPageActive) settingsStore.settingsPageActive = false;
-    if (id && fileManagerActive.value) fileManagerActive.value = false;
     selectedSql.value = "";
     activeOutputView.value = "result";
     if (id) queryStore.reloadEvictedTab(id);
@@ -2246,17 +2213,12 @@ onUnmounted(() => {
                 :driver-store-active="driverStoreActive"
                 :settings-page-open="settingsPageTabOpen"
                 :settings-page-active="settingsStore.settingsPageActive"
-                :file-manager-open="fileManagerTabOpen"
-                :file-manager-active="fileManagerActive"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
                 @activate-driver-store="openDriverStorePage"
                 @activate-settings-page="activateSettingsPage"
-                @activate-file-manager="activateFileManagerPage"
-                @close-file-manager="closeFileManagerPage"
                 @activate-tab="
                   driverStoreActive = false;
                   settingsStore.settingsPageActive = false;
-                  fileManagerActive = false;
                 "
                 @close-driver-store="closeDriverStorePage"
                 @close-settings-page="closeSettingsPage"
@@ -2267,7 +2229,7 @@ onUnmounted(() => {
                 @cancel-tab-close="cancelPendingAppClose"
               />
               <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
-              <FileManagerPage v-if="fileManagerTabOpen" ref="fileManagerPageRef" v-show="fileManagerActive" class="flex-1 min-h-0" @close="closeFileManagerPage" />
+              <FileManagerPage v-for="tab in fileManagerTabs" :key="tab.id" v-show="activeTab?.id === tab.id && !driverStoreActive && !settingsStore.settingsPageActive" :connection-id="tab.connectionId" class="flex-1 min-h-0" @close="queryStore.closeTab(tab.id)" />
               <EditorSettingsPage
                 v-if="settingsPageTabOpen"
                 v-show="settingsStore.settingsPageActive"
@@ -2279,7 +2241,7 @@ onUnmounted(() => {
                 class="flex-1 min-h-0"
                 @update:open="(open: boolean) => (open ? activateSettingsPage() : closeSettingsPage())"
               />
-              <div v-if="activeTab" v-show="!driverStoreActive && !settingsStore.settingsPageActive && !fileManagerActive" class="flex flex-col flex-1 min-h-0">
+              <div v-if="activeTab && activeTab.mode !== 'file-manager'" v-show="!driverStoreActive && !settingsStore.settingsPageActive" class="flex flex-col flex-1 min-h-0">
                 <EditorToolbar
                   v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
                   :active-tab="activeTab"
@@ -2389,7 +2351,7 @@ onUnmounted(() => {
                 </KeepAlive>
               </div>
               <WelcomeScreen
-                v-else-if="!driverStoreActive && !settingsStore.settingsPageActive && !fileManagerActive"
+                v-else-if="!activeTab && !driverStoreActive && !settingsStore.settingsPageActive"
                 :connection-stats="connectionStats"
                 :recent-connections="recentConnections"
                 :saved-sql-history-items="savedSqlHistoryItems"

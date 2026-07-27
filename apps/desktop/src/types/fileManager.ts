@@ -138,6 +138,11 @@ export interface FileTransferProgress {
   totalBytes: number;
 }
 
+export interface FileCreateDirectoryRequest {
+  connectionId: string;
+  path: string;
+}
+
 export interface FileRemoteOperationRequest {
   connectionId: string;
   sourcePath: string;
