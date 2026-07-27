@@ -22,7 +22,7 @@ import type {
   TunnelProfile,
   VectorCollectionMeta,
 } from "@/types/database";
-import type { FileConnection, FileSecretUpdates } from "@/types/fileManager";
+import type { FileSecretUpdates } from "@/types/fileManager";
 import {
   inheritNaturalTreeNodeOrder,
   migrateLegacyPinnedTreeNodeOrder,
@@ -54,9 +54,6 @@ import {
   remapSidebarLayoutConnectionIds,
   reorderEntry as reorderEntryOp,
   buildConnectionGroupPathMap,
-  findFileConnectionLocation,
-  moveFileConnectionToGroup as moveFileConnectionToGroupOp,
-  preserveFileConnectionLayout,
   type DropPosition,
 } from "@/lib/sidebar/sidebarLayout";
 import type { SqlCompletionColumn, SqlCompletionForeignKey, SqlCompletionObject, SqlCompletionTable } from "@/lib/sql/sqlCompletion";
@@ -405,8 +402,6 @@ export const useConnectionStore = defineStore("connection", () => {
     allDatabases?: boolean;
   } | null>(null);
   const sidebarLayout = ref<SidebarLayout>(emptyLayout());
-  const fileConnections = ref<FileConnection[]>([]);
-  let fileConnectionsLoaded = false;
   const connectionGroupPaths = computed(() => buildConnectionGroupPathMap(sidebarLayout.value));
   let layoutPersistTimer: ReturnType<typeof setTimeout> | null = null;
   const staleTreeRefreshIds = new Set<string>();
@@ -5549,7 +5544,7 @@ export const useConnectionStore = defineStore("connection", () => {
     };
     collectExisting(treeNodes.value);
 
-    const freshNodes = buildTreeNodesFromLayout(sidebarLayout.value, connections.value, pinnedTreeNodeIds.value, fileConnections.value);
+    const freshNodes = buildTreeNodesFromLayout(sidebarLayout.value, connections.value, pinnedTreeNodeIds.value);
     const mergeState = (nodes: TreeNode[]): TreeNode[] =>
       nodes.map((node) => {
         const existing = existingNodesMap.get(node.id);
@@ -6015,11 +6010,9 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   function applySidebarLayout(layout: SidebarLayout) {
-    const mergedLayout = preserveFileConnectionLayout(layout, sidebarLayout.value);
     const reconciledLayout = reconcileLayout(
       connections.value.map((c) => c.id),
-      mergedLayout,
-      fileConnectionsLoaded ? fileConnections.value.map((connection) => connection.id) : undefined,
+      layout,
     );
     updateLayoutAndRebuild(reconciledLayout);
   }
@@ -6035,7 +6028,6 @@ export const useConnectionStore = defineStore("connection", () => {
         sidebarLayout.value = reconcileLayout(
           connections.value.map((c) => c.id),
           savedLayout ?? currentLayout,
-          fileConnectionsLoaded ? fileConnections.value.map((connection) => connection.id) : undefined,
         );
         rebuildTreeNodes();
       })().finally(() => {
@@ -6053,17 +6045,6 @@ export const useConnectionStore = defineStore("connection", () => {
     connectedIds.value.add(normalized.id);
     markConnectionHealthChecked(normalized.id);
     clearConnectionError(normalized.id);
-  }
-
-  function syncFileConnections(nextConnections: FileConnection[]) {
-    fileConnections.value = [...nextConnections];
-    fileConnectionsLoaded = true;
-    const nextLayout = reconcileLayout(
-      connections.value.map((connection) => connection.id),
-      sidebarLayout.value,
-      fileConnections.value.map((connection) => connection.id),
-    );
-    updateLayoutAndRebuild(nextLayout);
   }
 
   return {
@@ -6094,7 +6075,6 @@ export const useConnectionStore = defineStore("connection", () => {
     markConnectionLost,
     recordConnectionLostError,
     sidebarLayout,
-    syncFileConnections,
     connectionGroupPaths,
     getConfig,
     connectionIdentifierQuote,
@@ -6236,14 +6216,8 @@ export const useConnectionStore = defineStore("connection", () => {
     moveConnectionToGroup(connectionId: string, groupId: string | null) {
       updateLayoutAndRebuild(moveConnectionToGroupOp(sidebarLayout.value, connectionId, groupId));
     },
-    moveFileConnectionToGroup(connectionId: string, groupId: string | null) {
-      updateLayoutAndRebuild(moveFileConnectionToGroupOp(sidebarLayout.value, connectionId, groupId));
-    },
     groupIdForConnection(connectionId: string): string | null {
       return findConnectionLocation(sidebarLayout.value, connectionId)?.groupId ?? null;
-    },
-    groupIdForFileConnection(connectionId: string): string | null {
-      return findFileConnectionLocation(sidebarLayout.value, connectionId)?.groupId ?? null;
     },
     reorderSidebarEntry(draggedId: string, targetId: string, position: DropPosition) {
       updateLayoutAndRebuild(reorderEntryOp(sidebarLayout.value, draggedId, targetId, position));

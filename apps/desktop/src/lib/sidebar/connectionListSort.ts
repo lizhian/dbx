@@ -7,7 +7,7 @@ const connectionNameCollator = new Intl.Collator(undefined, { numeric: true, sen
 function sortConnectionSiblingsForDisplay(nodes: readonly TreeNode[], mode: Exclude<ConnectionListSortMode, "manual">): TreeNode[] {
   const sortedConnections = nodes
     .map((node, index) => ({ node, index }))
-    .filter(({ node }) => node.type === "connection" || node.type === "file-connection")
+    .filter(({ node }) => node.type === "connection")
     .sort((left, right) => {
       const compared = connectionNameCollator.compare(left.node.label, right.node.label);
       const directional = mode === "asc" ? compared : -compared;
@@ -17,7 +17,7 @@ function sortConnectionSiblingsForDisplay(nodes: readonly TreeNode[], mode: Excl
 
   let nextConnectionIndex = 0;
   const displayNodes = nodes.map((node) => {
-    if (node.type === "connection" || node.type === "file-connection") {
+    if (node.type === "connection") {
       return sortedConnections[nextConnectionIndex++]!;
     }
 

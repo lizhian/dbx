@@ -7,7 +7,7 @@ function connection(id: string, label: string): TreeNode {
 }
 
 function fileConnection(id: string, label: string): TreeNode {
-  return { id: `file-connection:${id}`, label, type: "file-connection", fileConnectionId: id, children: [] };
+  return { id, label, type: "connection", connectionId: id, children: [] };
 }
 
 function group(id: string, label: string, children: TreeNode[]): TreeNode {
@@ -43,6 +43,6 @@ describe("connection list display sort", () => {
 
   it("sorts database and file connections together without moving groups", () => {
     const tree = [connection("database-z", "Zulu"), group("team", "Team", []), fileConnection("files-a", "Alpha")];
-    expect(sortConnectionListForDisplay(tree, "asc").map((node) => node.id)).toEqual(["file-connection:files-a", "team", "database-z"]);
+    expect(sortConnectionListForDisplay(tree, "asc").map((node) => node.id)).toEqual(["files-a", "team", "database-z"]);
   });
 });

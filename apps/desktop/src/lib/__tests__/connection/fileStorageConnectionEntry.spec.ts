@@ -5,6 +5,8 @@ const connectionDialogSource = readFileSync(new URL("../../../components/connect
 const connectionStoreSource = readFileSync(new URL("../../../stores/connectionStore.ts", import.meta.url), "utf8");
 const databaseTypesSource = readFileSync(new URL("../../../types/database.ts", import.meta.url), "utf8");
 const databaseIconSource = readFileSync(new URL("../../../components/icons/DatabaseIcon.vue", import.meta.url), "utf8");
+const fileManagerPageSource = readFileSync(new URL("../../../components/file-manager/FileManagerPage.vue", import.meta.url), "utf8");
+const sidebarLayoutSource = readFileSync(new URL("../../sidebar/sidebarLayout.ts", import.meta.url), "utf8");
 
 describe("file storage connection entry", () => {
   it("offers file protocols as driver profiles under the shared file DatabaseType", () => {
@@ -28,5 +30,13 @@ describe("file storage connection entry", () => {
     expect(connectionDialogSource).toContain("await store.updateConnection(updated, fileSecrets)");
     expect(connectionStoreSource).toContain("fileSecretUpdates?: FileSecretUpdates");
     expect(connectionStoreSource).toContain("await api.saveConnections(nextConnections, fileSecretUpdates)");
+  });
+
+  it("uses one connection store and one ordinary sidebar entry type", () => {
+    expect(fileManagerPageSource).toContain('connection.db_type === "file"');
+    expect(fileManagerPageSource).not.toContain("useFileConnectionStore");
+    expect(connectionStoreSource).not.toContain("syncFileConnections");
+    expect(databaseTypesSource).not.toContain('| "file-connection"');
+    expect(sidebarLayoutSource).not.toContain('"file-connection"');
   });
 });

@@ -219,7 +219,7 @@ const isTreeSearchFiltering = computed(() => sidebarFilterGuards.value.isTreeSea
 const isRootListPartial = computed(() => sidebarFilterGuards.value.isRootListPartial);
 
 const SEARCH_SCOPE_TO_NODE_TYPES: Record<SearchScope, TreeNodeType[]> = {
-  connection: ["connection", "file-connection"],
+  connection: ["connection"],
   database: ["database", "redis-db", "mq-tenant", "nacos-namespace", "mongo-db"],
   schema: ["schema"],
   table: ["table", "mongo-collection", "mongo-bucket", "vector-collection", "elasticsearch-index"],
@@ -489,7 +489,7 @@ watch(
 const flatTreeIndex = computed(() =>
   createFlatTreeIndex(flatNodes.value, {
     isSelectable: (node) => !isSidebarTableSearchControlNode(node),
-    isBoundary: (type) => type === "connection" || type === "file-connection" || type === "connection-group",
+    isBoundary: (type) => type === "connection" || type === "connection-group",
     isDatabaseContainer: (type) => DATABASE_LEVEL_TYPES.has(type),
     isSchemaContainer: (type) => SCHEMA_LEVEL_TYPES.has(type),
   }),

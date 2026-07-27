@@ -176,8 +176,8 @@ const driverStoreTabOpen = ref(false);
 const driverStoreActive = ref(false);
 const fileManagerTabOpen = ref(false);
 const fileManagerActive = ref(false);
-const fileManagerPageRef = ref<{ createConnection: (implementation?: FileConnectionImplementation) => void; openConnectionById: (connectionId: string) => Promise<void> } | null>(null);
-const pendingFileManagerAction = ref<{ type: "create"; implementation: FileConnectionImplementation } | { type: "open"; connectionId: string } | null>(null);
+const fileManagerPageRef = ref<{ openConnectionById: (connectionId: string) => Promise<void> } | null>(null);
+const pendingFileManagerConnectionId = ref<string | null>(null);
 const driverStoreActiveTab = ref<"agent" | "jdbc" | "storage" | "runtime">("agent");
 const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome");
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
@@ -414,30 +414,40 @@ function openFileManagerPage() {
 
 async function flushPendingFileManagerAction() {
   const page = fileManagerPageRef.value;
-  const action = pendingFileManagerAction.value;
-  if (!page || !action) return;
-  pendingFileManagerAction.value = null;
-  if (action.type === "create") {
-    page.createConnection(action.implementation);
-    return;
-  }
+  const connectionId = pendingFileManagerConnectionId.value;
+  if (!page || !connectionId) return;
+  pendingFileManagerConnectionId.value = null;
   try {
-    await page.openConnectionById(action.connectionId);
+    await page.openConnectionById(connectionId);
   } catch (error: any) {
     toast(translateBackendError(t, error?.message || String(error)), 5000);
   }
 }
 
 async function openNewFileConnection(implementation: FileConnectionImplementation) {
-  setConnectionDialogOpen(false);
-  pendingFileManagerAction.value = { type: "create", implementation };
-  openFileManagerPage();
-  await nextTick();
-  await flushPendingFileManagerAction();
+  const profile = {
+    ftp: { label: "FTP", port: 21, ssl: false },
+    sftp: { label: "SFTP", port: 22, ssl: false },
+    s3: { label: "S3", port: 443, ssl: true },
+    webdav: { label: "WebDAV", port: 80, ssl: false },
+    webhdfs: { label: "WebHDFS", port: 9870, ssl: false },
+    "hdfs-native": { label: "HDFS Native", port: 8020, ssl: false },
+  }[implementation];
+  connectionStore.stopEditing();
+  connectionStore.stopCreatingConnectionInGroup();
+  connectionDialogPrefill.value = {
+    dbType: "file",
+    driverProfile: implementation,
+    driverLabel: profile.label,
+    host: "127.0.0.1",
+    port: profile.port,
+    ssl: profile.ssl,
+  };
+  showConnectionDialog.value = true;
 }
 
 async function openFileConnection(connectionId: string) {
-  pendingFileManagerAction.value = { type: "open", connectionId };
+  pendingFileManagerConnectionId.value = connectionId;
   openFileManagerPage();
   await nextTick();
   await flushPendingFileManagerAction();
@@ -2272,7 +2282,7 @@ onUnmounted(() => {
                 @cancel-tab-close="cancelPendingAppClose"
               />
               <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
-              <FileManagerPage v-if="fileManagerTabOpen" ref="fileManagerPageRef" v-show="fileManagerActive" class="flex-1 min-h-0" />
+              <FileManagerPage v-if="fileManagerTabOpen" ref="fileManagerPageRef" v-show="fileManagerActive" class="flex-1 min-h-0" @create-connection="openNewFileConnection" />
               <EditorSettingsPage
                 v-if="settingsPageTabOpen"
                 v-show="settingsStore.settingsPageActive"
@@ -2492,7 +2502,6 @@ onUnmounted(() => {
             setConnectionDialogOpen(false);
             openSettings('tunnels');
           "
-          @create-file-connection="openNewFileConnection"
           @open-lineage-target="openLineageTarget"
           @open-database-search-target="openDatabaseSearchTarget"
           @open-diagram-target="openDiagramTarget"

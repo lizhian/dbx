@@ -1,28 +1,32 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { ArrowLeft, ChevronLeft, Copy, Download, FilePenLine, Folder, FolderOpen, Loader2, Pencil, Plus, RefreshCw, Trash2, Unplug, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { useFileConnectionStore } from "@/stores/fileConnectionStore";
+import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 import { formatError } from "@/lib/backend/errorUtils";
 import * as api from "@/lib/backend/api";
+import type { ConnectionConfig } from "@/types/database";
 import type { FileConnection, FileConnectionImplementation, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
-import FileConnectionDialog from "./FileConnectionDialog.vue";
 import { childFilePath, displayFilePath, formatFileSize, parentFilePath } from "./filePath";
 
+const emit = defineEmits<{
+  createConnection: [implementation: FileConnectionImplementation];
+}>();
 const { t } = useI18n();
 const { toast } = useToast();
-const store = useFileConnectionStore();
-const dialogOpen = ref(false);
-const initialImplementation = ref<FileConnectionImplementation>("ftp");
-const editing = ref<FileConnection>();
-const deleting = ref<FileConnection>();
+const connectionStore = useConnectionStore();
+const deleting = ref<ConnectionConfig>();
 const deleteActive = ref(false);
 const loadError = ref("");
+const runtimeConnections = ref(new Map<string, FileConnection>());
+const runtimeConnectionsLoading = ref(false);
+const fileConnections = computed(() => connectionStore.connections.filter((connection) => connection.db_type === "file"));
 const activeConnection = ref<FileConnection>();
 const currentPath = ref("");
 const entries = ref<FileEntry[]>([]);
@@ -47,34 +51,82 @@ const remoteDestinationPath = computed({
   },
 });
 
+function effectiveRuntimeConnection(config: ConnectionConfig): FileConnection | undefined {
+  const runtime = runtimeConnections.value.get(config.id);
+  if (!runtime) return undefined;
+  return {
+    ...runtime,
+    name: config.name,
+    capabilities: config.read_only
+      ? {
+          ...runtime.capabilities,
+          write: false,
+          delete: false,
+          copy: false,
+          rename: false,
+        }
+      : runtime.capabilities,
+  };
+}
+
+async function refreshRuntimeConnections() {
+  runtimeConnectionsLoading.value = true;
+  try {
+    const runtime = await api.listFileConnections();
+    runtimeConnections.value = new Map(runtime.map((connection) => [connection.id, connection]));
+    loadError.value = "";
+  } catch (error) {
+    loadError.value = formatError(error);
+  } finally {
+    runtimeConnectionsLoading.value = false;
+  }
+}
+
 onMounted(async () => {
   try {
-    await store.load();
+    await connectionStore.initFromDisk();
+    await refreshRuntimeConnections();
   } catch (error) {
     loadError.value = formatError(error);
   }
 });
 
+watch(
+  () => fileConnections.value.map((connection) => `${connection.id}:${connection.driver_profile}:${JSON.stringify(connection.external_config)}:${connection.read_only}`).join("|"),
+  () => {
+    void refreshRuntimeConnections();
+  },
+);
+
 function createConnection(implementation: FileConnectionImplementation = "ftp") {
-  editing.value = undefined;
-  initialImplementation.value = implementation;
-  dialogOpen.value = true;
+  emit("createConnection", implementation);
 }
 
-function editConnection(connection: FileConnection) {
-  editing.value = connection;
-  dialogOpen.value = true;
+function editConnection(connection: ConnectionConfig) {
+  connectionStore.startEditing(connection.id);
 }
 
-async function openConnection(connection: FileConnection) {
+function connectionEndpoint(connection: ConnectionConfig): string {
+  const config = connection.external_config as Record<string, unknown> | undefined;
+  const value = config?.endpoint ?? config?.nameNodeUri;
+  return typeof value === "string" ? value : connection.host;
+}
+
+async function openConnection(config: ConnectionConfig) {
+  let connection = effectiveRuntimeConnection(config);
+  if (!connection) {
+    await refreshRuntimeConnections();
+    connection = effectiveRuntimeConnection(config);
+  }
+  if (!connection) throw new Error(t("fileManager.connectionNotFound"));
   activeConnection.value = connection;
   currentPath.value = "";
   await refreshDirectory();
 }
 
 async function openConnectionById(connectionId: string) {
-  await store.load();
-  const connection = store.connections.find((candidate) => candidate.id === connectionId);
+  await connectionStore.initFromDisk();
+  const connection = fileConnections.value.find((candidate) => candidate.id === connectionId);
   if (!connection) throw new Error(t("fileManager.connectionNotFound"));
   await openConnection(connection);
 }
@@ -263,7 +315,10 @@ async function removeConnection() {
   if (!deleting.value) return;
   deleteActive.value = true;
   try {
-    await store.remove(deleting.value.id);
+    const id = deleting.value.id;
+    await connectionStore.removeConnection(id);
+    runtimeConnections.value.delete(id);
+    if (activeConnection.value?.id === id) closeBrowser();
     toast(t("fileManager.connectionDeleted"));
     deleting.value = undefined;
   } catch (error) {
@@ -362,11 +417,11 @@ defineExpose({ createConnection, openConnectionById });
       </template>
 
       <template v-else>
-        <div v-if="store.loading" class="flex flex-1 items-center justify-center text-muted-foreground">
+        <div v-if="runtimeConnectionsLoading && fileConnections.length === 0" class="flex flex-1 items-center justify-center text-muted-foreground">
           <Loader2 class="h-5 w-5 animate-spin" />
         </div>
         <div v-else-if="loadError" role="alert" class="p-4 text-sm text-destructive">{{ loadError }}</div>
-        <div v-else-if="store.connections.length === 0" class="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
+        <div v-else-if="fileConnections.length === 0" class="flex flex-1 flex-col items-center justify-center gap-3 text-muted-foreground">
           <Unplug class="h-8 w-8" />
           <p class="text-sm">{{ t("fileManager.noConnections") }}</p>
           <Button variant="outline" size="sm" @click="createConnection">{{ t("fileManager.newConnection") }}</Button>
@@ -382,12 +437,17 @@ defineExpose({ createConnection, openConnectionById });
               </tr>
             </thead>
             <tbody>
-              <tr v-for="connection in store.connections" :key="connection.id" class="border-b">
-                <td class="truncate px-3 py-2 font-medium">{{ connection.name }}</td>
-                <td class="px-3 py-2 uppercase">{{ connection.config.protocol }}</td>
-                <td class="truncate px-3 py-2 text-muted-foreground">{{ "endpoint" in connection.config ? connection.config.endpoint : connection.config.nameNodeUri }}</td>
+              <tr v-for="connection in fileConnections" :key="connection.id" class="border-b">
+                <td class="truncate px-3 py-2 font-medium">
+                  <span class="flex min-w-0 items-center gap-2">
+                    <DatabaseIcon :db-type="connection.driver_profile || 'file'" class="h-4 w-4 shrink-0" />
+                    <span class="truncate">{{ connection.name }}</span>
+                  </span>
+                </td>
+                <td class="px-3 py-2 uppercase">{{ connection.driver_profile }}</td>
+                <td class="truncate px-3 py-2 text-muted-foreground">{{ connectionEndpoint(connection) }}</td>
                 <td class="px-3 py-1 text-right">
-                  <Button v-if="connection.capabilities.list" variant="ghost" size="icon" class="h-7 w-7" :title="t('fileManager.open')" @click="openConnection(connection)">
+                  <Button v-if="effectiveRuntimeConnection(connection)?.capabilities.list" variant="ghost" size="icon" class="h-7 w-7" :title="t('fileManager.open')" @click="openConnection(connection)">
                     <FolderOpen class="h-4 w-4" />
                   </Button>
                   <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('common.edit')" @click="editConnection(connection)">
@@ -403,8 +463,6 @@ defineExpose({ createConnection, openConnectionById });
         </div>
       </template>
     </section>
-
-    <FileConnectionDialog v-model:open="dialogOpen" :connection="editing" :initial-implementation="initialImplementation" @saved="toast(t('fileManager.connectionSaved'))" />
 
     <Dialog v-model:open="uploadDialogOpen">
       <DialogContent class="sm:max-w-[480px]">

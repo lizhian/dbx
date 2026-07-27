@@ -165,7 +165,6 @@ const emit = defineEmits<{
   connectFailed: [message: string];
   openDriverStore: [focus?: DriverStoreFocus];
   openTunnelProfileSettings: [];
-  "create-file-connection": [implementation: FileConnectionImplementation];
 }>();
 
 const store = useConnectionStore();

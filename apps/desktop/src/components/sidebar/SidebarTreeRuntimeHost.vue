@@ -488,8 +488,18 @@ function isGroupLabel(node: TreeNode): boolean {
   return groupTypes.has(node.type);
 }
 
+function fileManagerConnectionId(node: TreeNode): string | undefined {
+  if (node.type !== "connection" || !node.connectionId) return undefined;
+  return connectionStore.getConfig(node.connectionId)?.db_type === "file" ? node.connectionId : undefined;
+}
+
 async function toggle() {
   const node = activeNode.value;
+  const fileConnectionId = fileManagerConnectionId(node);
+  if (fileConnectionId) {
+    emit("open-file-connection", fileConnectionId);
+    return;
+  }
   if (node.isLoading) {
     if (!node.isExpanded) {
       node.isExpanded = true;
@@ -677,8 +687,9 @@ async function toggle() {
 
 function runRowClickAction(clickDetail: number) {
   const node = activeNode.value;
-  if (node.type === "file-connection" && node.fileConnectionId) {
-    if (clickDetail <= 1) emit("open-file-connection", node.fileConnectionId);
+  const fileConnectionId = fileManagerConnectionId(node);
+  if (fileConnectionId) {
+    if (clickDetail <= 1) emit("open-file-connection", fileConnectionId);
     return;
   }
   if (node.type === "load-more") {
@@ -933,8 +944,9 @@ function requestDeleteSelectedNode(): boolean {
 
 function onDoubleClick(event: MouseEvent) {
   if (dataTabOpenModeFromTreeClick(activeNode.value.type, event, settingsStore.editorSettings.shortcuts.openDataInNewTab) === "new-tab") return;
-  if (activeNode.value.type === "file-connection" && activeNode.value.fileConnectionId) {
-    emit("open-file-connection", activeNode.value.fileConnectionId);
+  const fileConnectionId = fileManagerConnectionId(activeNode.value);
+  if (fileConnectionId) {
+    emit("open-file-connection", fileConnectionId);
     return;
   }
   const action = treeNodeRowDoubleClickAction(activeNode.value.type, canOpenObjectBrowser.value, settingsStore.editorSettings.sidebarActivation, canExpand.value);
@@ -3534,31 +3546,12 @@ type SidebarMenuFactory = (context: SidebarMenuFactoryContext) => boolean;
 
 function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   const { node, items } = context;
-  if (node.type === "file-connection" && node.fileConnectionId) {
-    const connectionId = node.fileConnectionId;
-    const currentFileGroupId = connectionStore.groupIdForFileConnection(connectionId);
-    items.push({ label: t("fileManager.open"), action: () => emit("open-file-connection", connectionId), icon: FolderOpen });
-    items.push({ label: "", separator: true });
-    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
-    if (availableGroups.value.length > 0 || currentFileGroupId) {
-      const groupChildren: ContextMenuItem[] = availableGroups.value.map((group: { id: string; name: string }) => ({
-        label: group.name,
-        action: () => connectionStore.moveFileConnectionToGroup(connectionId, group.id),
-        icon: FolderOpen,
-        disabled: group.id === currentFileGroupId,
-      }));
-      if (currentFileGroupId) {
-        groupChildren.push({ label: "", separator: true });
-        groupChildren.push({ label: t("connectionGroup.ungrouped"), action: () => connectionStore.moveFileConnectionToGroup(connectionId, null) });
-      }
-      items.push({ label: t("connectionGroup.moveToGroup"), icon: FolderInput, children: groupChildren });
-    }
-    return true;
-  }
-
   // 2. Connection
   if (node.type === "connection") {
-    if (isConnecting.value) {
+    const fileConnectionId = fileManagerConnectionId(node);
+    if (fileConnectionId) {
+      items.push({ label: t("fileManager.open"), action: () => emit("open-file-connection", fileConnectionId), icon: FolderOpen });
+    } else if (isConnecting.value) {
       items.push({ label: t("connection.cancelConnecting"), action: cancelConnectionAttempt, icon: X });
     } else if (!isConnected.value) {
       items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Plug });
@@ -3635,12 +3628,14 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
     } else {
       items.push({ label: t("connectionGroup.moveToNewGroup"), action: moveToNewGroup, icon: FolderPlus });
     }
-    items.push({
-      label: t("contextMenu.refreshChildren"),
-      action: refresh,
-      icon: RefreshCw,
-      shortcut: shortcutRefresh,
-    });
+    if (!fileConnectionId) {
+      items.push({
+        label: t("contextMenu.refreshChildren"),
+        action: refresh,
+        icon: RefreshCw,
+        shortcut: shortcutRefresh,
+      });
+    }
     if (canConfigureVisibleDatabases.value) {
       items.push({
         label: t("contextMenu.configureVisibleObjects"),

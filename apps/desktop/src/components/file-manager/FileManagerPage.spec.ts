@@ -25,6 +25,24 @@ const { copyFilePath, deleteFilePath, downloadFile, listFilePath, renameFilePath
 }));
 
 vi.mock("@/lib/backend/api", () => ({
+  loadConnections: vi.fn(async () => [
+    {
+      id: "ftp-local",
+      name: "Local FTP",
+      db_type: "file",
+      driver_profile: "ftp",
+      driver_label: "FTP",
+      host: "127.0.0.1",
+      port: 2121,
+      username: "dbx",
+      password: "",
+      ssl: false,
+      read_only: false,
+      external_config: { protocol: "ftp", endpoint: "127.0.0.1", port: 2121, root: "/ftp/dbx/", username: "dbx" },
+    },
+  ]),
+  loadSidebarLayout: vi.fn(async () => null),
+  loadTunnelProfiles: vi.fn(async () => []),
   listFileConnections: vi.fn(async () => [
     {
       id: "ftp-local",
@@ -56,9 +74,7 @@ vi.mock("@/lib/backend/api", () => ({
       },
     },
   ]),
-  saveFileConnection: vi.fn(),
-  deleteFileConnection: vi.fn(),
-  testFileConnection: vi.fn(),
+  saveConnections: vi.fn(),
   listFilePath,
   statFilePath: vi.fn(),
   uploadFile,

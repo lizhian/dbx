@@ -667,7 +667,6 @@ export interface SqlReferenceAnalysis {
 
 export type TreeNodeType =
   | "connection"
-  | "file-connection"
   | "connection-group"
   | "database"
   | "doris-catalog"
@@ -739,7 +738,7 @@ export interface ConnectionGroup {
   collapsed: boolean;
 }
 
-export type SidebarOrderEntry = { type: "group"; id: string; children?: SidebarOrderEntry[]; connectionIds?: string[] } | { type: "connection"; id: string } | { type: "file-connection"; id: string };
+export type SidebarOrderEntry = { type: "group"; id: string; children?: SidebarOrderEntry[]; connectionIds?: string[] } | { type: "connection"; id: string };
 
 export interface SidebarLayout {
   groups: ConnectionGroup[];
@@ -755,8 +754,6 @@ export interface TreeNode {
   isExpanded?: boolean;
   pinned?: boolean;
   connectionId?: string;
-  fileConnectionId?: string;
-  fileProtocol?: string;
   database?: string;
   catalog?: string;
   catalogType?: string;

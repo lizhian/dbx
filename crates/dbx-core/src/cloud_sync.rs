@@ -14,6 +14,7 @@ use crate::connection_secrets::{
     MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
     MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY, NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
 };
+use crate::file_connection_config::{FILE_SECRET_KEYS, FILE_SECRET_PREFIX};
 use crate::models::connection::{ConnectionConfig, DatabaseType, TransportLayerConfig};
 use crate::saved_sql::SavedSqlLibrary;
 use crate::storage::{DesktopSettings, Storage};
@@ -666,6 +667,14 @@ async fn build_sensitive_payload(
         }
         push_mq_external_config_secrets(&mut connection_secrets, config);
         push_nacos_external_config_secrets(&mut connection_secrets, config);
+        if config.db_type == DatabaseType::FileManager {
+            for key in FILE_SECRET_KEYS {
+                let namespaced_key = format!("{FILE_SECRET_PREFIX}{key}");
+                if let Some(secret) = storage.get_secret(&config.id, &namespaced_key).await? {
+                    push_secret(&mut connection_secrets, &config.id, &namespaced_key, &secret);
+                }
+            }
+        }
     }
 
     Ok(SensitiveSyncPayload {
@@ -803,6 +812,7 @@ async fn apply_sensitive_payload(storage: &Storage, payload: &SensitiveSyncPaylo
         if !SECRET_KEYS.contains(&secret.key.as_str())
             && !secret.key.starts_with(SSH_TUNNEL_SECRET_PREFIX)
             && !secret.key.starts_with(TRANSPORT_LAYER_SECRET_PREFIX)
+            && !secret.key.starts_with(FILE_SECRET_PREFIX)
         {
             continue;
         }
@@ -834,6 +844,9 @@ async fn clear_connection_secrets(storage: &Storage, connections: &[ConnectionCo
     for config in connections {
         for key in SECRET_KEYS {
             storage.delete_secret(&config.id, key).await?;
+        }
+        for key in FILE_SECRET_KEYS {
+            storage.delete_secret(&config.id, &format!("{FILE_SECRET_PREFIX}{key}")).await?;
         }
         for (index, layer) in config.transport_layers.iter().enumerate() {
             match layer {
@@ -1060,6 +1073,8 @@ fn parent_collection_paths(remote_path: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{
         apply_sensitive_payload, apply_sync_snapshot, build_sync_snapshot, build_sync_snapshot_with_saved_secrets,
         decrypt_sensitive_payload, encrypt_sensitive_payload, forget_webdav_sync_secrets_passphrase,
@@ -1069,6 +1084,7 @@ mod tests {
     };
     use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiConfigItem};
     use crate::connection_secrets::NACOS_AUTH_PASSWORD_KEY;
+    use crate::file_connection_config::{FileSecretUpdate, FileSecretUpdates};
     use crate::models::connection::{
         default_redis_key_separator, ConnectionConfig, DatabaseType, SshTunnelConfig, TransportLayerConfig,
     };
@@ -1227,6 +1243,29 @@ mod tests {
             production_databases: vec![],
             database_info: None,
         }
+    }
+
+    fn file_connection(id: &str) -> ConnectionConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": "Files",
+            "db_type": "file",
+            "driver_profile": "s3",
+            "driver_label": "S3",
+            "host": "127.0.0.1",
+            "port": 9000,
+            "username": "",
+            "password": "",
+            "external_config": {
+                "protocol": "s3",
+                "endpoint": "http://127.0.0.1:9000",
+                "region": "us-east-1",
+                "bucket": "dbx",
+                "root": "/",
+                "pathStyle": true
+            }
+        }))
+        .unwrap()
     }
 
     fn nacos_auth_password(config: &ConnectionConfig) -> Option<&str> {
@@ -1506,6 +1545,49 @@ mod tests {
         assert!(decrypted.connection_secrets.iter().any(|secret| {
             secret.connection_id == "nacos" && secret.key == NACOS_AUTH_PASSWORD_KEY && secret.secret == "nacos-secret"
         }));
+    }
+
+    #[tokio::test]
+    async fn saved_sync_passphrase_encrypts_file_secrets_without_exposing_them() {
+        let storage = Storage::open(&temp_db_path("saved-sync-file-snapshot")).await.unwrap();
+        let connection = file_connection("files");
+        storage
+            .save_connections_with_file_secret_updates(
+                std::slice::from_ref(&connection),
+                &HashMap::from([(
+                    "files".to_string(),
+                    FileSecretUpdates {
+                        access_key: FileSecretUpdate::Set("file-access-secret".to_string()),
+                        secret_key: FileSecretUpdate::Set("file-key-secret".to_string()),
+                        ..Default::default()
+                    },
+                )]),
+            )
+            .await
+            .unwrap();
+
+        save_webdav_sync_secrets_preference(&storage, true, Some("sync-pass")).await.unwrap();
+        let snapshot = build_sync_snapshot_with_saved_secrets(&storage, "test-version", None, None).await.unwrap();
+        let public_json = serde_json::to_string(&snapshot.connections).unwrap();
+        assert!(!public_json.contains("file-access-secret"));
+        assert!(!public_json.contains("file-key-secret"));
+
+        let encrypted = snapshot.encrypted_secrets.as_ref().expect("encrypted secrets");
+        let decrypted = decrypt_sensitive_payload(encrypted, "sync-pass").unwrap();
+        assert!(decrypted.connection_secrets.iter().any(|secret| {
+            secret.connection_id == "files" && secret.key == "file.access_key" && secret.secret == "file-access-secret"
+        }));
+        assert!(decrypted.connection_secrets.iter().any(|secret| {
+            secret.connection_id == "files" && secret.key == "file.secret_key" && secret.secret == "file-key-secret"
+        }));
+
+        let restored = Storage::open(&temp_db_path("saved-sync-file-restored")).await.unwrap();
+        restored.save_connections(std::slice::from_ref(&connection)).await.unwrap();
+        apply_sensitive_payload(&restored, &decrypted).await.unwrap();
+        assert_eq!(
+            restored.get_secret("files", "file.access_key").await.unwrap().as_deref(),
+            Some("file-access-secret")
+        );
     }
 
     #[tokio::test]

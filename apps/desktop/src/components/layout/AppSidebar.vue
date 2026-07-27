@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { Upload, Download, FolderPlus, RefreshCw, ChevronsLeft, ChevronsUp, Trash2, FolderInput, Check, Minus, Square, X } from "@lucide/vue";
@@ -10,7 +10,6 @@ import LightDropdown from "@/components/ui/LightDropdown.vue";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import ConnectionTree from "@/components/sidebar/ConnectionTree.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
-import { useFileConnectionStore } from "@/stores/fileConnectionStore";
 import { useToast } from "@/composables/useToast";
 
 defineProps<{
@@ -30,7 +29,6 @@ type ImportSource = "dbx" | "navicat" | "dbeaver" | "datagrip";
 
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
-const fileConnectionStore = useFileConnectionStore();
 const { toast } = useToast();
 const connectionTreeRef = ref<InstanceType<typeof ConnectionTree>>();
 const showDeleteSelectedConfirm = ref(false);
@@ -62,22 +60,6 @@ const moveGroupItems = computed(() => [
     separatorBefore: connectionStore.sidebarLayout.groups.length > 0,
   },
 ]);
-
-watch(
-  [() => fileConnectionStore.loaded, () => fileConnectionStore.connections],
-  ([loaded]) => {
-    if (loaded) connectionStore.syncFileConnections(fileConnectionStore.connections);
-  },
-  { deep: true, immediate: true },
-);
-
-onMounted(async () => {
-  try {
-    await fileConnectionStore.load();
-  } catch (error: any) {
-    toast(translateBackendError(t, error?.message || String(error)), 5000);
-  }
-});
 
 async function refreshTree() {
   try {
@@ -148,10 +130,6 @@ function moveSelectedConnectionsToGroup(value: string) {
   }
 }
 
-function moveFileConnectionToGroup(connectionId: string, groupId: string | null) {
-  connectionStore.moveFileConnectionToGroup(connectionId, groupId);
-}
-
 function openCreateSelectedGroupDialog() {
   selectedGroupName.value = "";
   showCreateSelectedGroupDialog.value = true;
@@ -167,7 +145,7 @@ function confirmCreateSelectedGroup() {
   showCreateSelectedGroupDialog.value = false;
 }
 
-defineExpose({ focusSearch, moveFileConnectionToGroup });
+defineExpose({ focusSearch });
 </script>
 
 <template>
