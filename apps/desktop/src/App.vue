@@ -52,7 +52,6 @@ import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { openQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
 import type { ConnectionConfig, ObjectSourceKind, QueryTab } from "@/types/database";
-import type { FileConnectionImplementation } from "@/types/fileManager";
 import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import {
   isBrowserReloadShortcut,
@@ -181,7 +180,6 @@ const pendingFileManagerConnectionId = ref<string | null>(null);
 const driverStoreActiveTab = ref<"agent" | "jdbc" | "storage" | "runtime">("agent");
 const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome");
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
-const showFileManager = computed(() => fileManagerTabOpen.value && fileManagerActive.value);
 const showSettingsPage = computed(() => settingsPageTabOpen.value && settingsStore.settingsPageActive);
 const showQuickOpen = ref(false);
 const agentDriverUpdateCount = ref(0);
@@ -405,8 +403,8 @@ function openDriverStorePage(target?: "agent" | "jdbc" | "storage" | "runtime" |
   fileManagerActive.value = false;
 }
 
-function openFileManagerPage() {
-  fileManagerTabOpen.value = true;
+function activateFileManagerPage() {
+  if (!fileManagerTabOpen.value) return;
   fileManagerActive.value = true;
   driverStoreActive.value = false;
   settingsStore.settingsPageActive = false;
@@ -421,34 +419,14 @@ async function flushPendingFileManagerAction() {
     await page.openConnectionById(connectionId);
   } catch (error: any) {
     toast(translateBackendError(t, error?.message || String(error)), 5000);
+    closeFileManagerPage();
   }
-}
-
-async function openNewFileConnection(implementation: FileConnectionImplementation) {
-  const profile = {
-    ftp: { label: "FTP", port: 21, ssl: false },
-    sftp: { label: "SFTP", port: 22, ssl: false },
-    s3: { label: "S3", port: 443, ssl: true },
-    webdav: { label: "WebDAV", port: 80, ssl: false },
-    webhdfs: { label: "WebHDFS", port: 9870, ssl: false },
-    "hdfs-native": { label: "HDFS Native", port: 8020, ssl: false },
-  }[implementation];
-  connectionStore.stopEditing();
-  connectionStore.stopCreatingConnectionInGroup();
-  connectionDialogPrefill.value = {
-    dbType: "file",
-    driverProfile: implementation,
-    driverLabel: profile.label,
-    host: "127.0.0.1",
-    port: profile.port,
-    ssl: profile.ssl,
-  };
-  showConnectionDialog.value = true;
 }
 
 async function openFileConnection(connectionId: string) {
   pendingFileManagerConnectionId.value = connectionId;
-  openFileManagerPage();
+  fileManagerTabOpen.value = true;
+  activateFileManagerPage();
   await nextTick();
   await flushPendingFileManagerAction();
 }
@@ -458,6 +436,7 @@ watch(fileManagerPageRef, () => {
 });
 
 function closeFileManagerPage() {
+  pendingFileManagerConnectionId.value = null;
   fileManagerTabOpen.value = false;
   fileManagerActive.value = false;
 }
@@ -2218,7 +2197,6 @@ onUnmounted(() => {
           :show-sql-library="showSqlLibraryPanel"
           :show-sql-file-panel="showSqlFilePanel"
           :show-driver-store="showDriverStore"
-          :show-file-manager="showFileManager"
           :show-settings-page="showSettingsPage"
           :checking-updates="checkingUpdates"
           :has-update-available="toolbarHasUpdateAvailable"
@@ -2235,7 +2213,6 @@ onUnmounted(() => {
           @open-github="openGitHub"
           @open-settings="openSettings()"
           @open-driver-store="openDriverStorePage"
-          @open-file-manager="openFileManagerPage"
           @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
           @open-sql-file="dialogs.showSqlFileDialog.value = true"
@@ -2274,7 +2251,7 @@ onUnmounted(() => {
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
                 @activate-driver-store="openDriverStorePage"
                 @activate-settings-page="activateSettingsPage"
-                @activate-file-manager="openFileManagerPage"
+                @activate-file-manager="activateFileManagerPage"
                 @close-file-manager="closeFileManagerPage"
                 @activate-tab="
                   driverStoreActive = false;
@@ -2290,7 +2267,7 @@ onUnmounted(() => {
                 @cancel-tab-close="cancelPendingAppClose"
               />
               <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
-              <FileManagerPage v-if="fileManagerTabOpen" ref="fileManagerPageRef" v-show="fileManagerActive" class="flex-1 min-h-0" @create-connection="openNewFileConnection" />
+              <FileManagerPage v-if="fileManagerTabOpen" ref="fileManagerPageRef" v-show="fileManagerActive" class="flex-1 min-h-0" @close="closeFileManagerPage" />
               <EditorSettingsPage
                 v-if="settingsPageTabOpen"
                 v-show="settingsStore.settingsPageActive"

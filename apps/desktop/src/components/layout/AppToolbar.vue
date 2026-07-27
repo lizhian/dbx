@@ -2,7 +2,7 @@
 import { computed, ref, onMounted, onBeforeUnmount, h, nextTick, watch } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import { DatabaseZap, FilePlus2, Loader2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown, FolderTree, FolderOpen } from "@lucide/vue";
+import { DatabaseZap, FilePlus2, Loader2, Moon, Sun, SunMoon, History, Bot, ArrowLeftRight, FileCode, BookMarked, GitCompareArrows, TableProperties, Settings, CloudDownload, Package, FileDown, FolderTree } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import LightDropdown from "@/components/ui/LightDropdown.vue";
@@ -31,7 +31,6 @@ const props = defineProps<{
   showSqlLibrary: boolean;
   showSqlFilePanel: boolean;
   showDriverStore: boolean;
-  showFileManager: boolean;
   showSettingsPage: boolean;
   checkingUpdates: boolean;
   hasUpdateAvailable: boolean;
@@ -51,7 +50,6 @@ const emit = defineEmits<{
   "open-github": [];
   "open-settings": [];
   "open-driver-store": [];
-  "open-file-manager": [];
   "check-updates": [];
   "open-transfer": [];
   "open-sql-file": [];
@@ -617,15 +615,6 @@ const toolbarStyle = computed(() => {
       </Tooltip>
     </div>
     <!-- /rightWrapper -->
-
-    <Tooltip>
-      <TooltipTrigger as-child>
-        <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0" :class="{ 'bg-accent': showFileManager }" @click="emit('open-file-manager')">
-          <FolderOpen class="h-4 w-4" />
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{{ t("fileManager.title") }}</TooltipContent>
-    </Tooltip>
 
     <Tooltip>
       <TooltipTrigger as-child>

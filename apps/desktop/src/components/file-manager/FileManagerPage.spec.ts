@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { createApp, defineComponent, h, nextTick, type App } from "vue";
+import { createApp, nextTick, type App } from "vue";
 import { createPinia } from "pinia";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useToast } from "@/composables/useToast";
@@ -9,10 +9,9 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import FileManagerPage from "./FileManagerPage.vue";
 import { displayFilePath, parentFilePath } from "./filePath";
 
-const { copyFilePath, deleteFilePath, disconnectDb, downloadFile, executeWithProductionContextGuard, listFilePath, renameFilePath, uploadFile } = vi.hoisted(() => ({
+const { copyFilePath, deleteFilePath, downloadFile, executeWithProductionContextGuard, listFilePath, renameFilePath, uploadFile } = vi.hoisted(() => ({
   copyFilePath: vi.fn(async (_request: unknown) => undefined),
   deleteFilePath: vi.fn(async (_connectionId: string, _path: string) => undefined),
-  disconnectDb: vi.fn(async (_connectionId: string) => undefined),
   downloadFile: vi.fn(async (_request: unknown) => 11),
   executeWithProductionContextGuard: vi.fn(async (options: { execute: () => Promise<unknown> }) => options.execute()),
   listFilePath: vi.fn(async (_connectionId: string, path: string) =>
@@ -59,7 +58,6 @@ vi.mock("@/lib/backend/api", () => ({
   loadTunnelProfiles: vi.fn(async () => []),
   deleteSchemaCache: vi.fn(async () => undefined),
   deleteSchemaCachePrefix: vi.fn(async () => undefined),
-  disconnectDb,
   listFileConnections: vi.fn(async () => [
     {
       id: "ftp-local",
@@ -117,18 +115,6 @@ async function flushPage() {
 async function mountPage() {
   const container = document.createElement("div");
   document.body.append(container);
-  const app = createApp(defineComponent({ setup: () => () => h(FileManagerPage) }));
-  mountedApps.push(app);
-  app.use(createPinia());
-  app.use(i18n);
-  app.mount(container);
-  await flushPage();
-  return container;
-}
-
-async function mountPageHandle() {
-  const container = document.createElement("div");
-  document.body.append(container);
   const app = createApp(FileManagerPage);
   mountedApps.push(app);
   app.use(createPinia());
@@ -137,7 +123,14 @@ async function mountPageHandle() {
     openConnectionById: (connectionId: string) => Promise<void>;
   };
   await flushPage();
-  return page;
+  return { container, page };
+}
+
+async function mountOpenPage() {
+  const mounted = await mountPage();
+  await mounted.page.openConnectionById("ftp-local");
+  await flushPage();
+  return mounted;
 }
 
 async function mountPageWithStore() {
@@ -170,7 +163,6 @@ afterEach(() => {
   uploadFile.mockClear();
   downloadFile.mockClear();
   deleteFilePath.mockClear();
-  disconnectDb.mockClear();
   executeWithProductionContextGuard.mockClear();
   copyFilePath.mockClear();
   renameFilePath.mockClear();
@@ -178,7 +170,7 @@ afterEach(() => {
 
 describe("FileManagerPage browsing", () => {
   it("exposes one layout root so parent visibility directives apply", async () => {
-    const container = await mountPage();
+    const { container } = await mountPage();
 
     expect(container.childElementCount).toBe(1);
     expect(container.firstElementChild?.classList.contains("flex")).toBe(true);
@@ -186,10 +178,16 @@ describe("FileManagerPage browsing", () => {
     expect(container.firstElementChild?.classList.contains("flex-1")).toBe(true);
   });
 
-  it("opens the connection root, displays metadata, navigates into a directory, and returns to root", async () => {
+  it("does not render a file connection index or creation control", async () => {
     await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+
+    expect(document.querySelector("[data-file-manager-loading]")).not.toBeNull();
+    expect(document.body.textContent).not.toContain("Local FTP");
+    expect(document.body.textContent).not.toContain("New file connection");
+  });
+
+  it("opens the connection root, displays metadata, navigates into a directory, and returns to root", async () => {
+    await mountOpenPage();
 
     expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "");
     expect(document.body.textContent).toContain("fixture.txt");
@@ -212,9 +210,7 @@ describe("FileManagerPage browsing", () => {
   });
 
   it("expands folders inline without changing the current directory", async () => {
-    await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+    await mountOpenPage();
 
     entryRow("folder")?.querySelector<HTMLButtonElement>('button[title="Expand folder"]')?.click();
     await flushPage();
@@ -227,9 +223,7 @@ describe("FileManagerPage browsing", () => {
   });
 
   it("opens shared right-click actions for files and folders", async () => {
-    await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+    await mountOpenPage();
 
     entryRow("folder")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 20, clientY: 20 }));
     await flushPage();
@@ -252,9 +246,19 @@ describe("FileManagerPage browsing", () => {
   });
 
   it("reports a stale sidebar connection instead of silently ignoring it", async () => {
-    const page = await mountPageHandle();
+    const { page } = await mountPage();
 
     await expect(page.openConnectionById("missing")).rejects.toThrow("File connection no longer exists");
+  });
+
+  it("closes the connection detail instead of returning to a connection index", async () => {
+    await mountOpenPage();
+
+    buttonWithTitle("Close")?.click();
+    await flushPage();
+
+    expect(document.querySelector("[data-file-manager-loading]")).not.toBeNull();
+    expect(document.body.textContent).not.toContain("Local FTP");
   });
 
   it("refreshes the active connection snapshot after a generic connection edit", async () => {
@@ -276,9 +280,7 @@ describe("FileManagerPage browsing", () => {
 
   it("requires explicit Replace before retrying an existing upload", async () => {
     uploadFile.mockRejectedValueOnce({ code: "already_exists", message: "redacted" }).mockResolvedValueOnce(11);
-    await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+    await mountOpenPage();
 
     const uploadButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Upload"));
     uploadButton?.click();
@@ -304,9 +306,7 @@ describe("FileManagerPage browsing", () => {
   });
 
   it("requires confirmation before deleting an entry", async () => {
-    await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+    await mountOpenPage();
 
     buttonWithTitle("Delete")?.click();
     await flushPage();
@@ -319,9 +319,7 @@ describe("FileManagerPage browsing", () => {
   });
 
   it("does not execute file mutations when production confirmation is cancelled", async () => {
-    await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+    await mountOpenPage();
 
     executeWithProductionContextGuard.mockResolvedValueOnce(undefined);
     const uploadButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Upload"));
@@ -363,23 +361,9 @@ describe("FileManagerPage browsing", () => {
     expect(renameFilePath).not.toHaveBeenCalled();
   });
 
-  it("disconnects the desktop runtime after deleting a file connection", async () => {
-    await mountPage();
-
-    buttonWithTitle("Delete")?.click();
-    await flushPage();
-    const deleteButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Delete");
-    deleteButton?.click();
-    await flushPage();
-
-    expect(disconnectDb).toHaveBeenCalledWith("ftp-local", undefined);
-  });
-
   it("shows capability-driven Copy only for files and sends one connection ID", async () => {
     copyFilePath.mockRejectedValueOnce({ code: "already_exists", message: "redacted" }).mockResolvedValueOnce(undefined);
-    await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+    await mountOpenPage();
 
     expect(document.querySelectorAll('button[title="Copy"]')).toHaveLength(1);
     buttonWithTitle("Copy")?.click();
@@ -415,9 +399,7 @@ describe("FileManagerPage browsing", () => {
       message: "The destination was created, but the source file could not be deleted",
       recovery: "Delete the source manually.",
     });
-    await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+    await mountOpenPage();
 
     entryRow("fixture.txt")?.querySelector<HTMLButtonElement>('button[title="Rename or move"]')?.click();
     await flushPage();
@@ -442,9 +424,7 @@ describe("FileManagerPage browsing", () => {
   });
 
   it("renames or moves folders through the same operation flow", async () => {
-    await mountPage();
-    buttonWithTitle("Open")?.click();
-    await flushPage();
+    await mountOpenPage();
 
     entryRow("folder")?.querySelector<HTMLButtonElement>('button[title="Rename or move"]')?.click();
     await flushPage();
