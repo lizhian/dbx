@@ -385,10 +385,10 @@ describe("FileManagerPage browsing", () => {
 
     const task = document.querySelector<HTMLElement>('[data-file-download-task="fixture.txt"]');
     expect(task?.textContent).toContain("fixture.txt");
-    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("Status");
-    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("Size");
-    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("Open file");
-    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("Open folder");
+    expect(task?.textContent).not.toContain("Open file");
+    expect(task?.textContent).not.toContain("Open folder");
+    expect(task?.querySelector('button[aria-label="Open file"] svg')).not.toBeNull();
+    expect(task?.querySelector('button[aria-label="Open folder"] svg')).not.toBeNull();
     expect(task?.textContent).toContain("512 B / 1.5 KiB");
     expect(task?.textContent).toContain("33%");
 
