@@ -130,6 +130,7 @@ export const savedSqlStorageDir = forward("savedSqlStorageDir");
 export const openSavedSqlStorageDir = forward("openSavedSqlStorageDir");
 export const revealPathInFileManager = forward("revealPathInFileManager");
 export const listFileConnections = forward("listFileConnections");
+export const fileConnectionSecretStatus = forward("fileConnectionSecretStatus");
 export const saveFileConnection = forward("saveFileConnection");
 export const deleteFileConnection = forward("deleteFileConnection");
 export const testFileConnection = forward("testFileConnection");

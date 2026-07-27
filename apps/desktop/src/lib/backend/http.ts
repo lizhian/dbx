@@ -293,7 +293,10 @@ export async function closeDatabaseConnection(connectionId: string, database: st
   return post("/api/connection/close-database", { connectionId, database });
 }
 
-export async function saveConnections(configs: ConnectionConfig[]): Promise<void> {
+export async function saveConnections(configs: ConnectionConfig[], fileSecretUpdates?: Record<string, import("@/types/fileManager").FileSecretUpdates>): Promise<void> {
+  if (fileSecretUpdates && Object.keys(fileSecretUpdates).length > 0) {
+    throw new Error("File Manager connections are available only in the desktop app.");
+  }
   return post("/api/connection/save", { configs });
 }
 
@@ -565,6 +568,10 @@ export async function revealPathInFileManager(_path: string): Promise<void> {
 
 export async function listFileConnections(): Promise<import("@/types/fileManager").FileConnection[]> {
   return [];
+}
+
+export async function fileConnectionSecretStatus(_id: string): Promise<import("@/types/fileManager").FileSecretStatus> {
+  throw new Error("Remote file connections are only available in the desktop app.");
 }
 
 export async function saveFileConnection(_request: import("@/types/fileManager").SaveFileConnectionRequest): Promise<import("@/types/fileManager").FileConnection> {

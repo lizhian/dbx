@@ -1378,6 +1378,7 @@ pub fn run() {
             commands::connection::save_sidebar_layout,
             commands::connection::load_sidebar_layout,
             commands::file_manager::list_file_connections,
+            commands::file_manager::file_connection_secret_status,
             commands::file_manager::save_file_connection,
             commands::file_manager::delete_file_connection,
             commands::file_manager::test_file_connection,

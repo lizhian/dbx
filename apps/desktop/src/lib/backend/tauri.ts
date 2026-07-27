@@ -1238,8 +1238,8 @@ export async function listAvailableExtensions(connectionId: string, database: st
   return invoke("list_available_extensions", { connectionId, database });
 }
 
-export async function saveConnections(configs: ConnectionConfig[]): Promise<void> {
-  return invoke("save_connections", { configs });
+export async function saveConnections(configs: ConnectionConfig[], fileSecretUpdates?: Record<string, import("@/types/fileManager").FileSecretUpdates>): Promise<void> {
+  return invoke("save_connections", { configs, fileSecretUpdates });
 }
 
 export async function loadConnections(): Promise<ConnectionConfig[]> {
@@ -1459,6 +1459,10 @@ export async function revealPathInFileManager(path: string): Promise<void> {
 
 export async function listFileConnections(): Promise<import("@/types/fileManager").FileConnection[]> {
   return invoke("list_file_connections");
+}
+
+export async function fileConnectionSecretStatus(id: string): Promise<import("@/types/fileManager").FileSecretStatus> {
+  return invoke("file_connection_secret_status", { id });
 }
 
 export async function saveFileConnection(request: import("@/types/fileManager").SaveFileConnectionRequest): Promise<import("@/types/fileManager").FileConnection> {

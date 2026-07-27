@@ -14,7 +14,9 @@ use crate::connection_secrets::{
     NACOS_AUTH_SECRET_PREFIX, NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
 };
 use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
-use crate::file_connection_config::{FileConnectionConfig, FILE_SECRET_PREFIX};
+use crate::file_connection_config::{
+    FileConnectionConfig, FileSecretStatus, FileSecretUpdate, FileSecretUpdates, FILE_SECRET_PREFIX,
+};
 use crate::history::{
     HistoryConnectionFilter, HistoryConnectionOption, HistoryCursor, HistoryDatabaseFilter, HistoryEntry,
     HistorySearchRequest, HistorySearchResult, MAX_HISTORY,
@@ -2252,7 +2254,11 @@ fn persist_connection_in_tx(tx: &rusqlite::Transaction<'_>, config: &ConnectionC
     }
     persist_mq_auth_secrets_in_tx(tx, &config)?;
     persist_mq_token_signing_secret_in_tx(tx, &config)?;
-    persist_nacos_auth_secrets_in_tx(tx, &config)
+    persist_nacos_auth_secrets_in_tx(tx, &config)?;
+    if config.db_type != DatabaseType::FileManager {
+        delete_secret_prefix_in_tx(tx, &config.id, FILE_SECRET_PREFIX)?;
+    }
+    Ok(())
 }
 
 impl Storage {
@@ -2298,13 +2304,50 @@ impl Storage {
     }
 
     pub async fn save_connections(&self, configs: &[ConnectionConfig]) -> Result<(), String> {
+        self.save_connections_with_file_secret_updates(configs, &HashMap::new()).await
+    }
+
+    pub async fn save_connections_with_file_secret_updates(
+        &self,
+        configs: &[ConnectionConfig],
+        file_secret_updates: &HashMap<String, FileSecretUpdates>,
+    ) -> Result<(), String> {
         let configs = configs.to_vec();
+        let file_secret_updates = file_secret_updates.clone();
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM connections", []).map_err(|e| e.to_string())?;
 
             for config in &configs {
                 persist_connection_in_tx(&tx, config)?;
+            }
+            for (connection_id, updates) in &file_secret_updates {
+                let config = configs
+                    .iter()
+                    .find(|config| config.id == *connection_id)
+                    .ok_or_else(|| format!("File secret updates reference unknown connection '{connection_id}'"))?;
+                if config.db_type != DatabaseType::FileManager {
+                    return Err(format!("File secret updates require a File Manager connection: '{connection_id}'"));
+                }
+                for (key, update) in updates.entries() {
+                    let namespaced_key = format!("{FILE_SECRET_PREFIX}{key}");
+                    match update {
+                        FileSecretUpdate::Keep => {}
+                        FileSecretUpdate::Set(secret) if secret.is_empty() => {
+                            return Err("A file secret value cannot be empty; use clear explicitly".to_string());
+                        }
+                        FileSecretUpdate::Set(secret) => {
+                            persist_secret_in_tx(&tx, connection_id, &namespaced_key, secret)?;
+                        }
+                        FileSecretUpdate::Clear => {
+                            tx.execute(
+                                "DELETE FROM connection_secrets WHERE connection_id = ?1 AND key = ?2",
+                                params![connection_id, namespaced_key],
+                            )
+                            .map_err(|error| error.to_string())?;
+                        }
+                    }
+                }
             }
 
             if configs.is_empty() {
@@ -2468,6 +2511,25 @@ impl Storage {
             configs.push(config.canonicalized());
         }
         Ok(configs)
+    }
+
+    pub async fn file_connection_secret_status(&self, connection_id: &str) -> Result<FileSecretStatus, String> {
+        let connection_id = connection_id.to_string();
+        let keys = self
+            .with_conn(move |conn| {
+                let mut statement = conn
+                    .prepare(
+                        "SELECT key FROM connection_secrets
+                         WHERE connection_id = ?1 AND key LIKE 'file.%' ORDER BY key",
+                    )
+                    .map_err(|error| error.to_string())?;
+                let rows = statement
+                    .query_map([connection_id], |row| row.get::<_, String>(0))
+                    .map_err(|error| error.to_string())?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
+            })
+            .await?;
+        Ok(FileSecretStatus::from_keys(&keys))
     }
 
     async fn hydrate_mq_auth_secrets(
@@ -3774,12 +3836,14 @@ mod tests {
     use crate::connection_secrets::{
         MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
     };
+    use crate::file_connection_config::{FileSecretUpdate, FileSecretUpdates};
     use crate::history::{HistoryConnectionFilter, HistoryDatabaseFilter, HistoryEntry, HistorySearchRequest};
     use crate::models::connection::{
         ConnectionConfig, DatabaseConnectionInfo, DatabaseType, SshTunnelConfig, TransportLayerConfig,
     };
     use crate::saved_sql::SavedSqlFile;
     use rusqlite::Connection;
+    use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
@@ -3968,6 +4032,82 @@ mod tests {
             })
             .unwrap();
         assert_eq!((legacy_count, migrated_count, marker_count), (1, 0, 0));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn generic_file_connection_secrets_use_explicit_keep_set_clear_without_plaintext_config() {
+        let path = temp_db_path("generic-file-secrets");
+        let storage = Storage::open(&path).await.unwrap();
+        let file_config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": "files",
+            "name": "S3",
+            "db_type": "file",
+            "driver_profile": "s3",
+            "driver_label": "S3",
+            "host": "127.0.0.1",
+            "port": 9000,
+            "username": "",
+            "password": "",
+            "database": null,
+            "external_config": {
+                "protocol": "s3",
+                "endpoint": "http://127.0.0.1:9000",
+                "region": "us-east-1",
+                "bucket": "dbx",
+                "root": "/",
+                "pathStyle": true
+            }
+        }))
+        .unwrap();
+        let updates = FileSecretUpdates {
+            access_key: FileSecretUpdate::Set("access-secret".to_string()),
+            secret_key: FileSecretUpdate::Set("key-secret".to_string()),
+            ..Default::default()
+        };
+        storage
+            .save_connections_with_file_secret_updates(
+                std::slice::from_ref(&file_config),
+                &HashMap::from([("files".to_string(), updates)]),
+            )
+            .await
+            .unwrap();
+
+        let raw_json: String = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT config_json FROM connections WHERE id = 'files'", [], |row| row.get(0))
+            .unwrap();
+        assert!(!raw_json.contains("access-secret"));
+        assert!(!raw_json.contains("key-secret"));
+        assert!(storage.file_connection_secret_status("files").await.unwrap().access_key);
+
+        storage
+            .save_connections_with_file_secret_updates(
+                std::slice::from_ref(&file_config),
+                &HashMap::from([("files".to_string(), FileSecretUpdates::default())]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.get_secret("files", "file.access_key").await.unwrap().as_deref(), Some("access-secret"));
+
+        storage
+            .save_connections_with_file_secret_updates(
+                std::slice::from_ref(&file_config),
+                &HashMap::from([(
+                    "files".to_string(),
+                    FileSecretUpdates { access_key: FileSecretUpdate::Clear, ..Default::default() },
+                )]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.get_secret("files", "file.access_key").await.unwrap(), None);
+        assert_eq!(storage.get_secret("files", "file.secret_key").await.unwrap().as_deref(), Some("key-secret"));
+
+        let mut database_config = file_config;
+        database_config.db_type = DatabaseType::Postgres;
+        database_config.external_config = None;
+        storage.save_connections(&[database_config]).await.unwrap();
+        assert_eq!(storage.get_secret("files", "file.secret_key").await.unwrap(), None);
         let _ = std::fs::remove_file(path);
     }
 

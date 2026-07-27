@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { Database } from "@lucide/vue";
+import { Cloud, Database, Globe2, KeyRound, Network, Server, Workflow } from "@lucide/vue";
 import { useTheme } from "@/composables/useTheme";
 import { webPath } from "@/lib/common/webPath";
 
@@ -106,6 +106,15 @@ const letterIcons: Record<string, { letter: string; color: string }> = {
 };
 
 const normalizedType = computed(() => props.dbType.toLowerCase().replace(/[\s-]+/g, "_"));
+const protocolIcons: Record<string, typeof Database> = {
+  ftp: Network,
+  sftp: KeyRound,
+  s3: Cloud,
+  webdav: Globe2,
+  webhdfs: Workflow,
+  hdfs_native: Server,
+};
+const protocolIcon = computed(() => protocolIcons[normalizedType.value]);
 const assetName = computed(() => assetIcons[normalizedType.value]);
 const assetSrc = computed(() => {
   if (!assetName.value) return "";
@@ -116,7 +125,8 @@ const letter = computed(() => letterIcons[normalizedType.value]);
 </script>
 
 <template>
-  <img v-if="assetName" :src="assetSrc" alt="" class="database-logo object-contain" aria-hidden="true" />
+  <component :is="protocolIcon" v-if="protocolIcon" class="text-cyan-500" aria-hidden="true" />
+  <img v-else-if="assetName" :src="assetSrc" alt="" class="database-logo object-contain" aria-hidden="true" />
   <svg v-else-if="letter" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
     <circle cx="12" cy="12" r="12" :fill="letter.color" />
     <text x="12" y="16.5" text-anchor="middle" fill="white" font-size="14" font-weight="bold" font-family="system-ui, sans-serif">

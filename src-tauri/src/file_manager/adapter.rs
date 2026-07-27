@@ -46,9 +46,13 @@ pub async fn resolve_secrets(
             SecretUpdate::Clear => None,
             SecretUpdate::Keep => match request.id.as_deref() {
                 Some(id) => storage
-                    .get_file_connection_secret(id, key)
+                    .get_secret(id, &format!("file.{key}"))
                     .await
-                    .map_err(|_| FileManagerError::new("storage", "Failed to read saved credentials"))?,
+                    .map_err(|_| FileManagerError::new("storage", "Failed to read saved credentials"))?
+                    .or(storage
+                        .get_file_connection_secret(id, key)
+                        .await
+                        .map_err(|_| FileManagerError::new("storage", "Failed to read saved credentials"))?),
                 None => None,
             },
         };

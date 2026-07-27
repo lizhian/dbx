@@ -81,6 +81,7 @@ export const DATABASE_PROPERTY_EDITING_MATRIX = {
   influxdb: { deferred: "database retention policies need a dedicated workflow" },
   jdbc: { deferred: "generic JDBC does not expose reliable dialect-specific properties" },
   mq: { deferred: "message queue namespaces are handled by MQ admin panels" },
+  file: { deferred: "File Manager paths do not expose database properties" },
   nacos: { deferred: "Nacos namespace editing already uses the Nacos admin flow" },
 } satisfies Record<DatabaseType, DatabasePropertyEditingEntry>;
 

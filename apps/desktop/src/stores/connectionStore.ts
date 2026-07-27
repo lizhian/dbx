@@ -22,7 +22,7 @@ import type {
   TunnelProfile,
   VectorCollectionMeta,
 } from "@/types/database";
-import type { FileConnection } from "@/types/fileManager";
+import type { FileConnection, FileSecretUpdates } from "@/types/fileManager";
 import {
   inheritNaturalTreeNodeOrder,
   migrateLegacyPinnedTreeNodeOrder,
@@ -1947,7 +1947,7 @@ export const useConnectionStore = defineStore("connection", () => {
     return true;
   }
 
-  async function addConnection(config: ConnectionConfig, targetGroupId?: string | null) {
+  async function addConnection(config: ConnectionConfig, targetGroupId?: string | null, fileSecretUpdates?: FileSecretUpdates) {
     const normalized = normalizeConnection(config);
     const existing = connections.value.findIndex((c) => c.id === normalized.id);
     const nextConnections = [...connections.value];
@@ -1958,7 +1958,7 @@ export const useConnectionStore = defineStore("connection", () => {
       const groupId = targetGroupId !== undefined ? targetGroupId : newConnectionGroupId.value;
       sidebarLayout.value = appendConnectionToLayout(sidebarLayout.value, normalized.id, groupId);
     }
-    await persistConnections(nextConnections);
+    await persistConnections(nextConnections, fileSecretUpdates ? { [normalized.id]: fileSecretUpdates } : undefined);
     connections.value = nextConnections;
     rebuildTreeNodes();
     persistSidebarLayoutDebounced();
@@ -2093,13 +2093,13 @@ export const useConnectionStore = defineStore("connection", () => {
     await removeConnections([id]);
   }
 
-  async function updateConnection(config: ConnectionConfig) {
+  async function updateConnection(config: ConnectionConfig, fileSecretUpdates?: FileSecretUpdates) {
     config = normalizeConnection(config);
     const idx = connections.value.findIndex((c) => c.id === config.id);
     if (idx < 0) return;
     const nextConnections = [...connections.value];
     nextConnections[idx] = config;
-    await persistConnections(nextConnections);
+    await persistConnections(nextConnections, fileSecretUpdates ? { [config.id]: fileSecretUpdates } : undefined);
     connections.value = nextConnections;
     rebuildTreeNodes();
     connectedIds.value.delete(config.id);
@@ -5527,8 +5527,8 @@ export const useConnectionStore = defineStore("connection", () => {
     return null;
   }
 
-  async function persistConnections(nextConnections: ConnectionConfig[] = connections.value) {
-    await api.saveConnections(nextConnections);
+  async function persistConnections(nextConnections: ConnectionConfig[] = connections.value, fileSecretUpdates?: Record<string, FileSecretUpdates>) {
+    await api.saveConnections(nextConnections, fileSecretUpdates);
   }
 
   function persistSidebarLayoutDebounced() {

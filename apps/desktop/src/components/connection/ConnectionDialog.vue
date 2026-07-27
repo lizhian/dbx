@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import type { ObjectDirective } from "vue";
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -15,7 +15,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import type { ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, HttpTunnelConfig, IdentifierCase, JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
-import type { FileConnectionImplementation } from "@/types/fileManager";
+import type { FileConnection, FileConnectionConfig, FileConnectionImplementation, FileSecretStatus } from "@/types/fileManager";
 import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { NacosAdminConfig, NacosAuthConfig, NacosImplementation, NacosRNacosConsoleAuth, NacosVersionMode } from "@/types/nacos";
@@ -71,7 +71,6 @@ import {
   ExternalLink,
   FilePlus2,
   FolderOpen,
-  HardDrive,
   GripVertical,
   Grid3X3,
   KeyRound,
@@ -94,6 +93,8 @@ import { canSaveVisibleDatabaseSelection, connectionUsesVisibleSchemaFilter, fil
 import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureSupport";
 import VisibleSchemasDialog from "@/components/sidebar/VisibleSchemasDialog.vue";
 import CloudflareD1ConnectionFields from "@/components/connection/CloudflareD1ConnectionFields.vue";
+import FileConnectionFields from "@/components/connection/FileConnectionFields.vue";
+import { createFileConnectionDraft, createFileConnectionImplementationDraft, fileConnectionRequestFromDraft, type FileConnectionDraft } from "@/components/file-manager/fileConnectionDraft";
 import { oceanbaseModeConnectionPatch, oceanbaseSubModeFromConfig } from "@/lib/database/oceanbaseConnectionMode";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { applyHiveKerberosSubmitConfig, hiveKerberosFormConfig, type HiveKerberosAuthMode } from "@/lib/database/hiveKerberosOptions";
@@ -101,9 +102,9 @@ import { hasCloudflareD1Credentials, isCloudflareD1Connection, normalizeCloudfla
 import { buildElasticsearchExternalConfig, elasticsearchConnectionModeFromConfig, elasticsearchKibanaBasePathFromConfig, type ElasticsearchConnectionMode } from "@/lib/connection/elasticsearchKibanaProxy";
 
 type DbOption = { value: string; label: string };
-type DbCategoryKey = "sql" | "analytics" | "domestic" | "lightweight" | "document" | "graph_ai" | "timeseries" | "mq" | "registry_config";
+type DbCategoryKey = "sql" | "analytics" | "domestic" | "lightweight" | "document" | "graph_ai" | "timeseries" | "mq" | "registry_config" | "file";
 type DbCategory = { key: DbCategoryKey; title: string; options: DbOption[] };
-type ConnectionCategoryKey = DbCategoryKey | "file-storage";
+type ConnectionCategoryKey = DbCategoryKey;
 type DialogStep = "select" | "config";
 export type ConfigTab = "connection" | "advanced" | "tls" | "transport";
 type ProductionScope = "connection" | "databases";
@@ -520,7 +521,8 @@ const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>(loadConnectionPickerView());
 const dbSearchQuery = ref("");
 const selectedDbCategory = ref<ConnectionCategoryKey>("sql");
-const selectedFileImplementation = ref<FileConnectionImplementation>("ftp");
+const fileDraft = reactive<FileConnectionDraft>(createFileConnectionImplementationDraft("ftp"));
+const fileSecretStatus = ref<FileSecretStatus>();
 const configTab = ref<ConfigTab>("connection");
 const MQ_KAFKA_SECURITY_PROTOCOL_AUTO = "__auto";
 const mqAdminUrl = ref("http://127.0.0.1:8080");
@@ -897,6 +899,12 @@ const driverProfiles: Record<
   rocketmq: { type: "mq", port: 9876, user: "", label: "Apache RocketMQ", icon: "rocketmq", host: "127.0.0.1" },
   rabbitmq: { type: "mq", port: 5672, user: "", label: "RabbitMQ", icon: "rabbitmq", host: "127.0.0.1" },
   nacos: { type: "nacos", port: 8848, user: "nacos", label: "Nacos", icon: "nacos", host: "127.0.0.1" },
+  ftp: { type: "file", port: 21, user: "", label: "FTP", icon: "ftp", host: "127.0.0.1" },
+  sftp: { type: "file", port: 22, user: "", label: "SFTP", icon: "sftp", host: "127.0.0.1" },
+  s3: { type: "file", port: 443, user: "", label: "S3", icon: "s3", host: "127.0.0.1" },
+  webdav: { type: "file", port: 80, user: "", label: "WebDAV", icon: "webdav", host: "127.0.0.1" },
+  webhdfs: { type: "file", port: 9870, user: "", label: "WebHDFS", icon: "webhdfs", host: "127.0.0.1" },
+  "hdfs-native": { type: "file", port: 8020, user: "", label: "HDFS Native", icon: "hdfs-native", host: "127.0.0.1" },
   iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
   influxdb: { type: "influxdb", port: 8086, user: "", label: "InfluxDB", icon: "InfluxDB" },
   custom_mysql: {
@@ -1773,6 +1781,41 @@ function isCustomCompatibleProfile() {
   return selectedType.value === "custom_mysql" || selectedType.value === "custom_postgres";
 }
 
+const FILE_IMPLEMENTATIONS = ["ftp", "sftp", "s3", "webdav", "webhdfs", "hdfs-native"] as const;
+
+function isFileImplementation(value: string): value is FileConnectionImplementation {
+  return FILE_IMPLEMENTATIONS.includes(value as FileConnectionImplementation);
+}
+
+function resetFileDraft(implementation: FileConnectionImplementation, id = editingId.value || draftTestConnectionId.value) {
+  Object.assign(fileDraft, createFileConnectionImplementationDraft(implementation, { id, name: form.value.name }));
+  fileSecretStatus.value = undefined;
+}
+
+function hydrateFileDraft(config: ConnectionConfig, implementation: FileConnectionImplementation) {
+  const fileConfig = config.external_config as FileConnectionConfig | undefined;
+  if (!fileConfig || typeof fileConfig !== "object" || !("protocol" in fileConfig)) {
+    resetFileDraft(implementation, config.id);
+    return;
+  }
+  const connection: FileConnection = {
+    id: config.id,
+    name: config.name,
+    config: fileConfig,
+    capabilities: {} as FileConnection["capabilities"],
+    secretStatus: fileSecretStatus.value ?? {
+      password: false,
+      privateKey: false,
+      accessKey: false,
+      secretKey: false,
+      sessionToken: false,
+      bearerToken: false,
+      delegationToken: false,
+    },
+  };
+  Object.assign(fileDraft, createFileConnectionDraft(connection, implementation));
+}
+
 function applyProfile(val: string, preserveConnectionFields = false) {
   const profile = driverProfiles[val];
   if (!profile) return;
@@ -1855,6 +1898,14 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.database = undefined;
       form.value.password = "";
       form.value.connection_string = undefined;
+    }
+    if (profile.type === "file" && isFileImplementation(val)) {
+      resetFileDraft(val);
+      form.value.password = "";
+      form.value.database = undefined;
+      form.value.connection_string = undefined;
+      form.value.url_params = "";
+      form.value.ssl = val === "s3";
     }
     resetHiveKerberosFields(profile.type === "hive" ? form.value : undefined);
   }
@@ -1962,6 +2013,19 @@ watch(
       customColorInput.value = config.color || "";
       selectedTransportLayerId.value = form.value.transport_layers?.[0]?.id || null;
       selectedType.value = profile;
+      if (config.db_type === "file" && isFileImplementation(profile)) {
+        hydrateFileDraft(config, profile);
+        void api
+          .fileConnectionSecretStatus(config.id)
+          .then((status) => {
+            if (open.value && props.editConfig?.id === config.id) fileSecretStatus.value = status;
+          })
+          .catch(() => {
+            fileSecretStatus.value = undefined;
+          });
+      } else {
+        fileSecretStatus.value = undefined;
+      }
       if (profile === "oceanbase") {
         oceanbaseSubMode.value = oceanbaseMode;
       }
@@ -2191,6 +2255,12 @@ const iconTypeMap: Record<string, string> = {
   rocketmq: "rocketmq",
   rabbitmq: "rabbitmq",
   nacos: "nacos",
+  ftp: "ftp",
+  sftp: "sftp",
+  s3: "s3",
+  webdav: "webdav",
+  webhdfs: "webhdfs",
+  "hdfs-native": "hdfs-native",
   dm: "dm",
   h2: "h2",
   snowflake: "snowflake",
@@ -2288,6 +2358,12 @@ const dbOptions: DbOption[] = [
   { value: "rocketmq", label: "Apache RocketMQ" },
   { value: "rabbitmq", label: "RabbitMQ" },
   { value: "nacos", label: "Nacos" },
+  { value: "ftp", label: "FTP" },
+  { value: "sftp", label: "SFTP" },
+  { value: "s3", label: "S3" },
+  { value: "webdav", label: "WebDAV" },
+  { value: "webhdfs", label: "WebHDFS" },
+  { value: "hdfs-native", label: "HDFS Native" },
   { value: "influxdb", label: "InfluxDB" },
   { value: "iris", label: "IRIS" },
   { value: "jdbcx", label: "JDBCX" },
@@ -2347,6 +2423,11 @@ const dbCategoryDefinitions: Array<{
     titleKey: "connection.databaseCategoryRegistryConfig",
     optionValues: ["etcd", "zookeeper", "nacos"],
   },
+  {
+    key: "file",
+    titleKey: "fileManager.storageCategory",
+    optionValues: ["ftp", "sftp", "s3", "webdav", "webhdfs", "hdfs-native"],
+  },
 ];
 
 // Keep the picker exhaustive as database drivers are added or reorganized.
@@ -2362,15 +2443,7 @@ const dbCategories = computed<DbCategory[]>(() => {
     options: dbOptions.filter((option) => category.optionValues.includes(option.value)),
   }));
 });
-const connectionCategories = computed(() => [{ key: "file-storage" as const, title: t("fileManager.storageCategory") }, ...dbCategories.value.map((category) => ({ key: category.key as ConnectionCategoryKey, title: category.title }))]);
-const fileImplementationOptions: { value: FileConnectionImplementation; label: string }[] = [
-  { value: "ftp", label: "FTP" },
-  { value: "sftp", label: "SFTP" },
-  { value: "s3", label: "S3" },
-  { value: "webdav", label: "WebDAV" },
-  { value: "webhdfs", label: "WebHDFS" },
-  { value: "hdfs-native", label: "HDFS Native" },
-];
+const connectionCategories = computed(() => dbCategories.value.map((category) => ({ key: category.key as ConnectionCategoryKey, title: category.title })));
 
 function matchesDbOption(option: DbOption, keyword: string, categoryTitle = "") {
   const profile = driverProfiles[option.value];
@@ -2382,8 +2455,6 @@ function matchesDbOption(option: DbOption, keyword: string, categoryTitle = "") 
 }
 
 const isDbSearchActive = computed(() => !!dbSearchQuery.value.trim());
-const isFileStorageCategory = computed(() => !isDbSearchActive.value && selectedDbCategory.value === "file-storage");
-
 const filteredDbCategories = computed<DbCategory[]>(() => {
   const keyword = dbSearchQuery.value.trim().toLowerCase();
   if (!isDbSearchActive.value) return dbCategories.value;
@@ -2406,18 +2477,9 @@ const selectedDbOptionIsVisible = computed(() => visibleDbCategories.value.some(
 function selectDbCategory(category: ConnectionCategoryKey) {
   selectedDbCategory.value = category;
   dbSearchQuery.value = "";
-  if (category === "file-storage") return;
   const categoryOptions = dbCategoryDefinitions.find((definition) => definition.key === category)?.optionValues ?? [];
   const nextSelection = databaseSelectionForCategory(selectedType.value, categoryOptions);
   if (nextSelection && nextSelection !== selectedType.value) onDbTypeChange(nextSelection);
-}
-
-function selectFileImplementation(implementation: FileConnectionImplementation) {
-  selectedFileImplementation.value = implementation;
-}
-
-function openFileConnection(implementation = selectedFileImplementation.value) {
-  emit("create-file-connection", implementation);
 }
 
 function selectDbPickerView(view: DbPickerView) {
@@ -2752,7 +2814,33 @@ const connectionLabelClass = "justify-self-start text-left";
 const connectionLabelSmallClass = `${connectionLabelClass} text-xs`;
 const connectionLabelTopClass = `${connectionLabelClass} mt-2`;
 const connectionLabelSmallPaddedClass = `${connectionLabelClass} pt-2 text-xs`;
+const fileDraftCanSubmit = computed(() => {
+  if (form.value.db_type !== "file") return true;
+  const hdfsNative = fileDraft.protocol === "hdfs" && fileDraft.hdfsImplementation === "native";
+  const portValid = !["ftp", "sftp"].includes(fileDraft.protocol) || (fileDraft.port > 0 && fileDraft.port <= 65535);
+  if (!form.value.name.trim() || !fileDraft.root.trim() || !portValid) return false;
+  if (hdfsNative) return !!fileDraft.nameNodeUri.trim() && !!fileDraft.hadoopConfigDirectory.trim();
+  if (!fileDraft.endpoint.trim()) return false;
+  if (fileDraft.protocol === "s3") {
+    const accessKey = !!fileDraft.accessKey || (!!fileSecretStatus.value?.accessKey && !fileDraft.clearAccessKey);
+    const secretKey = !!fileDraft.secretKey || (!!fileSecretStatus.value?.secretKey && !fileDraft.clearSecretKey);
+    return !!fileDraft.region.trim() && !!fileDraft.bucket.trim() && accessKey && secretKey;
+  }
+  if (fileDraft.protocol === "webdav") {
+    if (fileDraft.webdavAuthentication === "basic") {
+      return !!fileDraft.username.trim() && (!!fileDraft.password || (!!fileSecretStatus.value?.password && !fileDraft.clearPassword));
+    }
+    return !!fileDraft.bearerToken || (!!fileSecretStatus.value?.bearerToken && !fileDraft.clearBearerToken);
+  }
+  if (fileDraft.protocol === "hdfs") {
+    if (!fileDraft.useDelegationToken) return !!fileDraft.simpleUser.trim();
+    return !!fileDraft.delegationToken || (!!fileSecretStatus.value?.delegationToken && !fileDraft.clearDelegationToken);
+  }
+  if (fileDraft.protocol !== "sftp" || fileDraft.authentication !== "private_key") return true;
+  return !!fileDraft.privateKey || (!!fileSecretStatus.value?.privateKey && !fileDraft.clearPrivateKey);
+});
 const hasRequiredConnectionTarget = computed(() => {
+  if (form.value.db_type === "file") return fileDraftCanSubmit.value;
   if (form.value.db_type === "mq") {
     if (mqSystemKind.value === "kafka") return mqKafkaConnectionSource.value === "zookeeper" ? !!mqKafkaZooKeeperServers.value.trim() : !!mqKafkaBootstrapServers.value.trim();
     if (mqSystemKind.value === "rocketmq") return !!mqRocketmqNamesrvAddr.value.trim();
@@ -2843,6 +2931,27 @@ async function testConnection() {
   const submittedSourceName = form.value.name;
   try {
     config = connectionConfigForSubmit(editingId.value || draftTestConnectionId.value);
+    if (config.db_type === "file") {
+      const request = fileConnectionRequestForSubmit(config.id, config.name);
+      await api.testFileConnection({
+        id: editingId.value || undefined,
+        config: request.config,
+        secrets: request.secrets,
+      });
+      if (runId !== testRunId) return;
+      const result: ConnectionTestResult = {
+        message: t("fileManager.testSucceeded"),
+        databaseInfo: {
+          productName: config.driver_label,
+          currentDatabase: fileDraft.protocol === "s3" ? fileDraft.bucket : fileDraft.root,
+          driverName: "Apache OpenDAL",
+        },
+      };
+      applySuccessfulConnectionTest(result, config, submittedSourceName);
+      void persistSuccessfulConnectionTest(result, config, submittedSourceName, runId);
+      clearEditedConnectionErrorAfterSuccessfulTest();
+      return;
+    }
     await ensureRequiredAgentDriverInstalled(config);
     await ensureRequiredJdbcxDriverInstalled(config);
     const result = await testConnectionWithTimeout(config, runId);
@@ -3021,6 +3130,39 @@ function generateConnectionName(): string {
   return `${label}_${rand}`;
 }
 
+function fileConnectionRequestForSubmit(id: string, name: string) {
+  return fileConnectionRequestFromDraft({ ...fileDraft, id, name });
+}
+
+function applyFileConnectionProjection(config: LegacyConnectionConfig, fileConfig: FileConnectionConfig) {
+  const implementation = isFileImplementation(selectedType.value) ? selectedType.value : "ftp";
+  const endpoint = fileConfig.protocol === "hdfs" && fileConfig.implementation === "native" ? fileConfig.nameNodeUri : fileConfig.endpoint;
+  const scheme = implementation === "sftp" ? "ssh" : implementation === "hdfs-native" ? "hdfs" : implementation;
+  try {
+    const parsed = new URL(endpoint.includes("://") ? endpoint : `${scheme}://${endpoint}`);
+    config.host = parsed.hostname;
+    config.port = parsed.port ? Number(parsed.port) : implementation === "ftp" ? 21 : implementation === "sftp" ? 22 : implementation === "s3" ? 443 : implementation === "webhdfs" ? 80 : implementation === "hdfs-native" ? 8020 : 80;
+    config.ssl = parsed.protocol === "https:" || parsed.protocol === "ftps:";
+  } catch {
+    config.host = endpoint;
+  }
+  config.username =
+    fileConfig.protocol === "ftp" || fileConfig.protocol === "sftp"
+      ? fileConfig.username
+      : fileConfig.protocol === "webdav" && fileConfig.authentication.method === "basic"
+        ? fileConfig.authentication.username
+        : fileConfig.protocol === "hdfs" && fileConfig.implementation === "webhdfs"
+          ? fileConfig.simpleUser
+          : "";
+  config.password = "";
+  config.database = undefined;
+  config.connection_string = undefined;
+  config.url_params = "";
+  config.external_config = fileConfig;
+  config.driver_profile = implementation;
+  config.driver_label = driverProfiles[implementation].label;
+}
+
 function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionConfig {
   const config = { ...formValueForSubmit(), id } as LegacyConnectionConfig;
   config.database_info = undefined;
@@ -3117,7 +3259,10 @@ function connectionConfigForSubmit(id: string, generatedName = ""): ConnectionCo
   if (!config.is_production) config.is_production = undefined;
   config.production_databases = [...new Set((config.production_databases || []).map((database) => database.trim()).filter(Boolean))];
   if (!config.production_databases.length) config.production_databases = undefined;
-  if (form.value.db_type === "mq") {
+  if (form.value.db_type === "file") {
+    const request = fileConnectionRequestForSubmit(id, config.name);
+    applyFileConnectionProjection(config, request.config);
+  } else if (form.value.db_type === "mq") {
     const mqConfig = buildMqAdminConfig();
     config.external_config = mqConfig;
     config.driver_profile = mqConfig.systemKind;
@@ -3870,6 +4015,7 @@ function resetForm() {
   selectedTransportLayerId.value = null;
   draggedTransportLayerId.value = null;
   selectedType.value = "mysql";
+  resetFileDraft("ftp", draftTestConnectionId.value);
   customDriverName.value = "";
   mongoUseUrl.value = false;
   resetMqFields();
@@ -4187,14 +4333,16 @@ async function save() {
     if (editingId.value) {
       const updated = withSavedDatabaseInfo(connectionConfigForSubmit(editingId.value), databaseInfoForSave);
       await ensureRequiredAgentDriverInstalled(updated);
-      await store.updateConnection(updated);
+      const fileSecrets = updated.db_type === "file" ? fileConnectionRequestForSubmit(updated.id, updated.name).secrets : undefined;
+      await store.updateConnection(updated, fileSecrets);
       store.stopEditing();
     } else {
       const config = withSavedDatabaseInfo(connectionConfigForSubmit(draftTestConnectionId.value), databaseInfoForSave);
       await ensureRequiredAgentDriverInstalled(config);
-      await store.addConnection(config);
+      const fileSecrets = config.db_type === "file" ? fileConnectionRequestForSubmit(config.id, config.name).secrets : undefined;
+      await store.addConnection(config, undefined, fileSecrets);
       draftTestConnectionId.value = uuid();
-      if (config.db_type === "jdbc") {
+      if (config.db_type === "jdbc" || config.db_type === "file") {
         open.value = false;
         return;
       }
@@ -4663,45 +4811,7 @@ function openExternalUrl(url: string) {
             <div class="connection-db-picker-results min-w-0 flex-1 space-y-5 overflow-y-auto p-0.5 pr-2">
               <div v-if="isDbSearchActive" class="text-sm font-medium">{{ t("connection.searchResults") }}</div>
 
-              <section v-if="isFileStorageCategory" class="space-y-2" data-file-storage-picker>
-                <div v-if="dbPickerView === 'icon'" class="connection-db-picker-grid grid grid-cols-2 gap-2 sm:grid-cols-3">
-                  <button
-                    v-for="option in fileImplementationOptions"
-                    :key="option.value"
-                    type="button"
-                    class="connection-db-picker-option group flex min-h-24 flex-col items-center justify-center gap-2 rounded-[4px] border bg-background/70 p-3 text-center transition hover:border-primary/40 hover:bg-muted/40 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    :class="selectedFileImplementation === option.value ? 'connection-db-picker-option--selected shadow-sm' : 'border-border'"
-                    :aria-pressed="selectedFileImplementation === option.value"
-                    :data-file-protocol="option.value"
-                    @click="selectFileImplementation(option.value)"
-                    @dblclick="openFileConnection(option.value)"
-                  >
-                    <span class="flex h-10 w-10 items-center justify-center rounded-xl bg-muted/60 transition group-hover:bg-background">
-                      <HardDrive class="h-6 w-6" />
-                    </span>
-                    <span class="max-w-full truncate text-sm font-medium">{{ option.label }}</span>
-                  </button>
-                </div>
-
-                <div v-else class="grid gap-2">
-                  <button
-                    v-for="option in fileImplementationOptions"
-                    :key="option.value"
-                    type="button"
-                    class="connection-db-picker-option flex items-center gap-3 rounded-[4px] border bg-background px-3 py-2 text-left transition hover:border-primary/40 hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                    :class="selectedFileImplementation === option.value ? 'connection-db-picker-option--selected' : 'border-border'"
-                    :aria-pressed="selectedFileImplementation === option.value"
-                    :data-file-protocol="option.value"
-                    @click="selectFileImplementation(option.value)"
-                    @dblclick="openFileConnection(option.value)"
-                  >
-                    <HardDrive class="h-5 w-5 shrink-0" />
-                    <span class="min-w-0 flex-1 truncate text-sm font-medium">{{ option.label }}</span>
-                  </button>
-                </div>
-              </section>
-
-              <section v-for="category in visibleDbCategories" v-else :key="category.key" class="space-y-2">
+              <section v-for="category in visibleDbCategories" :key="category.key" class="space-y-2">
                 <h3 v-if="isDbSearchActive" class="text-sm font-medium">{{ category.title }}</h3>
 
                 <div v-if="dbPickerView === 'icon'" class="connection-db-picker-grid grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-5">
@@ -4740,7 +4850,7 @@ function openExternalUrl(url: string) {
                 </div>
               </section>
 
-              <div v-if="!isFileStorageCategory && !hasDbPickerResults" class="rounded-xl border border-dashed py-12 text-center text-sm text-muted-foreground">
+              <div v-if="!hasDbPickerResults" class="rounded-xl border border-dashed py-12 text-center text-sm text-muted-foreground">
                 {{ t("connection.noDatabaseMatches") }}
               </div>
             </div>
@@ -4748,19 +4858,11 @@ function openExternalUrl(url: string) {
         </div>
 
         <DialogFooter class="flex shrink-0 items-center gap-2">
-          <div v-if="isFileStorageCategory" class="mr-auto flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
-            <HardDrive class="h-4 w-4 shrink-0" />
-            <span class="truncate">{{ t("fileManager.protocol") }}: {{ fileImplementationOptions.find((option) => option.value === selectedFileImplementation)?.label }}</span>
-          </div>
-          <div v-else class="mr-auto flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
+          <div class="mr-auto flex min-w-0 items-center gap-2 text-sm text-muted-foreground">
             <DatabaseIcon :db-type="selectedDbIcon" class="h-4 w-4 shrink-0" />
             <span class="truncate">{{ t("connection.selectedDatabase") }}: {{ selectedProfile().label }}</span>
           </div>
-          <Button v-if="isFileStorageCategory" @click="openFileConnection()">
-            {{ t("connection.next") }}
-            <ChevronRight class="h-4 w-4" />
-          </Button>
-          <Button v-else :disabled="!hasDbPickerResults || !selectedDbOptionIsVisible" @click="goToConnectionStep()">
+          <Button :disabled="!hasDbPickerResults || !selectedDbOptionIsVisible" @click="goToConnectionStep()">
             {{ t("connection.next") }}
             <ChevronRight class="h-4 w-4" />
           </Button>
@@ -4781,7 +4883,7 @@ function openExternalUrl(url: string) {
 
             <TabsContent value="connection" class="m-0 min-h-0 flex-1 overflow-hidden">
               <div class="connection-form-body grid h-full min-h-0 gap-4 overflow-y-auto pt-4 pr-2">
-                <div v-if="!isJdbcConnection && form.db_type !== 'nacos'" class="grid grid-cols-4 items-center gap-4">
+                <div v-if="!isJdbcConnection && form.db_type !== 'nacos' && form.db_type !== 'file'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelClass">{{ t("connection.connectionUrlOptional") }}</Label>
                   <div class="col-span-3 flex items-center gap-1">
                     <Input v-model="connectionUrlInput" class="flex-1" :placeholder="connectionUrlPlaceholder" @keydown.enter.prevent="applyConnectionUrl" />
@@ -4914,8 +5016,10 @@ function openExternalUrl(url: string) {
                   </p>
                 </div>
 
+                <FileConnectionFields v-if="form.db_type === 'file'" :draft="fileDraft" :secret-status="fileSecretStatus" @error="showConnectionError" />
+
                 <!-- JDBC: optional external plugin -->
-                <template v-if="isJdbcConnection">
+                <template v-else-if="isJdbcConnection">
                   <div v-if="form.driver_profile === 'dremio'" class="grid grid-cols-4 items-center gap-4">
                     <Label :class="connectionLabelClass">{{ t("connection.mode") }}</Label>
                     <div class="col-span-3 flex gap-2">

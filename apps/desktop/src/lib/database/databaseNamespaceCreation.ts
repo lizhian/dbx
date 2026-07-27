@@ -80,6 +80,7 @@ export const DATABASE_NAMESPACE_CREATION_MATRIX = {
   influxdb: { connection: "database" },
   jdbc: { deferred: "generic JDBC does not expose a reliable dialect-specific create target" },
   mq: { deferred: "message queue namespaces are handled by MQ admin panels" },
+  file: { deferred: "File Manager paths are managed by file operations, not database namespace creation" },
   nacos: { deferred: "Nacos namespace creation already uses the Nacos admin flow" },
 } satisfies Record<DatabaseType, DatabaseNamespaceCreationMatrixEntry>;
 

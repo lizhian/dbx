@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::adapter::map_operation_error;
 use super::models::{FileManagerError, FileTransferRequest};
-use super::service::{operator_for_connection, validate_remote_path};
+use super::service::{ensure_writable_connection, operator_for_connection, validate_remote_path};
 
 const TRANSFER_BUFFER_SIZE: usize = 64 * 1024;
 pub(crate) const TRANSFER_TIMEOUT_SECS: u64 = 60;
@@ -64,6 +64,7 @@ pub async fn upload(
     state: &FileTransferState,
     request: FileTransferRequest,
 ) -> Result<u64, FileManagerError> {
+    ensure_writable_connection(storage, &request.connection_id).await?;
     let remote_path = non_root_remote_path(&request.remote_path)?;
     let local_path = absolute_local_path(&request.local_path)?;
     let metadata = tokio::fs::metadata(&local_path)
@@ -150,6 +151,7 @@ pub async fn delete(
     connection_id: &str,
     path: &str,
 ) -> Result<(), FileManagerError> {
+    ensure_writable_connection(storage, connection_id).await?;
     let path = non_root_remote_path(path)?;
     let operator = operator_for_connection(storage, connection_id).await?;
     let _permits = state.acquire(connection_id).await?;

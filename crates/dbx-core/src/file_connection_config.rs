@@ -1,8 +1,123 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 pub const FILE_SECRET_PREFIX: &str = "file.";
 pub const FILE_SECRET_KEYS: [&str; 7] =
     ["password", "private_key", "access_key", "secret_key", "session_token", "bearer_token", "delegation_token"];
+
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(tag = "action", content = "value", rename_all = "snake_case")]
+pub enum FileSecretUpdate {
+    #[default]
+    Keep,
+    Set(String),
+    Clear,
+}
+
+impl fmt::Debug for FileSecretUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Keep => formatter.write_str("Keep"),
+            Self::Set(_) => formatter.write_str("Set([REDACTED])"),
+            Self::Clear => formatter.write_str("Clear"),
+        }
+    }
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSecretUpdates {
+    #[serde(default)]
+    pub password: FileSecretUpdate,
+    #[serde(default)]
+    pub private_key: FileSecretUpdate,
+    #[serde(default)]
+    pub access_key: FileSecretUpdate,
+    #[serde(default)]
+    pub secret_key: FileSecretUpdate,
+    #[serde(default)]
+    pub session_token: FileSecretUpdate,
+    #[serde(default)]
+    pub bearer_token: FileSecretUpdate,
+    #[serde(default)]
+    pub delegation_token: FileSecretUpdate,
+}
+
+impl fmt::Debug for FileSecretUpdates {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileSecretUpdates")
+            .field("password", &self.password)
+            .field("private_key", &self.private_key)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &self.secret_key)
+            .field("session_token", &self.session_token)
+            .field("bearer_token", &self.bearer_token)
+            .field("delegation_token", &self.delegation_token)
+            .finish()
+    }
+}
+
+impl FileSecretUpdates {
+    pub fn entries(&self) -> [(&'static str, &FileSecretUpdate); 7] {
+        [
+            ("password", &self.password),
+            ("private_key", &self.private_key),
+            ("access_key", &self.access_key),
+            ("secret_key", &self.secret_key),
+            ("session_token", &self.session_token),
+            ("bearer_token", &self.bearer_token),
+            ("delegation_token", &self.delegation_token),
+        ]
+    }
+
+    pub fn persistence_updates(&self) -> Result<Vec<(String, Option<String>)>, String> {
+        let mut updates = Vec::new();
+        for (key, update) in self.entries() {
+            match update {
+                FileSecretUpdate::Keep => {}
+                FileSecretUpdate::Set(value) if value.is_empty() => {
+                    return Err("A secret value cannot be empty; use clear explicitly".to_string());
+                }
+                FileSecretUpdate::Set(value) => updates.push((key.to_string(), Some(value.clone()))),
+                FileSecretUpdate::Clear => updates.push((key.to_string(), None)),
+            }
+        }
+        Ok(updates)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSecretStatus {
+    pub password: bool,
+    pub private_key: bool,
+    pub access_key: bool,
+    pub secret_key: bool,
+    pub session_token: bool,
+    pub bearer_token: bool,
+    pub delegation_token: bool,
+}
+
+impl FileSecretStatus {
+    pub fn from_keys(keys: &[String]) -> Self {
+        let contains = |key: &str| {
+            keys.iter().any(|candidate| {
+                candidate == key || candidate.strip_prefix(FILE_SECRET_PREFIX).is_some_and(|value| value == key)
+            })
+        };
+        Self {
+            password: contains("password"),
+            private_key: contains("private_key"),
+            access_key: contains("access_key"),
+            secret_key: contains("secret_key"),
+            session_token: contains("session_token"),
+            bearer_token: contains("bearer_token"),
+            delegation_token: contains("delegation_token"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]

@@ -5,7 +5,7 @@ use tauri::State;
 
 use crate::file_manager;
 use crate::file_manager::models::{
-    FileConnection, FileEntry, FileManagerError, FileRemoteOperationRequest, FileTransferRequest,
+    FileConnection, FileEntry, FileManagerError, FileRemoteOperationRequest, FileSecretStatus, FileTransferRequest,
     SaveFileConnectionRequest, TestFileConnectionRequest,
 };
 use crate::file_manager::FileTransferState;
@@ -13,6 +13,18 @@ use crate::file_manager::FileTransferState;
 #[tauri::command]
 pub async fn list_file_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<FileConnection>, FileManagerError> {
     file_manager::service::list_connections(&state.storage).await
+}
+
+#[tauri::command]
+pub async fn file_connection_secret_status(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<FileSecretStatus, FileManagerError> {
+    state
+        .storage
+        .file_connection_secret_status(&id)
+        .await
+        .map_err(|_| FileManagerError::new("storage", "Failed to load file connection credential status"))
 }
 
 #[tauri::command]

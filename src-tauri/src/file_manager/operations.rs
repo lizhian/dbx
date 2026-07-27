@@ -6,7 +6,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use super::adapter::map_operation_error;
 use super::models::{FileManagerError, FileRemoteOperationRequest};
-use super::service::operator_for_connection;
+use super::service::{ensure_writable_connection, operator_for_connection};
 use super::transfer::{
     copy_with_fixed_buffer, non_root_remote_path, transfer_timeout, FileTransferState, TRANSFER_TIMEOUT_SECS,
 };
@@ -16,6 +16,7 @@ pub async fn copy(
     state: &FileTransferState,
     request: FileRemoteOperationRequest,
 ) -> Result<(), FileManagerError> {
+    ensure_writable_connection(storage, &request.connection_id).await?;
     let source = non_root_remote_path(&request.source_path)?;
     let destination = destination_path(&source, &request.destination_path)?;
     let operator = operator_for_connection(storage, &request.connection_id).await?;
@@ -28,6 +29,7 @@ pub async fn rename(
     state: &FileTransferState,
     request: FileRemoteOperationRequest,
 ) -> Result<(), FileManagerError> {
+    ensure_writable_connection(storage, &request.connection_id).await?;
     let source = non_root_remote_path(&request.source_path)?;
     let destination = destination_path(&source, &request.destination_path)?;
     let operator = operator_for_connection(storage, &request.connection_id).await?;

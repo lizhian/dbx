@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::storage::Storage;
 use opendal::{EntryMode, Metadata, Operator};
 use percent_encoding::percent_decode_str;
@@ -15,14 +16,33 @@ const CONNECTION_TEST_TIMEOUT_SECS: u64 = 15;
 const FILE_OPERATION_TIMEOUT_SECS: u64 = 60;
 
 pub async fn list_connections(storage: &Storage) -> Result<Vec<FileConnection>, FileManagerError> {
-    let values = storage
-        .load_file_connections()
+    let configs = storage
+        .load_connections()
         .await
         .map_err(|_| FileManagerError::new("storage", "Failed to load file connections"))?;
-    let mut connections = Vec::with_capacity(values.len());
-    for value in values {
+    let mut connections = Vec::new();
+    for config in configs.into_iter().filter(|config| config.db_type == DatabaseType::FileManager) {
+        let file_config = file_config_from_connection(&config)?;
+        let status = storage
+            .file_connection_secret_status(&config.id)
+            .await
+            .map_err(|_| FileManagerError::new("storage", "Failed to load file connection credential status"))?;
+        connections.push(public_connection(
+            StoredFileConnection { id: config.id, name: config.name, config: file_config },
+            status,
+        ));
+    }
+    if !connections.is_empty() {
+        return Ok(connections);
+    }
+
+    let legacy_values = storage
+        .load_file_connections()
+        .await
+        .map_err(|_| FileManagerError::new("storage", "Failed to load legacy file connections"))?;
+    for value in legacy_values {
         let stored: StoredFileConnection = serde_json::from_value(value)
-            .map_err(|_| FileManagerError::new("storage", "A saved file connection is invalid"))?;
+            .map_err(|_| FileManagerError::new("storage", "A saved legacy file connection is invalid"))?;
         let keys = storage
             .file_connection_secret_keys(&stored.id)
             .await
@@ -45,7 +65,7 @@ pub async fn save_connection(
     };
     let resolved = resolve_secrets(storage, &validation_request).await?;
     build_operator(&request.config, &resolved)?;
-    let updates = request.secrets.persistence_updates()?;
+    let updates = request.secrets.persistence_updates().map_err(FileManagerError::configuration)?;
     let stored = StoredFileConnection { id: request.id, name: request.name, config: request.config };
     let value = serde_json::to_value(&stored)
         .map_err(|_| FileManagerError::new("storage", "Failed to serialize the file connection"))?;
@@ -202,6 +222,11 @@ pub(crate) async fn operator_for_connection(
 }
 
 async fn stored_connection(storage: &Storage, connection_id: &str) -> Result<StoredFileConnection, FileManagerError> {
+    if let Some(config) = connection_config(storage, connection_id).await? {
+        let file_config = file_config_from_connection(&config)?;
+        return Ok(StoredFileConnection { id: config.id, name: config.name, config: file_config });
+    }
+
     let values = storage
         .load_file_connections()
         .await
@@ -211,6 +236,40 @@ async fn stored_connection(storage: &Storage, connection_id: &str) -> Result<Sto
         .filter_map(|value| serde_json::from_value::<StoredFileConnection>(value).ok())
         .find(|connection| connection.id == connection_id)
         .ok_or_else(|| FileManagerError::new("not_found", "The file connection does not exist"))
+}
+
+pub(crate) async fn ensure_writable_connection(storage: &Storage, connection_id: &str) -> Result<(), FileManagerError> {
+    if connection_config(storage, connection_id).await?.is_some_and(|config| config.read_only) {
+        return Err(FileManagerError::new("read_only", "This File Manager connection is read-only"));
+    }
+    Ok(())
+}
+
+async fn connection_config(
+    storage: &Storage,
+    connection_id: &str,
+) -> Result<Option<ConnectionConfig>, FileManagerError> {
+    storage
+        .load_connections()
+        .await
+        .map_err(|_| FileManagerError::new("storage", "Failed to load file connections"))
+        .map(|configs| {
+            configs.into_iter().find(|config| config.id == connection_id && config.db_type == DatabaseType::FileManager)
+        })
+}
+
+fn file_config_from_connection(config: &ConnectionConfig) -> Result<FileConnectionConfig, FileManagerError> {
+    let value = config
+        .external_config
+        .clone()
+        .ok_or_else(|| FileManagerError::configuration("The file protocol configuration is missing"))?;
+    let file_config: FileConnectionConfig = serde_json::from_value(value)
+        .map_err(|_| FileManagerError::configuration("The file protocol configuration is invalid"))?;
+    let expected_profile = file_config.driver_profile();
+    if config.driver_profile.as_deref() != Some(expected_profile) {
+        return Err(FileManagerError::configuration("The file protocol does not match the selected driver profile"));
+    }
+    Ok(file_config)
 }
 
 async fn with_operation_timeout<T>(

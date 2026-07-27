@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tauri::State;
 
@@ -14,6 +14,7 @@ pub use dbx_core::connection::{
 use dbx_core::database_capabilities;
 use dbx_core::db;
 use dbx_core::db::agent_driver::AgentMethod;
+use dbx_core::file_connection_config::FileSecretUpdates;
 use dbx_core::models::connection::{
     database_info_from_protocol_value, rewrite_jdbc_url_host, ConnectionConfig, ConnectionTestResult,
     DatabaseConnectionInfo, DatabaseType,
@@ -541,12 +542,25 @@ mod tests {
 }
 
 #[tauri::command]
-pub async fn save_connections(state: State<'_, Arc<AppState>>, configs: Vec<ConnectionConfig>) -> Result<(), String> {
+pub async fn save_connections(
+    state: State<'_, Arc<AppState>>,
+    configs: Vec<ConnectionConfig>,
+    file_secret_updates: Option<HashMap<String, FileSecretUpdates>>,
+) -> Result<(), String> {
     let configs: Vec<ConnectionConfig> = configs.into_iter().map(|config| config.canonicalized()).collect();
-    save_connection_configs(state.inner(), &configs).await
+    let file_secret_updates = file_secret_updates.unwrap_or_default();
+    save_connection_configs_with_file_secrets(state.inner(), &configs, &file_secret_updates).await
 }
 
 async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig]) -> Result<(), String> {
+    save_connection_configs_with_file_secrets(state, configs, &HashMap::new()).await
+}
+
+async fn save_connection_configs_with_file_secrets(
+    state: &AppState,
+    configs: &[ConnectionConfig],
+    file_secret_updates: &HashMap<String, FileSecretUpdates>,
+) -> Result<(), String> {
     for config in configs {
         if config.db_type == DatabaseType::Sqlite {
             db::sqlite::validate_persistent_attachments(
@@ -556,7 +570,7 @@ async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig])
             )?;
         }
     }
-    state.storage.save_connections(configs).await?;
+    state.storage.save_connections_with_file_secret_updates(configs, file_secret_updates).await?;
     let sync = sync_connection_configs(state, configs).await;
     remove_connection_pools_for_connection_ids(state, &sync.connection_pool_ids_to_drop).await;
     drop_nacos_adapters_for_connection_ids(state, &sync.nacos_adapter_ids_to_drop).await;
