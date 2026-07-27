@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowLeft, ChevronLeft, Copy, Download, FilePenLine, Folder, FolderOpen, Loader2, Pencil, Plus, RefreshCw, Trash2, Unplug, Upload } from "@lucide/vue";
+import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Copy, Download, File as FileIcon, FilePenLine, FileQuestion, Folder, FolderOpen, Loader2, Pencil, Plus, RefreshCw, Trash2, Unplug, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -11,10 +12,13 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 import { formatError } from "@/lib/backend/errorUtils";
 import * as api from "@/lib/backend/api";
+import { copyToClipboard } from "@/lib/common/clipboard";
 import { executeWithProductionContextGuard } from "@/lib/database/productionExecutionGuard";
+import { treeItemPaddingLeft } from "@/lib/sidebar/sidebarTreeItemLayout";
 import type { ConnectionConfig } from "@/types/database";
 import type { FileConnection, FileConnectionImplementation, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
 import { childFilePath, displayFilePath, formatFileSize, parentFilePath } from "./filePath";
+import { flattenVisibleFileTree, normalizeFileListing } from "./fileTree";
 
 const emit = defineEmits<{
   createConnection: [implementation: FileConnectionImplementation];
@@ -32,8 +36,13 @@ const fileConnections = computed(() => connectionStore.connections.filter((conne
 const activeConnection = ref<FileConnection>();
 const currentPath = ref("");
 const entries = ref<FileEntry[]>([]);
+const expandedDirectoryPaths = ref(new Set<string>());
+const directoryChildren = ref(new Map<string, FileEntry[]>());
+const loadingDirectoryPaths = ref(new Set<string>());
+const fileTreeRows = computed(() => flattenVisibleFileTree(entries.value, expandedDirectoryPaths.value, directoryChildren.value));
 const browsing = ref(false);
 const browseError = ref("");
+let browseGeneration = 0;
 const visiblePath = computed(() => displayFilePath(currentPath.value));
 const uploadDialogOpen = ref(false);
 const uploadLocalPath = ref("");
@@ -41,7 +50,8 @@ const uploadRemotePath = ref("");
 const operationActive = ref("");
 const deleteEntryTarget = ref<FileEntry>();
 const remoteOperation = ref<{ operation: "copy" | "rename"; entry: FileEntry; destinationPath: string }>();
-const replaceRequest = ref<{ operation: "upload" | "download"; request: FileTransferRequest } | { operation: "copy" | "rename"; request: FileRemoteOperationRequest }>();
+const replaceRequest = ref<{ operation: "upload" | "download"; request: FileTransferRequest } | { operation: "copy" | "rename"; request: FileRemoteOperationRequest; sourceKind: FileEntry["kind"] }>();
+const fileContextMenuItems = ref<ContextMenuItem[]>([]);
 const replaceDestination = computed(() => {
   const pending = replaceRequest.value;
   return pending ? ("remotePath" in pending.request ? pending.request.remotePath : pending.request.destinationPath) : "";
@@ -137,8 +147,7 @@ async function openConnection(config: ConnectionConfig) {
   }
   if (!connection) throw new Error(t("fileManager.connectionNotFound"));
   activeConnection.value = connection;
-  currentPath.value = "";
-  await refreshDirectory();
+  await navigateToDirectory("");
 }
 
 async function openConnectionById(connectionId: string) {
@@ -150,28 +159,93 @@ async function openConnectionById(connectionId: string) {
 
 async function openEntry(entry: FileEntry) {
   if (entry.kind !== "directory") return;
-  currentPath.value = entry.path;
-  await refreshDirectory();
+  await navigateToDirectory(entry.path);
 }
 
 async function goUp() {
   if (!currentPath.value) return;
-  currentPath.value = parentFilePath(currentPath.value);
+  await navigateToDirectory(parentFilePath(currentPath.value));
+}
+
+function resetFileTree() {
+  browseGeneration += 1;
+  expandedDirectoryPaths.value = new Set();
+  directoryChildren.value = new Map();
+  loadingDirectoryPaths.value = new Set();
+}
+
+async function navigateToDirectory(path: string) {
+  currentPath.value = path;
+  resetFileTree();
   await refreshDirectory();
 }
 
 async function refreshDirectory() {
   const connection = activeConnection.value;
   if (!connection?.capabilities.list) return;
+  const generation = ++browseGeneration;
+  const listedPath = currentPath.value;
+  const expandedPaths = [...expandedDirectoryPaths.value];
   browsing.value = true;
   browseError.value = "";
   try {
-    entries.value = await api.listFilePath(connection.id, currentPath.value);
+    const rootEntries = normalizeFileListing(await api.listFilePath(connection.id, listedPath), listedPath);
+    if (generation !== browseGeneration || activeConnection.value?.id !== connection.id || currentPath.value !== listedPath) return;
+    entries.value = rootEntries;
+
+    const nextChildren = new Map<string, FileEntry[]>();
+    const nextExpanded = new Set<string>();
+    for (const path of expandedPaths) {
+      if (generation !== browseGeneration) return;
+      try {
+        nextChildren.set(path, normalizeFileListing(await api.listFilePath(connection.id, path), path));
+        nextExpanded.add(path);
+      } catch {
+        // A concurrently removed or renamed branch simply collapses on refresh.
+      }
+    }
+    if (generation !== browseGeneration) return;
+    directoryChildren.value = nextChildren;
+    expandedDirectoryPaths.value = nextExpanded;
   } catch (error) {
+    if (generation !== browseGeneration) return;
     browseError.value = formatError(error);
   } finally {
-    browsing.value = false;
+    if (generation === browseGeneration) browsing.value = false;
   }
+}
+
+async function toggleDirectory(entry: FileEntry) {
+  if (entry.kind !== "directory") return;
+  const expanded = new Set(expandedDirectoryPaths.value);
+  if (expanded.has(entry.path)) {
+    expanded.delete(entry.path);
+    expandedDirectoryPaths.value = expanded;
+    return;
+  }
+
+  const connection = activeConnection.value;
+  if (!connection) return;
+  if (!directoryChildren.value.has(entry.path)) {
+    const generation = browseGeneration;
+    loadingDirectoryPaths.value = new Set([...loadingDirectoryPaths.value, entry.path]);
+    try {
+      const children = normalizeFileListing(await api.listFilePath(connection.id, entry.path), entry.path);
+      if (generation !== browseGeneration || activeConnection.value?.id !== connection.id) return;
+      directoryChildren.value = new Map(directoryChildren.value).set(entry.path, children);
+    } catch (error) {
+      toast(formatError(error), 4000);
+      return;
+    } finally {
+      const loading = new Set(loadingDirectoryPaths.value);
+      loading.delete(entry.path);
+      loadingDirectoryPaths.value = loading;
+    }
+  }
+
+  if (!directoryChildren.value.has(entry.path)) return;
+  expanded.add(entry.path);
+  expandedDirectoryPaths.value = expanded;
 }
 
 async function selectUploadFile() {
@@ -246,7 +320,7 @@ async function runTransfer(operation: "upload" | "download", request: FileTransf
 }
 
 function startRemoteOperation(entry: FileEntry, operation: "copy" | "rename") {
-  if (entry.kind !== "file") return;
+  if (entry.kind === "unknown" || (operation === "copy" && entry.kind !== "file")) return;
   remoteOperation.value = {
     operation,
     entry,
@@ -259,15 +333,19 @@ async function confirmRemoteOperation() {
   const pending = remoteOperation.value;
   if (!connection || !pending || !pending.destinationPath.trim()) return;
   remoteOperation.value = undefined;
-  await runRemoteOperation(pending.operation, {
-    connectionId: connection.id,
-    sourcePath: pending.entry.path,
-    destinationPath: pending.destinationPath.trim(),
-    replace: false,
-  });
+  await runRemoteOperation(
+    pending.operation,
+    {
+      connectionId: connection.id,
+      sourcePath: pending.entry.path,
+      destinationPath: pending.destinationPath.trim(),
+      replace: false,
+    },
+    pending.entry.kind,
+  );
 }
 
-async function runRemoteOperation(operation: "copy" | "rename", request: FileRemoteOperationRequest) {
+async function runRemoteOperation(operation: "copy" | "rename", request: FileRemoteOperationRequest, sourceKind: FileEntry["kind"] = "file") {
   operationActive.value = `${operation}:${request.sourcePath}`;
   try {
     const executed = await executeWithProductionContextGuard({
@@ -284,8 +362,8 @@ async function runRemoteOperation(operation: "copy" | "rename", request: FileRem
     toast(t(operation === "copy" ? "fileManager.copySucceeded" : "fileManager.renameSucceeded"));
     await refreshDirectory();
   } catch (error) {
-    if (typeof error === "object" && error && "code" in error && error.code === "already_exists") {
-      replaceRequest.value = { operation, request: { ...request, replace: true } };
+    if (sourceKind !== "directory" && typeof error === "object" && error && "code" in error && error.code === "already_exists") {
+      replaceRequest.value = { operation, request: { ...request, replace: true }, sourceKind };
     } else {
       toast(formatFileOperationError(error), 6000);
     }
@@ -314,10 +392,10 @@ async function confirmReplace() {
       await runTransfer("download", pending.request);
       break;
     case "copy":
-      await runRemoteOperation("copy", pending.request);
+      await runRemoteOperation("copy", pending.request, pending.sourceKind);
       break;
     case "rename":
-      await runRemoteOperation("rename", pending.request);
+      await runRemoteOperation("rename", pending.request, pending.sourceKind);
       break;
   }
 }
@@ -352,7 +430,52 @@ function closeBrowser() {
   activeConnection.value = undefined;
   currentPath.value = "";
   entries.value = [];
+  resetFileTree();
   browseError.value = "";
+}
+
+function copyEntryText(value: string) {
+  void copyToClipboard(value)
+    .then(() => toast(t("fileManager.copied"), 2000))
+    .catch((error) => toast(formatError(error), 4000));
+}
+
+function buildFileContextMenu(entry: FileEntry): ContextMenuItem[] {
+  const connection = activeConnection.value;
+  if (!connection) return [];
+  const items: ContextMenuItem[] = [];
+
+  if (entry.kind === "directory") {
+    items.push({ label: t("fileManager.open"), icon: FolderOpen, action: () => void openEntry(entry) });
+    items.push({
+      label: t(expandedDirectoryPaths.value.has(entry.path) ? "fileManager.collapseFolder" : "fileManager.expandFolder"),
+      icon: expandedDirectoryPaths.value.has(entry.path) ? ChevronDown : ChevronRight,
+      action: () => void toggleDirectory(entry),
+    });
+  } else if (entry.kind === "file" && connection.capabilities.read) {
+    items.push({ label: t("fileManager.download"), icon: Download, disabled: !!operationActive.value, action: () => void startDownload(entry) });
+  }
+
+  if (entry.kind === "file" && connection.capabilities.copy) {
+    items.push({ label: t("fileManager.copy"), icon: Copy, disabled: !!operationActive.value, action: () => startRemoteOperation(entry, "copy") });
+  }
+  if (entry.kind !== "unknown" && connection.capabilities.rename) {
+    items.push({ label: t("fileManager.rename"), icon: FilePenLine, disabled: !!operationActive.value, action: () => startRemoteOperation(entry, "rename") });
+  }
+  items.push({ label: "", separator: true });
+  items.push({ label: t("contextMenu.copyName"), icon: Copy, action: () => copyEntryText(entry.name) });
+  items.push({ label: t("fileManager.copyPath"), icon: Copy, action: () => copyEntryText(entry.path) });
+  if (connection.capabilities.delete) {
+    items.push({ label: "", separator: true });
+    items.push({ label: t("common.delete"), icon: Trash2, variant: "destructive", disabled: !!operationActive.value, action: () => (deleteEntryTarget.value = entry) });
+  }
+  return items;
+}
+
+function openFileContextMenu(event: MouseEvent, entry: FileEntry, openContextMenu: (event: MouseEvent, itemsOverride?: ContextMenuItem[]) => void) {
+  const items = buildFileContextMenu(entry);
+  fileContextMenuItems.value = items;
+  openContextMenu(event, items);
 }
 
 async function removeConnection() {
@@ -412,55 +535,90 @@ defineExpose({ createConnection, openConnectionById });
         </div>
 
         <div v-if="browseError" role="alert" class="border-b px-3 py-2 text-sm text-destructive">{{ browseError }}</div>
-        <div class="min-h-0 flex-1 overflow-auto">
-          <table class="w-full table-fixed text-sm">
-            <thead class="sticky top-0 bg-muted/70 text-left text-xs text-muted-foreground">
-              <tr>
-                <th class="px-3 py-2 font-medium">{{ t("fileManager.fileName") }}</th>
-                <th class="w-28 px-3 py-2 font-medium">{{ t("fileManager.type") }}</th>
-                <th class="w-28 px-3 py-2 text-right font-medium">{{ t("fileManager.size") }}</th>
-                <th class="w-48 px-3 py-2 font-medium">{{ t("fileManager.modified") }}</th>
-                <th class="w-36 px-3 py-2 text-right font-medium">{{ t("fileManager.actions") }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="entry in entries" :key="entry.path" class="border-b" :class="{ 'cursor-pointer hover:bg-muted/50': entry.kind === 'directory' }" @dblclick="openEntry(entry)">
-                <td class="px-3 py-2">
-                  <button v-if="entry.kind === 'directory'" class="flex min-w-0 items-center gap-2" @click="openEntry(entry)">
-                    <Folder class="h-4 w-4 shrink-0 text-amber-500" />
-                    <span class="truncate">{{ entry.name }}</span>
-                  </button>
-                  <span v-else class="block truncate pl-6">{{ entry.name }}</span>
-                </td>
-                <td class="px-3 py-2 text-muted-foreground">{{ t(`fileManager.kind.${entry.kind}`) }}</td>
-                <td class="px-3 py-2 text-right tabular-nums text-muted-foreground">{{ entry.kind === "file" ? formatFileSize(entry.size) : "—" }}</td>
-                <td class="truncate px-3 py-2 text-muted-foreground">{{ entry.modifiedAt ? new Date(entry.modifiedAt).toLocaleString() : "—" }}</td>
-                <td class="px-3 py-1 text-right">
-                  <Button v-if="entry.kind === 'file' && activeConnection.capabilities.copy" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.copy')" @click="startRemoteOperation(entry, 'copy')">
-                    <Loader2 v-if="operationActive === `copy:${entry.path}`" class="h-4 w-4 animate-spin" />
-                    <Copy v-else class="h-4 w-4" />
-                  </Button>
-                  <Button v-if="entry.kind === 'file' && activeConnection.capabilities.rename" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.rename')" @click="startRemoteOperation(entry, 'rename')">
-                    <Loader2 v-if="operationActive === `rename:${entry.path}`" class="h-4 w-4 animate-spin" />
-                    <FilePenLine v-else class="h-4 w-4" />
-                  </Button>
-                  <Button v-if="entry.kind === 'file' && activeConnection.capabilities.read" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.download')" @click="startDownload(entry)">
-                    <Loader2 v-if="operationActive === `download:${entry.path}`" class="h-4 w-4 animate-spin" />
-                    <Download v-else class="h-4 w-4" />
-                  </Button>
-                  <Button v-if="activeConnection.capabilities.delete" variant="ghost" size="icon" class="h-7 w-7 text-destructive" :disabled="!!operationActive" :title="t('common.delete')" @click="deleteEntryTarget = entry">
-                    <Loader2 v-if="operationActive === `delete:${entry.path}`" class="h-4 w-4 animate-spin" />
-                    <Trash2 v-else class="h-4 w-4" />
-                  </Button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-if="browsing && entries.length === 0" class="flex h-36 items-center justify-center text-muted-foreground">
-            <Loader2 class="h-5 w-5 animate-spin" />
+        <CustomContextMenu :items="fileContextMenuItems" v-slot="contextMenuSlot">
+          <div class="min-h-0 flex-1 overflow-auto">
+            <table class="w-full table-fixed text-sm">
+              <thead class="sticky top-0 z-[1] bg-muted/70 text-left text-xs text-muted-foreground">
+                <tr>
+                  <th class="px-3 py-2 font-medium">{{ t("fileManager.fileName") }}</th>
+                  <th class="w-28 px-3 py-2 font-medium">{{ t("fileManager.type") }}</th>
+                  <th class="w-28 px-3 py-2 text-right font-medium">{{ t("fileManager.size") }}</th>
+                  <th class="w-48 px-3 py-2 font-medium">{{ t("fileManager.modified") }}</th>
+                  <th class="w-36 px-3 py-2 text-right font-medium">{{ t("fileManager.actions") }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-if="currentPath" data-file-parent-row class="cursor-pointer border-b hover:bg-muted/50" @click="goUp">
+                  <td class="px-3 py-2">
+                    <span class="flex min-w-0 items-center gap-2">
+                      <ChevronLeft class="h-4 w-4 shrink-0 text-muted-foreground" />
+                      <FolderOpen class="h-4 w-4 shrink-0 text-amber-500" />
+                      <span class="truncate">../</span>
+                    </span>
+                  </td>
+                  <td class="px-3 py-2 text-muted-foreground">{{ t("fileManager.kind.directory") }}</td>
+                  <td class="px-3 py-2" />
+                  <td class="px-3 py-2" />
+                  <td class="px-3 py-2" />
+                </tr>
+                <tr v-for="row in fileTreeRows" :key="row.entry.path" :data-file-entry-path="row.entry.path" :data-file-entry-kind="row.entry.kind" class="border-b hover:bg-muted/50" @contextmenu="(event) => openFileContextMenu(event, row.entry, contextMenuSlot.onContextMenu)">
+                  <td class="py-2 pr-3" :style="{ paddingLeft: treeItemPaddingLeft(row.depth) }">
+                    <span class="flex min-w-0 items-center gap-1.5">
+                      <button
+                        v-if="row.entry.kind === 'directory'"
+                        type="button"
+                        class="flex h-5 w-5 shrink-0 items-center justify-center text-muted-foreground hover:text-foreground"
+                        :title="t(expandedDirectoryPaths.has(row.entry.path) ? 'fileManager.collapseFolder' : 'fileManager.expandFolder')"
+                        :aria-expanded="expandedDirectoryPaths.has(row.entry.path)"
+                        @click.stop="toggleDirectory(row.entry)"
+                      >
+                        <Loader2 v-if="loadingDirectoryPaths.has(row.entry.path)" class="h-3.5 w-3.5 animate-spin" />
+                        <ChevronDown v-else-if="expandedDirectoryPaths.has(row.entry.path)" class="h-3.5 w-3.5" />
+                        <ChevronRight v-else class="h-3.5 w-3.5" />
+                      </button>
+                      <span v-else class="h-5 w-5 shrink-0" />
+                      <button v-if="row.entry.kind === 'directory'" type="button" class="flex min-w-0 items-center gap-2 text-left" @click="openEntry(row.entry)">
+                        <FolderOpen v-if="expandedDirectoryPaths.has(row.entry.path)" class="h-4 w-4 shrink-0 text-amber-500" />
+                        <Folder v-else class="h-4 w-4 shrink-0 text-amber-500" />
+                        <span class="truncate">{{ row.entry.name }}</span>
+                      </button>
+                      <span v-else class="flex min-w-0 items-center gap-2">
+                        <FileIcon v-if="row.entry.kind === 'file'" class="h-4 w-4 shrink-0 text-muted-foreground" />
+                        <FileQuestion v-else class="h-4 w-4 shrink-0 text-muted-foreground" />
+                        <span class="truncate">{{ row.entry.name }}</span>
+                      </span>
+                    </span>
+                  </td>
+                  <td class="px-3 py-2 text-muted-foreground">{{ t(`fileManager.kind.${row.entry.kind}`) }}</td>
+                  <td class="px-3 py-2 text-right tabular-nums text-muted-foreground">{{ row.entry.kind === "file" ? formatFileSize(row.entry.size) : "—" }}</td>
+                  <td class="truncate px-3 py-2 text-muted-foreground">{{ row.entry.modifiedAt ? new Date(row.entry.modifiedAt).toLocaleString() : "—" }}</td>
+                  <td class="px-3 py-1 text-right">
+                    <Button v-if="row.entry.kind === 'file' && activeConnection.capabilities.copy" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.copy')" @click="startRemoteOperation(row.entry, 'copy')">
+                      <Loader2 v-if="operationActive === `copy:${row.entry.path}`" class="h-4 w-4 animate-spin" />
+                      <Copy v-else class="h-4 w-4" />
+                    </Button>
+                    <Button v-if="row.entry.kind !== 'unknown' && activeConnection.capabilities.rename" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.rename')" @click="startRemoteOperation(row.entry, 'rename')">
+                      <Loader2 v-if="operationActive === `rename:${row.entry.path}`" class="h-4 w-4 animate-spin" />
+                      <FilePenLine v-else class="h-4 w-4" />
+                    </Button>
+                    <Button v-if="row.entry.kind === 'file' && activeConnection.capabilities.read" variant="ghost" size="icon" class="h-7 w-7" :disabled="!!operationActive" :title="t('fileManager.download')" @click="startDownload(row.entry)">
+                      <Loader2 v-if="operationActive === `download:${row.entry.path}`" class="h-4 w-4 animate-spin" />
+                      <Download v-else class="h-4 w-4" />
+                    </Button>
+                    <Button v-if="activeConnection.capabilities.delete" variant="ghost" size="icon" class="h-7 w-7 text-destructive" :disabled="!!operationActive" :title="t('common.delete')" @click="deleteEntryTarget = row.entry">
+                      <Loader2 v-if="operationActive === `delete:${row.entry.path}`" class="h-4 w-4 animate-spin" />
+                      <Trash2 v-else class="h-4 w-4" />
+                    </Button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-if="browsing && entries.length === 0" class="flex h-36 items-center justify-center text-muted-foreground">
+              <Loader2 class="h-5 w-5 animate-spin" />
+            </div>
+            <p v-else-if="!browseError && entries.length === 0" class="p-6 text-center text-sm text-muted-foreground">{{ t("fileManager.emptyDirectory") }}</p>
           </div>
-          <p v-else-if="!browseError && entries.length === 0" class="p-6 text-center text-sm text-muted-foreground">{{ t("fileManager.emptyDirectory") }}</p>
-        </div>
+        </CustomContextMenu>
       </template>
 
       <template v-else>
@@ -563,7 +721,8 @@ defineExpose({ createConnection, openConnectionById });
           </div>
           <div class="border-l-2 border-amber-500 bg-amber-500/10 px-3 py-2 text-xs text-muted-foreground">
             <p v-if="remoteOperation?.operation === 'copy' && activeConnection?.capabilities.copyMode === 'stream_relay'">{{ t("fileManager.streamRelayNotice") }}</p>
-            <p v-if="remoteOperation?.operation === 'rename' && activeConnection?.capabilities.renameMode === 'copy_delete'">{{ t("fileManager.nonAtomicRenameNotice") }}</p>
+            <p v-if="remoteOperation?.operation === 'rename' && remoteOperation.entry.kind === 'directory'">{{ t("fileManager.directoryRenameNotice") }}</p>
+            <p v-else-if="remoteOperation?.operation === 'rename' && activeConnection?.capabilities.renameMode === 'copy_delete'">{{ t("fileManager.nonAtomicRenameNotice") }}</p>
             <p v-if="!activeConnection?.capabilities.atomicNoClobber">{{ t("fileManager.bestEffortNoClobberNotice") }}</p>
           </div>
         </div>

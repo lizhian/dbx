@@ -16,12 +16,15 @@ const { copyFilePath, deleteFilePath, disconnectDb, downloadFile, executeWithPro
   downloadFile: vi.fn(async (_request: unknown) => 11),
   executeWithProductionContextGuard: vi.fn(async (options: { execute: () => Promise<unknown> }) => options.execute()),
   listFilePath: vi.fn(async (_connectionId: string, path: string) =>
-    path
-      ? []
-      : [
-          { path: "folder", name: "folder", kind: "directory", size: 0 },
-          { path: "fixture.txt", name: "fixture.txt", kind: "file", size: 1536, modifiedAt: "2026-07-27T00:00:00Z" },
-        ],
+    path === "folder"
+      ? [{ path: "folder/child.txt", name: "child.txt", kind: "file", size: 7 }]
+      : path
+        ? []
+        : [
+            { path: "/", name: "/", kind: "directory", size: 0 },
+            { path: "folder", name: "folder", kind: "directory", size: 0 },
+            { path: "fixture.txt", name: "fixture.txt", kind: "file", size: 1536, modifiedAt: "2026-07-27T00:00:00Z" },
+          ],
   ),
   renameFilePath: vi.fn(async (_request: unknown) => undefined),
   uploadFile: vi.fn(async (_request: unknown) => 11),
@@ -156,6 +159,10 @@ function buttonWithTitle(title: string): HTMLButtonElement | undefined {
   return Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.title === title);
 }
 
+function entryRow(path: string): HTMLTableRowElement | null {
+  return document.querySelector<HTMLTableRowElement>(`tr[data-file-entry-path="${path}"]`);
+}
+
 afterEach(() => {
   for (const app of mountedApps.splice(0)) app.unmount();
   document.body.innerHTML = "";
@@ -188,16 +195,54 @@ describe("FileManagerPage browsing", () => {
     expect(document.body.textContent).toContain("fixture.txt");
     expect(document.body.textContent).toContain("1.5 KiB");
     expect(document.body.textContent).toContain("/");
+    expect(entryRow("")).toBeNull();
+    expect(document.querySelector('tr[data-file-entry-path="/"]')).toBeNull();
+    expect(entryRow("fixture.txt")?.querySelector("svg")).not.toBeNull();
 
     const folderButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("folder"));
     folderButton?.click();
     await flushPage();
     expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "folder");
     expect(document.body.textContent).toContain("/folder");
+    expect(document.querySelector("tbody tr:first-child")?.textContent).toContain("../");
 
-    buttonWithTitle("Up")?.click();
+    document.querySelector<HTMLElement>("[data-file-parent-row]")?.click();
     await flushPage();
     expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "");
+  });
+
+  it("expands folders inline without changing the current directory", async () => {
+    await mountPage();
+    buttonWithTitle("Open")?.click();
+    await flushPage();
+
+    entryRow("folder")?.querySelector<HTMLButtonElement>('button[title="Expand folder"]')?.click();
+    await flushPage();
+
+    expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "folder");
+    expect(entryRow("folder/child.txt")).not.toBeNull();
+    expect(entryRow("folder/child.txt")?.firstElementChild?.getAttribute("style")).toContain("24px");
+    expect(document.body.textContent).toContain("/");
+    expect(document.querySelector("[data-file-parent-row]")).toBeNull();
+  });
+
+  it("opens shared right-click actions for files and folders", async () => {
+    await mountPage();
+    buttonWithTitle("Open")?.click();
+    await flushPage();
+
+    entryRow("folder")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 20, clientY: 20 }));
+    await flushPage();
+    expect(document.body.textContent).toContain("Expand folder");
+    expect(document.body.textContent).toContain("Rename or move");
+    expect(document.body.textContent).toContain("Copy path");
+
+    document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
+    entryRow("fixture.txt")?.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 30, clientY: 30 }));
+    await flushPage();
+    expect(document.body.textContent).toContain("Download");
+    expect(document.body.textContent).toContain("Copy");
+    expect(document.body.textContent).toContain("Delete");
   });
 
   it("keeps root as the highest visible path", () => {
@@ -374,7 +419,7 @@ describe("FileManagerPage browsing", () => {
     buttonWithTitle("Open")?.click();
     await flushPage();
 
-    buttonWithTitle("Rename or move")?.click();
+    entryRow("fixture.txt")?.querySelector<HTMLButtonElement>('button[title="Rename or move"]')?.click();
     await flushPage();
     expect(document.body.textContent).toContain("non-atomic");
     const destination = document.querySelector<HTMLInputElement>("#file-operation-destination-path");
@@ -394,5 +439,31 @@ describe("FileManagerPage browsing", () => {
       replace: false,
     });
     expect(useToast().message.value).toContain("Delete the source manually.");
+  });
+
+  it("renames or moves folders through the same operation flow", async () => {
+    await mountPage();
+    buttonWithTitle("Open")?.click();
+    await flushPage();
+
+    entryRow("folder")?.querySelector<HTMLButtonElement>('button[title="Rename or move"]')?.click();
+    await flushPage();
+    expect(document.body.textContent).toContain("Folder moves are non-atomic");
+    const destination = document.querySelector<HTMLInputElement>("#file-operation-destination-path");
+    if (destination) {
+      destination.value = "moved-folder";
+      destination.dispatchEvent(new Event("input"));
+    }
+    await flushPage();
+    const renameButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Rename or move");
+    renameButton?.click();
+    await flushPage();
+
+    expect(renameFilePath).toHaveBeenCalledWith({
+      connectionId: "ftp-local",
+      sourcePath: "folder",
+      destinationPath: "moved-folder",
+      replace: false,
+    });
   });
 });

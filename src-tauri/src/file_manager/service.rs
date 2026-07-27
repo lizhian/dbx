@@ -276,20 +276,7 @@ pub async fn list_path(storage: &Storage, connection_id: &str, path: &str) -> Re
     let directory = if path.is_empty() { String::new() } else { format!("{path}/") };
     let operator = operator_for_connection(storage, connection_id).await?;
     let entries = with_operation_timeout(operator.list(&directory)).await?;
-    let mut result = entries
-        .into_iter()
-        .filter(|entry| entry.path() != directory)
-        .map(|entry| {
-            let path = validate_remote_path(entry.path())?;
-            Ok(entry_from_metadata(&path, entry.metadata()))
-        })
-        .collect::<Result<Vec<_>, FileManagerError>>()?;
-    result.sort_by(|left, right| {
-        let left_directory = left.kind == FileEntryKind::Directory;
-        let right_directory = right.kind == FileEntryKind::Directory;
-        right_directory.cmp(&left_directory).then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
-    Ok(result)
+    entries_from_listing(&directory, entries)
 }
 
 pub async fn list_path_cached(
@@ -440,14 +427,17 @@ pub(crate) async fn with_configured_timeout<T>(
 }
 
 fn entries_from_listing(directory: &str, entries: Vec<opendal::Entry>) -> Result<Vec<FileEntry>, FileManagerError> {
-    let mut result = entries
-        .into_iter()
-        .filter(|entry| entry.path() != directory)
-        .map(|entry| {
-            let path = validate_remote_path(entry.path())?;
-            Ok(entry_from_metadata(&path, entry.metadata()))
-        })
-        .collect::<Result<Vec<_>, FileManagerError>>()?;
+    let listed_path = directory.trim_end_matches('/');
+    let mut result = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let path = validate_remote_path(entry.path())?;
+        // Some services include "/" or the listed directory itself in list
+        // results. They are navigation context, not child entries.
+        if path.is_empty() || path == listed_path {
+            continue;
+        }
+        result.push(entry_from_metadata(&path, entry.metadata()));
+    }
     result.sort_by(|left, right| {
         let left_directory = left.kind == FileEntryKind::Directory;
         let right_directory = right.kind == FileEntryKind::Directory;
@@ -499,10 +489,11 @@ fn public_connection(stored: StoredFileConnection, secret_status: FileSecretStat
 #[cfg(test)]
 mod tests {
     use dbx_core::storage::Storage;
+    use opendal::{services, Operator};
 
     use super::{
-        delete_connection, list_connections, list_path, operator_for_connection, save_connection, stat_path,
-        test_connection, validate_remote_path,
+        delete_connection, entries_from_listing, list_connections, list_path, operator_for_connection, save_connection,
+        stat_path, test_connection, validate_remote_path,
     };
     use crate::file_manager::models::{
         FileConnectionConfig, FileSecretUpdates, HdfsConfig, SaveFileConnectionRequest, SecretUpdate,
@@ -512,6 +503,18 @@ mod tests {
     async fn storage(label: &str) -> Storage {
         let path = std::env::temp_dir().join(format!("dbx-file-manager-{label}-{}.db", uuid::Uuid::new_v4()));
         Storage::open(&path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn listing_omits_root_and_current_directory_entries() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        operator.create_dir("folder/").await.unwrap();
+        operator.write("folder/child.txt", "child").await.unwrap();
+
+        let root = entries_from_listing("", operator.list("").await.unwrap()).unwrap();
+        assert!(root.iter().all(|entry| !entry.path.is_empty() && entry.name != "/"));
+        let folder = entries_from_listing("folder/", operator.list("folder/").await.unwrap()).unwrap();
+        assert_eq!(folder.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(), ["folder/child.txt"]);
     }
 
     fn ftp_request(id: &str, password: SecretUpdate) -> SaveFileConnectionRequest {

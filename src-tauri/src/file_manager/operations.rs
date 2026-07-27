@@ -1,7 +1,8 @@
 use dbx_core::connection::AppState;
 #[cfg(test)]
 use dbx_core::storage::Storage;
-use opendal::{ErrorKind, Operator};
+use futures::TryStreamExt;
+use opendal::{EntryMode, Operator};
 use std::future::Future;
 use std::time::Duration;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
@@ -84,18 +85,106 @@ async fn rename_with_cached_operator(
     let source = non_root_remote_path(&request.source_path)?;
     let destination = destination_path(&source, &request.destination_path)?;
     let _permits = state.acquire(&request.connection_id).await?;
+    rename_with_operator(&operator, &source, &destination, request.replace, timeout).await
+}
+
+async fn rename_with_operator(
+    operator: &Operator,
+    source: &str,
+    destination: &str,
+    replace: bool,
+    timeout: Option<Duration>,
+) -> Result<(), FileManagerError> {
+    if source_is_directory(operator, source).await? {
+        return rename_directory_with_optional_timeout(operator, source, destination, replace, timeout).await;
+    }
+
     if operator.info().full_capability().rename {
         transfer_with_configured_timeout(timeout, async {
-            ensure_source_file(&operator, &source).await?;
-            ensure_destination(&operator, &destination, request.replace).await?;
-            operator.rename(&source, &destination).await.map_err(map_operation_error)
+            ensure_source_file(operator, source).await?;
+            ensure_destination(operator, destination, replace).await?;
+            operator.rename(source, destination).await.map_err(map_operation_error)
         })
         .await
     } else {
-        fallback_rename_with_optional_timeout(&operator, &source, &destination, request.replace, timeout, || {
-            operator.delete(&source)
+        fallback_rename_with_optional_timeout(operator, source, destination, replace, timeout, || {
+            operator.delete(source)
         })
         .await
+    }
+}
+
+async fn rename_directory_with_optional_timeout(
+    operator: &Operator,
+    source: &str,
+    destination: &str,
+    replace: bool,
+    timeout: Option<Duration>,
+) -> Result<(), FileManagerError> {
+    if destination.starts_with(&format!("{source}/")) {
+        return Err(FileManagerError::configuration("A folder cannot be moved inside itself"));
+    }
+    if remote_path_exists(operator, destination).await? {
+        return if replace {
+            Err(FileManagerError::new("unsupported", "A folder move cannot replace an existing destination"))
+        } else {
+            Err(FileManagerError::new("already_exists", "The remote destination already exists"))
+        };
+    }
+
+    let source_directory = format!("{source}/");
+    let destination_directory = format!("{destination}/");
+    let mut destination_created = false;
+    let operation = async {
+        operator.create_dir(&destination_directory).await.map_err(map_operation_error)?;
+        destination_created = true;
+
+        let mut lister = operator
+            .lister_with(&source_directory)
+            .recursive(true)
+            .await
+            .map_err(|_| partial_directory_rename_error(source, destination))?;
+        while let Some(entry) =
+            lister.try_next().await.map_err(|_| partial_directory_rename_error(source, destination))?
+        {
+            let entry_path = entry.path().trim_end_matches('/');
+            if entry_path == source {
+                continue;
+            }
+            let relative = entry_path
+                .strip_prefix(&source_directory)
+                .ok_or_else(|| partial_directory_rename_error(source, destination))?;
+            let destination_entry = format!("{destination_directory}{relative}");
+            match entry.metadata().mode() {
+                EntryMode::DIR => {
+                    operator
+                        .create_dir(&format!("{destination_entry}/"))
+                        .await
+                        .map_err(|_| partial_directory_rename_error(source, destination))?;
+                }
+                EntryMode::FILE => {
+                    copy_with_operator(operator, entry_path, &destination_entry, false)
+                        .await
+                        .map_err(|_| partial_directory_rename_error(source, destination))?;
+                }
+                EntryMode::Unknown => return Err(partial_directory_rename_error(source, destination)),
+            }
+        }
+
+        operator
+            .delete_with(&source_directory)
+            .recursive(true)
+            .await
+            .map_err(|_| partial_directory_rename_error(source, destination))
+    };
+
+    match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => result,
+            Err(_) if destination_created => Err(partial_directory_rename_error(source, destination)),
+            Err(_) => Err(FileManagerError::new("timeout", "The file transfer timed out")),
+        },
+        None => operation.await,
     }
 }
 
@@ -194,19 +283,38 @@ async fn stream_copy(
 }
 
 async fn ensure_source_file(operator: &Operator, source: &str) -> Result<(), FileManagerError> {
+    if source_is_directory(operator, source).await? {
+        Err(FileManagerError::new("unsupported", "Only files can be copied"))
+    } else {
+        Ok(())
+    }
+}
+
+async fn source_is_directory(operator: &Operator, source: &str) -> Result<bool, FileManagerError> {
     let metadata = match operator.stat(source).await {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => match operator.stat(&format!("{source}/")).await {
+        Err(error) => match operator.stat(&format!("{source}/")).await {
             Ok(metadata) => metadata,
             Err(_) => return Err(map_operation_error(error)),
         },
-        Err(error) => return Err(map_operation_error(error)),
     };
-    if metadata.is_file() {
-        Ok(())
+    if metadata.is_dir() {
+        Ok(true)
+    } else if metadata.is_file() {
+        Ok(false)
     } else {
-        Err(FileManagerError::new("unsupported", "Only files can be copied or renamed in this version"))
+        Err(FileManagerError::new("unsupported", "This entry type cannot be copied or renamed"))
     }
+}
+
+async fn remote_path_exists(operator: &Operator, path: &str) -> Result<bool, FileManagerError> {
+    if operator.exists(path).await.map_err(map_operation_error)?
+        || operator.exists(&format!("{path}/")).await.map_err(map_operation_error)?
+    {
+        return Ok(true);
+    }
+    let mut lister = operator.lister_with(&format!("{path}/")).limit(1).await.map_err(map_operation_error)?;
+    lister.try_next().await.map(|entry| entry.is_some()).map_err(map_operation_error)
 }
 
 async fn ensure_destination(operator: &Operator, destination: &str, replace: bool) -> Result<(), FileManagerError> {
@@ -243,6 +351,50 @@ fn partial_rename_error(source: &str, destination: &str) -> FileManagerError {
     error
 }
 
+fn partial_directory_rename_error(source: &str, destination: &str) -> FileManagerError {
+    let mut error = FileManagerError::new(
+        "partial_success",
+        "The folder move did not complete; the source remains and the destination may be incomplete",
+    );
+    error.recovery = Some(format!("Keep '{source}', inspect or remove '{destination}', then retry the folder move."));
+    error
+}
+
+#[cfg(test)]
+pub(crate) async fn assert_folder_rename_contract(
+    storage: &Storage,
+    state: &FileTransferState,
+    connection_id: &str,
+    prefix: &str,
+) {
+    let operator = operator_for_connection(storage, connection_id).await.unwrap();
+    let source = format!("{prefix}-folder");
+    let nested = format!("{source}/nested");
+    let destination = format!("{prefix}-folder-moved");
+    operator.create_dir(&format!("{source}/")).await.unwrap();
+    operator.create_dir(&format!("{nested}/")).await.unwrap();
+    operator.write(&format!("{source}/root.txt"), "root").await.unwrap();
+    operator.write(&format!("{nested}/child.txt"), "child").await.unwrap();
+
+    rename(
+        storage,
+        state,
+        FileRemoteOperationRequest {
+            connection_id: connection_id.to_string(),
+            source_path: source.clone(),
+            destination_path: destination.clone(),
+            replace: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(operator.read(&format!("{destination}/root.txt")).await.unwrap().to_vec(), b"root");
+    assert_eq!(operator.read(&format!("{destination}/nested/child.txt")).await.unwrap().to_vec(), b"child");
+    assert!(!operator.exists(&format!("{source}/root.txt")).await.unwrap());
+    operator.delete_with(&format!("{destination}/")).recursive(true).await.unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -252,7 +404,10 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{copy, copy_with_operator, fallback_rename_with_delete, rename};
+    use super::{
+        assert_folder_rename_contract, copy, copy_with_operator, fallback_rename_with_delete, rename,
+        rename_with_operator,
+    };
     use crate::file_manager::models::{
         FileConnectionConfig, FileManagerError, FileRemoteOperationRequest, FileSecretUpdates, FileTransferRequest,
         SaveFileConnectionRequest, SecretUpdate,
@@ -292,6 +447,36 @@ mod tests {
             copy_with_operator(&operator, "folder", "folder-copy", false).await.unwrap_err().code,
             "unsupported"
         );
+    }
+
+    #[tokio::test]
+    async fn folder_rename_moves_nested_entries_with_bounded_fallback() {
+        let operator = Operator::new(services::Memory::default()).unwrap().finish();
+        operator.create_dir("folder/").await.unwrap();
+        operator.create_dir("folder/nested/").await.unwrap();
+        operator.write("folder/root.txt", "root").await.unwrap();
+        operator.write("folder/nested/child.txt", "child").await.unwrap();
+
+        operator.create_dir("moved/").await.unwrap();
+        let collision =
+            rename_with_operator(&operator, "folder", "moved", false, Some(Duration::from_secs(1))).await.unwrap_err();
+        assert_eq!(collision.code, "already_exists");
+        assert!(operator.exists("folder/root.txt").await.unwrap());
+        operator.delete_with("moved/").recursive(true).await.unwrap();
+
+        let descendant =
+            rename_with_operator(&operator, "folder", "folder/nested/moved", false, Some(Duration::from_secs(1)))
+                .await
+                .unwrap_err();
+        assert_eq!(descendant.code, "configuration");
+        assert!(operator.exists("folder/root.txt").await.unwrap());
+
+        rename_with_operator(&operator, "folder", "moved", false, Some(Duration::from_secs(1))).await.unwrap();
+
+        assert_eq!(operator.read("moved/root.txt").await.unwrap().to_vec(), b"root");
+        assert_eq!(operator.read("moved/nested/child.txt").await.unwrap().to_vec(), b"child");
+        assert!(!operator.exists("folder/root.txt").await.unwrap());
+        assert!(!operator.exists("folder/nested/child.txt").await.unwrap());
     }
 
     #[tokio::test]
@@ -464,6 +649,7 @@ mod tests {
             .code,
             "unsupported"
         );
+        assert_folder_rename_contract(&storage, &state, "ftp-operations", &format!("folder-move-{suffix}")).await;
 
         delete(&storage, &state, "ftp-operations", &source).await.unwrap();
         delete(&storage, &state, "ftp-operations", &renamed).await.unwrap();

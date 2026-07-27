@@ -194,6 +194,8 @@ mod unix {
         .await
         .unwrap();
         assert_eq!(tokio::fs::read(&local_download).await.unwrap(), b"SFTP seven-operation contract");
+        operations::assert_folder_rename_contract(storage, &state, "sftp-contract", &format!("folder-move-{suffix}"))
+            .await;
 
         transfer::delete(storage, &state, "sftp-contract", &source).await.unwrap();
         transfer::delete(storage, &state, "sftp-contract", &renamed).await.unwrap();
@@ -375,6 +377,8 @@ mod s3 {
         .await
         .unwrap();
         assert_eq!(tokio::fs::read(&local_download).await.unwrap(), b"S3 seven-operation contract");
+        operations::assert_folder_rename_contract(&storage, &state, "s3-contract", &format!("folder-move-{suffix}"))
+            .await;
 
         transfer::delete(&storage, &state, "s3-contract", &source).await.unwrap();
         transfer::delete(&storage, &state, "s3-contract", &renamed).await.unwrap();
@@ -525,6 +529,13 @@ mod webdav {
         .await
         .unwrap();
         assert_eq!(tokio::fs::read(&local_download).await.unwrap(), b"WebDAV seven-operation contract");
+        operations::assert_folder_rename_contract(
+            &storage,
+            &state,
+            "webdav-contract",
+            &format!("folder-move-{suffix}"),
+        )
+        .await;
 
         transfer::delete(&storage, &state, "webdav-contract", &source).await.unwrap();
         transfer::delete(&storage, &state, "webdav-contract", &renamed).await.unwrap();
@@ -673,6 +684,13 @@ mod webhdfs {
         .await
         .unwrap();
         assert_eq!(tokio::fs::read(&local_download).await.unwrap(), b"WebHDFS seven-operation contract");
+        operations::assert_folder_rename_contract(
+            &storage,
+            &state,
+            "webhdfs-contract",
+            &format!("folder-move-{suffix}"),
+        )
+        .await;
 
         transfer::delete(&storage, &state, "webhdfs-contract", &source).await.unwrap();
         transfer::delete(&storage, &state, "webhdfs-contract", &renamed).await.unwrap();
@@ -825,6 +843,13 @@ mod hdfs_native {
         .await
         .unwrap();
         assert_eq!(tokio::fs::read(&local_download).await.unwrap(), b"HDFS Native seven-operation contract");
+        operations::assert_folder_rename_contract(
+            &storage,
+            &state,
+            "hdfs-native-contract",
+            &format!("folder-move-{suffix}"),
+        )
+        .await;
 
         transfer::delete(&storage, &state, "hdfs-native-contract", &source).await.unwrap();
         transfer::delete(&storage, &state, "hdfs-native-contract", &renamed).await.unwrap();
