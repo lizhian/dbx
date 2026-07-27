@@ -27,6 +27,7 @@ pub mod db_admin_sql;
 pub mod document_ops;
 pub mod driver_runtime;
 pub mod external;
+pub mod file_connection_config;
 pub mod history;
 pub mod jdbc;
 pub mod models;

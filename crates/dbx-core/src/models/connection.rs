@@ -530,6 +530,10 @@ pub enum DatabaseType {
     /// system is determined by `external_config.systemKind`.
     #[serde(rename = "mq")]
     MessageQueue,
+    /// Desktop File Manager connection. The concrete protocol is selected by
+    /// `driver_profile` and the typed discriminator in `external_config`.
+    #[serde(rename = "file")]
+    FileManager,
 }
 
 #[derive(Deserialize)]
@@ -1066,6 +1070,7 @@ impl ConnectionConfig {
             DatabaseType::Jdbc => "jdbc:<redacted>".to_string(),
             DatabaseType::MessageQueue => self.message_queue_admin_url(),
             DatabaseType::Nacos => self.nacos_admin_url(),
+            DatabaseType::FileManager => self.file_manager_endpoint(),
         }
     }
 
@@ -1294,6 +1299,7 @@ impl ConnectionConfig {
             }
             DatabaseType::MessageQueue => self.message_queue_admin_url(),
             DatabaseType::Nacos => self.nacos_admin_url(),
+            DatabaseType::FileManager => self.file_manager_endpoint(),
         }
     }
 
@@ -1327,6 +1333,19 @@ impl ConnectionConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("nacos://")
+            .to_string()
+    }
+
+    fn file_manager_endpoint(&self) -> String {
+        self.external_config
+            .as_ref()
+            .and_then(|value| {
+                value.get("endpoint").or_else(|| value.get("nameNodeUri")).or_else(|| value.get("name_node_uri"))
+            })
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("file://")
             .to_string()
     }
 

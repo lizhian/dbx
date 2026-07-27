@@ -2,78 +2,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
-pub enum SftpAuthentication {
-    SshConfig,
-    SshAgent,
-    PrivateKey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "method", rename_all = "snake_case")]
-pub enum WebdavAuthentication {
-    Basic { username: String },
-    Bearer,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "implementation", rename_all = "snake_case")]
-pub enum HdfsConfig {
-    Webhdfs {
-        endpoint: String,
-        root: String,
-        #[serde(default)]
-        simple_user: String,
-        #[serde(default)]
-        use_delegation_token: bool,
-    },
-    Native {
-        name_node_uri: String,
-        root: String,
-        #[serde(default)]
-        hadoop_config_directory: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "protocol", rename_all = "snake_case")]
-pub enum FileConnectionConfig {
-    Ftp {
-        endpoint: String,
-        port: u16,
-        root: String,
-        username: String,
-    },
-    Sftp {
-        endpoint: String,
-        port: u16,
-        root: String,
-        username: String,
-        authentication: SftpAuthentication,
-    },
-    S3 {
-        endpoint: String,
-        region: String,
-        bucket: String,
-        root: String,
-        #[serde(default = "default_true")]
-        path_style: bool,
-    },
-    Webdav {
-        endpoint: String,
-        root: String,
-        authentication: WebdavAuthentication,
-    },
-    Hdfs {
-        #[serde(flatten)]
-        config: HdfsConfig,
-    },
-}
-
-fn default_true() -> bool {
-    true
-}
+pub use dbx_core::file_connection_config::{
+    FileConnectionConfig, HdfsConfig, SftpAuthentication, WebdavAuthentication,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

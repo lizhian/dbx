@@ -14,6 +14,7 @@ use crate::connection_secrets::{
     NACOS_AUTH_SECRET_PREFIX, NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
 };
 use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
+use crate::file_connection_config::{FileConnectionConfig, FILE_SECRET_PREFIX};
 use crate::history::{
     HistoryConnectionFilter, HistoryConnectionOption, HistoryCursor, HistoryDatabaseFilter, HistoryEntry,
     HistorySearchRequest, HistorySearchResult, MAX_HISTORY,
@@ -30,6 +31,7 @@ const APP_STATE_OPEN_TABS_KEY: &str = "open_tabs";
 const APP_STATE_SAVED_SQL_EDITOR_POSITIONS_KEY: &str = "saved_sql_editor_positions";
 const MCP_GLOBAL_POLICY_KEY: &str = "mcp_global_policy";
 const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instructions";
+const APP_STATE_FILE_CONNECTION_MIGRATION_KEY: &str = "file_connection_catalog_migration_v1";
 const USER_DATA_TABLES: &[&str] = &[
     "connections",
     "connection_secrets",
@@ -424,6 +426,7 @@ impl Storage {
             ensure_saved_sql_columns_sync(conn)?;
             ensure_tab_runtime_cache_columns_sync(conn)?;
             ensure_ai_configs_columns_sync(conn)?;
+            migrate_legacy_file_connections_sync(conn)?;
             Ok(())
         })
     }
@@ -435,6 +438,178 @@ impl Storage {
     {
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || db.with_connection(f)).await.map_err(|e| e.to_string())?
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyStoredFileConnection {
+    id: String,
+    name: String,
+    config: FileConnectionConfig,
+}
+
+fn migrate_legacy_file_connections_sync(conn: &mut Connection) -> Result<(), String> {
+    let already_migrated = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_state WHERE key = ?1)",
+            [APP_STATE_FILE_CONNECTION_MIGRATION_KEY],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("Failed to inspect File Manager migration state: {error}"))?;
+    if already_migrated {
+        return Ok(());
+    }
+
+    let legacy_rows = {
+        let mut statement = conn
+            .prepare("SELECT id, config_json FROM file_connections ORDER BY id")
+            .map_err(|error| format!("Failed to read legacy file connections: {error}"))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| format!("Failed to read legacy file connections: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Failed to read legacy file connections: {error}"))?;
+        rows
+    };
+    if legacy_rows.is_empty() {
+        return Ok(());
+    }
+
+    let tx = conn.transaction().map_err(|error| format!("Failed to start File Manager migration: {error}"))?;
+    let mut occupied_ids = {
+        let mut statement = tx.prepare("SELECT id FROM connections ORDER BY id").map_err(|error| error.to_string())?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        ids
+    };
+    let mut id_mapping = HashMap::new();
+
+    for (legacy_row_id, json) in &legacy_rows {
+        let legacy: LegacyStoredFileConnection = serde_json::from_str(json)
+            .map_err(|error| format!("Legacy file connection '{legacy_row_id}' is invalid: {error}"))?;
+        if legacy.id != *legacy_row_id {
+            return Err(format!("Legacy file connection ID mismatch for '{legacy_row_id}'; migration was rolled back"));
+        }
+
+        let migrated_id = available_file_connection_id(&legacy.id, &occupied_ids);
+        occupied_ids.insert(migrated_id.clone());
+        id_mapping.insert(legacy.id.clone(), migrated_id.clone());
+
+        let (host, port, ssl) = legacy.config.projected_host_port_ssl();
+        let external_config = serde_json::to_value(&legacy.config)
+            .map_err(|error| format!("Failed to serialize legacy file connection '{}': {error}", legacy.id))?;
+        let config: ConnectionConfig = serde_json::from_value(serde_json::json!({
+            "id": migrated_id,
+            "name": legacy.name,
+            "db_type": "file",
+            "driver_profile": legacy.config.driver_profile(),
+            "driver_label": legacy.config.driver_label(),
+            "host": host,
+            "port": port,
+            "username": legacy.config.username(),
+            "password": "",
+            "database": null,
+            "ssl": ssl,
+            "external_config": external_config,
+            "connect_timeout_secs": 10,
+            "query_timeout_secs": 60,
+            "idle_timeout_secs": 60,
+            "keepalive_interval_secs": 30
+        }))
+        .map_err(|error| format!("Failed to convert legacy file connection '{}': {error}", legacy.id))?;
+        let config_json = serde_json::to_string(&config)
+            .map_err(|error| format!("Failed to serialize migrated file connection '{}': {error}", legacy.id))?;
+        tx.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", params![config.id, config_json])
+            .map_err(|error| format!("Failed to save migrated file connection '{}': {error}", legacy.id))?;
+
+        let mut secret_statement = tx
+            .prepare(
+                "SELECT key, secret FROM file_connection_secrets
+                 WHERE connection_id = ?1 ORDER BY key",
+            )
+            .map_err(|error| format!("Failed to read secrets for legacy file connection '{}': {error}", legacy.id))?;
+        let secrets = secret_statement
+            .query_map([&legacy.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|error| format!("Failed to read secrets for legacy file connection '{}': {error}", legacy.id))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Failed to read secrets for legacy file connection '{}': {error}", legacy.id))?;
+        drop(secret_statement);
+        for (key, secret) in secrets {
+            let key = if key.starts_with(FILE_SECRET_PREFIX) { key } else { format!("{FILE_SECRET_PREFIX}{key}") };
+            tx.execute(
+                "INSERT INTO connection_secrets (connection_id, key, secret) VALUES (?1, ?2, ?3)",
+                params![config.id, key, secret],
+            )
+            .map_err(|error| {
+                format!("Failed to migrate secrets for legacy file connection '{}': {error}", legacy.id)
+            })?;
+        }
+    }
+
+    let sidebar_json = tx
+        .query_row("SELECT layout_json FROM sidebar_layout WHERE id = 1", [], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|error| format!("Failed to read sidebar layout during File Manager migration: {error}"))?;
+    if let Some(sidebar_json) = sidebar_json {
+        let mut layout: serde_json::Value = serde_json::from_str(&sidebar_json)
+            .map_err(|error| format!("Sidebar layout is invalid; File Manager migration was rolled back: {error}"))?;
+        migrate_file_sidebar_entries(&mut layout, &id_mapping);
+        let migrated_json = serde_json::to_string(&layout)
+            .map_err(|error| format!("Failed to serialize migrated sidebar layout: {error}"))?;
+        tx.execute("UPDATE sidebar_layout SET layout_json = ?1 WHERE id = 1", [migrated_json])
+            .map_err(|error| format!("Failed to save migrated sidebar layout: {error}"))?;
+    }
+
+    tx.execute(
+        "INSERT INTO app_state (key, value_json) VALUES (?1, 'true')",
+        [APP_STATE_FILE_CONNECTION_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("Failed to mark File Manager migration complete: {error}"))?;
+    tx.commit().map_err(|error| format!("Failed to commit File Manager migration: {error}"))
+}
+
+fn available_file_connection_id(id: &str, occupied_ids: &HashSet<String>) -> String {
+    if !occupied_ids.contains(id) {
+        return id.to_string();
+    }
+    let base = format!("{id}-file");
+    if !occupied_ids.contains(&base) {
+        return base;
+    }
+    for suffix in 2_u32.. {
+        let candidate = format!("{base}-{suffix}");
+        if !occupied_ids.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("an unbounded numeric suffix always provides an unused connection ID")
+}
+
+fn migrate_file_sidebar_entries(value: &mut serde_json::Value, id_mapping: &HashMap<String, String>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                migrate_file_sidebar_entries(value, id_mapping);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("file-connection") {
+                object.insert("type".to_string(), serde_json::Value::String("connection".to_string()));
+                if let Some(id) = object.get("id").and_then(serde_json::Value::as_str) {
+                    if let Some(migrated_id) = id_mapping.get(id) {
+                        object.insert("id".to_string(), serde_json::Value::String(migrated_id.clone()));
+                    }
+                }
+            }
+            for value in object.values_mut() {
+                migrate_file_sidebar_entries(value, id_mapping);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3694,6 +3869,105 @@ mod tests {
         assert_eq!(kind, "ftp");
         assert_eq!(revision, 2);
         assert_eq!(storage.get_file_connection_secret("ftp-1", "password").await.unwrap().as_deref(), Some("secret"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn legacy_file_connections_migrate_transactionally_with_sidebar_and_collision_mapping() {
+        let path = temp_db_path("file-connection-catalog-migration");
+        {
+            let storage = Storage::open(&path).await.unwrap();
+            let existing: ConnectionConfig = serde_json::from_value(serde_json::json!({
+                "id": "shared",
+                "name": "Existing database",
+                "db_type": "postgres",
+                "host": "127.0.0.1",
+                "port": 5432,
+                "username": "postgres",
+                "password": "",
+                "database": "postgres"
+            }))
+            .unwrap();
+            storage.save_connections(&[existing]).await.unwrap();
+            let legacy = serde_json::json!({
+                "id": "shared",
+                "name": "Files",
+                "config": {
+                    "protocol": "ftp",
+                    "endpoint": "ftp://files.example.test:2121",
+                    "port": 2121,
+                    "root": "/root/",
+                    "username": "dbx"
+                }
+            });
+            storage
+                .save_file_connection("shared", &legacy, &[("password".to_string(), Some("legacy-secret".to_string()))])
+                .await
+                .unwrap();
+            storage
+                .save_sidebar_layout(&serde_json::json!({
+                    "order": [{
+                        "type": "group",
+                        "id": "team",
+                        "children": [{ "type": "file-connection", "id": "shared" }]
+                    }],
+                    "groups": [{ "id": "team", "name": "Team" }]
+                }))
+                .await
+                .unwrap();
+        }
+
+        let storage = Storage::open(&path).await.unwrap();
+        let mut connections = storage.load_connections().await.unwrap();
+        connections.sort_by(|left, right| left.id.cmp(&right.id));
+        assert_eq!(
+            connections.iter().map(|config| config.id.as_str()).collect::<Vec<_>>(),
+            vec!["shared", "shared-file"]
+        );
+        let migrated = connections.iter().find(|config| config.id == "shared-file").unwrap();
+        assert_eq!(migrated.db_type, DatabaseType::FileManager);
+        assert_eq!(migrated.driver_profile.as_deref(), Some("ftp"));
+        assert_eq!(migrated.host, "files.example.test");
+        assert_eq!(migrated.port, 2121);
+        assert_eq!(migrated.external_config.as_ref().unwrap()["protocol"], "ftp");
+        assert_eq!(storage.get_secret("shared-file", "file.password").await.unwrap().as_deref(), Some("legacy-secret"));
+
+        let layout = storage.load_sidebar_layout().await.unwrap().unwrap();
+        assert_eq!(layout["order"][0]["children"][0]["type"], "connection");
+        assert_eq!(layout["order"][0]["children"][0]["id"], "shared-file");
+        drop(storage);
+
+        let reopened = Storage::open(&path).await.unwrap();
+        assert_eq!(reopened.load_connections().await.unwrap().len(), 2);
+        assert_eq!(reopened.load_file_connections().await.unwrap().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn invalid_legacy_file_connection_rolls_back_without_marking_migration() {
+        let path = temp_db_path("file-connection-migration-rollback");
+        {
+            let storage = Storage::open(&path).await.unwrap();
+            drop(storage);
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute("INSERT INTO file_connections (id, config_json) VALUES ('broken', '{not-json')", [])
+                .unwrap();
+        }
+
+        let error = Storage::open(&path).await.err().unwrap();
+        assert!(error.contains("Legacy file connection 'broken' is invalid"));
+        let connection = Connection::open(&path).unwrap();
+        let legacy_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM file_connections", [], |row| row.get(0)).unwrap();
+        let migrated_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM connections", [], |row| row.get(0)).unwrap();
+        let marker_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM app_state WHERE key = 'file_connection_catalog_migration_v1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((legacy_count, migrated_count, marker_count), (1, 0, 0));
         let _ = std::fs::remove_file(path);
     }
 

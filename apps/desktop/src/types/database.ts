@@ -64,6 +64,7 @@ export type DatabaseType =
   | "influxdb"
   | "jdbc"
   | "mq"
+  | "file"
   | "nacos";
 
 export interface SqlSnippet {

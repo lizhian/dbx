@@ -1660,6 +1660,10 @@ impl AppState {
                         .to_string(),
                 );
             }
+            DatabaseType::FileManager => {
+                return Err("File Manager connections are available only through the desktop file operator runtime."
+                    .to_string());
+            }
         };
 
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
