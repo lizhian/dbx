@@ -2366,6 +2366,12 @@ impl Storage {
 
     pub async fn add_connection_for_mcp(&self, config: ConnectionConfig) -> Result<ConnectionConfig, String> {
         let config = config.canonicalized();
+        if config.db_type == DatabaseType::FileManager {
+            return Err(
+                "UNSUPPORTED_CONNECTION_TYPE: File Manager connections are available only through the desktop file operator runtime."
+                    .to_string(),
+            );
+        }
         self.with_conn(move |conn| {
             let tx = conn.transaction().map_err(|e| e.to_string())?;
             ensure_mcp_connection_change_allowed_in_tx(&tx, None)?;
@@ -4937,6 +4943,12 @@ mod tests {
         let mut concurrently_updated = removed.clone();
         concurrently_updated.host = "updated-by-web-ui".to_string();
         storage.save_connections(&[kept.clone(), concurrently_updated.clone()]).await.unwrap();
+        let mut file_connection = mq_connection("files", "");
+        file_connection.db_type = DatabaseType::FileManager;
+        let error = storage.add_connection_for_mcp(file_connection).await.unwrap_err();
+        assert!(error.starts_with("UNSUPPORTED_CONNECTION_TYPE:"));
+        assert_eq!(storage.load_connections().await.unwrap().len(), 2);
+
         let added = mq_connection("added", "added-token");
         storage.add_connection_for_mcp(added.clone()).await.unwrap();
         let after_add = storage.load_connections().await.unwrap();

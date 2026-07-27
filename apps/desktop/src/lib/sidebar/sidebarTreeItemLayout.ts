@@ -1,4 +1,4 @@
-import type { TreeNode, TreeNodeType } from "@/types/database";
+import type { DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
 
 const leafTypes: Set<TreeNodeType> = new Set([
   "column",
@@ -139,8 +139,9 @@ export function canTreeNodeExpand(type: TreeNodeType): boolean {
   return !leafTypes.has(type);
 }
 
-export function canTreeNodeShowExpander({ type, childCount }: { type: TreeNodeType; childCount?: number }): boolean {
+export function canTreeNodeShowExpander({ type, childCount, databaseType }: { type: TreeNodeType; childCount?: number; databaseType?: DatabaseType }): boolean {
   if (!canTreeNodeExpand(type)) return false;
+  if (type === "connection" && databaseType === "file") return false;
   if (childCount === 0 && emptyContainerTypes.has(type)) return false;
   return true;
 }

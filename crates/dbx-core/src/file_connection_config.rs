@@ -140,15 +140,16 @@ pub enum HdfsConfig {
     Webhdfs {
         endpoint: String,
         root: String,
-        #[serde(default)]
+        #[serde(default, rename = "simpleUser", alias = "simple_user")]
         simple_user: String,
-        #[serde(default)]
+        #[serde(default, rename = "useDelegationToken", alias = "use_delegation_token")]
         use_delegation_token: bool,
     },
     Native {
+        #[serde(rename = "nameNodeUri", alias = "name_node_uri")]
         name_node_uri: String,
         root: String,
-        #[serde(default)]
+        #[serde(default, rename = "hadoopConfigDirectory", alias = "hadoop_config_directory")]
         hadoop_config_directory: String,
     },
 }
@@ -174,7 +175,7 @@ pub enum FileConnectionConfig {
         region: String,
         bucket: String,
         root: String,
-        #[serde(default = "default_true")]
+        #[serde(default = "default_true", rename = "pathStyle", alias = "path_style")]
         path_style: bool,
     },
     Webdav {
@@ -271,5 +272,39 @@ mod tests {
         assert_eq!(config.driver_profile(), "hdfs-native");
         assert_eq!(config.projected_host_port_ssl(), ("namenode".to_string(), 19000, false));
         assert_eq!(serde_json::to_value(config).unwrap()["protocol"], "hdfs");
+    }
+
+    #[test]
+    fn file_config_accepts_frontend_camel_case_and_legacy_snake_case_fields() {
+        let camel_case: FileConnectionConfig = serde_json::from_value(serde_json::json!({
+            "protocol": "hdfs",
+            "implementation": "webhdfs",
+            "endpoint": "http://127.0.0.1:9870",
+            "root": "/",
+            "simpleUser": "dbx",
+            "useDelegationToken": false
+        }))
+        .unwrap();
+        assert!(matches!(
+            camel_case,
+            FileConnectionConfig::Hdfs {
+                config: HdfsConfig::Webhdfs { ref simple_user, use_delegation_token: false, .. }
+            } if simple_user == "dbx"
+        ));
+
+        let legacy: FileConnectionConfig = serde_json::from_value(serde_json::json!({
+            "protocol": "hdfs",
+            "implementation": "native",
+            "name_node_uri": "hdfs://127.0.0.1:19000",
+            "root": "/",
+            "hadoop_config_directory": "/etc/hadoop"
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            FileConnectionConfig::Hdfs {
+                config: HdfsConfig::Native { ref name_node_uri, ref hadoop_config_directory, .. }
+            } if name_node_uri == "hdfs://127.0.0.1:19000" && hadoop_config_directory == "/etc/hadoop"
+        ));
     }
 }

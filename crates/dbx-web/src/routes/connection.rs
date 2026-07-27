@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::Json;
 use dbx_core::connection::AppState;
-use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo};
+use dbx_core::models::connection::{ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType};
 use serde::Deserialize;
 
 use crate::error::AppError;
@@ -259,7 +259,12 @@ pub async fn save_connections(
     Json(body): Json<SaveConnectionsRequest>,
 ) -> Result<Json<()>, AppError> {
     for config in &body.configs {
-        if config.db_type == dbx_core::models::connection::DatabaseType::Sqlite {
+        if config.db_type == DatabaseType::FileManager {
+            return Err(AppError::from(
+                "UNSUPPORTED_CONNECTION_TYPE: File Manager connections are available only through the desktop file operator runtime.",
+            ));
+        }
+        if config.db_type == DatabaseType::Sqlite {
             dbx_core::db::sqlite::validate_persistent_attachments(
                 &config.host,
                 &config.password,
@@ -627,6 +632,21 @@ mod tests {
         let configs = state.app.configs.read().await;
         assert_eq!(configs.get("sqlite-conn").map(|c| c.host.as_str()), Some(config.host.as_str()));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn save_connections_rejects_desktop_only_file_connections() {
+        let (state, dir) = test_web_state().await;
+        let mut config = sqlite_config("files", "");
+        config.db_type = DatabaseType::FileManager;
+
+        let result =
+            save_connections(State(state.clone()), Json(SaveConnectionsRequest { configs: vec![config] })).await;
+
+        assert!(result.is_err());
+        assert!(state.app.storage.load_connections().await.unwrap().is_empty());
+        assert!(state.app.configs.read().await.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 

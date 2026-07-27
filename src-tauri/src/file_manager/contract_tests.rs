@@ -1,6 +1,11 @@
 #[cfg(unix)]
 mod unix {
+    use std::sync::Arc;
+
+    use dbx_core::connection::AppState;
+    use dbx_core::models::connection::ConnectionConfig;
     use dbx_core::storage::Storage;
+    use serde_json::json;
     use uuid::Uuid;
 
     use super::super::models::{
@@ -8,6 +13,7 @@ mod unix {
         SaveFileConnectionRequest, SecretUpdate, SftpAuthentication, TestFileConnectionRequest,
     };
     use super::super::operations;
+    use super::super::registry::FileOperatorRegistry;
     use super::super::service;
     use super::super::transfer::{self, FileTransferState};
 
@@ -22,7 +28,11 @@ mod unix {
             .join("../deploy/file-manager/runtime/sftp/id_ed25519")
             .canonicalize()
             .expect("run deploy/file-manager/setup.sh before the SFTP contract");
-        let storage = Storage::open(&database).await.unwrap();
+        let state = Arc::new(AppState::new_with_plugin_dir(
+            Storage::open(&database).await.unwrap(),
+            std::env::temp_dir().join(format!("dbx-sftp-plugins-{suffix}")),
+        ));
+        let storage = &state.storage;
         let config = FileConnectionConfig::Sftp {
             endpoint: "127.0.0.1".to_string(),
             port: 2222,
@@ -30,8 +40,43 @@ mod unix {
             username: "dbx".to_string(),
             authentication: SftpAuthentication::PrivateKey,
         };
+        let generic_config: ConnectionConfig = serde_json::from_value(json!({
+            "id": "sftp-generic-contract",
+            "name": "SFTP Generic Contract",
+            "db_type": "file",
+            "driver_profile": "sftp",
+            "driver_label": "SFTP",
+            "host": "127.0.0.1",
+            "port": 2222,
+            "username": "dbx",
+            "password": "",
+            "database": null,
+            "connect_timeout_secs": 10,
+            "query_timeout_secs": 30,
+            "idle_timeout_secs": 60,
+            "external_config": {
+                "protocol": "sftp",
+                "endpoint": "127.0.0.1",
+                "port": 2222,
+                "root": "/config",
+                "username": "dbx",
+                "authentication": { "method": "private_key" }
+            }
+        }))
+        .unwrap();
+        service::test_connection_config(
+            state.as_ref(),
+            &FileOperatorRegistry::default(),
+            &generic_config,
+            &FileSecretUpdates {
+                private_key: SecretUpdate::Set(private_key.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let saved = service::save_connection(
-            &storage,
+            storage,
             SaveFileConnectionRequest {
                 id: "sftp-contract".to_string(),
                 name: "SFTP Contract".to_string(),
@@ -49,7 +94,7 @@ mod unix {
         assert!(saved.capabilities.native_rename);
         assert!(saved.capabilities.atomic_rename);
         service::test_connection(
-            &storage,
+            storage,
             TestFileConnectionRequest {
                 id: Some("sftp-contract".to_string()),
                 config,
@@ -59,7 +104,7 @@ mod unix {
         .await
         .unwrap();
         let edited = service::save_connection(
-            &storage,
+            storage,
             SaveFileConnectionRequest {
                 id: "sftp-contract".to_string(),
                 name: "Edited SFTP Contract".to_string(),
@@ -78,7 +123,7 @@ mod unix {
         assert_eq!(edited.name, "Edited SFTP Contract");
         assert!(edited.secret_status.private_key);
 
-        let operator = service::operator_for_connection(&storage, "sftp-contract").await.unwrap();
+        let operator = service::operator_for_connection(storage, "sftp-contract").await.unwrap();
         assert!(operator.info().full_capability().copy);
         assert!(operator.info().full_capability().rename);
         let directory = format!("dbx-sftp-{suffix}");
@@ -90,7 +135,7 @@ mod unix {
         let state = FileTransferState::default();
 
         transfer::upload(
-            &storage,
+            storage,
             &state,
             FileTransferRequest {
                 connection_id: "sftp-contract".to_string(),
@@ -101,17 +146,17 @@ mod unix {
         )
         .await
         .unwrap();
-        let stat = service::stat_path(&storage, "sftp-contract", &source).await.unwrap();
+        let stat = service::stat_path(storage, "sftp-contract", &source).await.unwrap();
         assert_eq!(stat.kind, FileEntryKind::File);
         assert_eq!(stat.size, b"SFTP seven-operation contract".len() as u64);
-        assert!(service::list_path(&storage, "sftp-contract", &directory)
+        assert!(service::list_path(storage, "sftp-contract", &directory)
             .await
             .unwrap()
             .iter()
             .any(|entry| entry.path == source));
 
         operations::copy(
-            &storage,
+            storage,
             &state,
             FileRemoteOperationRequest {
                 connection_id: "sftp-contract".to_string(),
@@ -122,9 +167,9 @@ mod unix {
         )
         .await
         .unwrap();
-        assert_eq!(service::stat_path(&storage, "sftp-contract", &source).await.unwrap().kind, FileEntryKind::File);
+        assert_eq!(service::stat_path(storage, "sftp-contract", &source).await.unwrap().kind, FileEntryKind::File);
         operations::rename(
-            &storage,
+            storage,
             &state,
             FileRemoteOperationRequest {
                 connection_id: "sftp-contract".to_string(),
@@ -135,9 +180,9 @@ mod unix {
         )
         .await
         .unwrap();
-        assert_eq!(service::stat_path(&storage, "sftp-contract", &copied).await.unwrap_err().code, "not_found");
+        assert_eq!(service::stat_path(storage, "sftp-contract", &copied).await.unwrap_err().code, "not_found");
         transfer::download(
-            &storage,
+            storage,
             &state,
             FileTransferRequest {
                 connection_id: "sftp-contract".to_string(),
@@ -150,11 +195,11 @@ mod unix {
         .unwrap();
         assert_eq!(tokio::fs::read(&local_download).await.unwrap(), b"SFTP seven-operation contract");
 
-        transfer::delete(&storage, &state, "sftp-contract", &source).await.unwrap();
-        transfer::delete(&storage, &state, "sftp-contract", &renamed).await.unwrap();
-        transfer::delete(&storage, &state, "sftp-contract", &directory).await.unwrap();
-        service::delete_connection(&storage, "sftp-contract").await.unwrap();
-        assert!(service::list_connections(&storage).await.unwrap().is_empty());
+        transfer::delete(storage, &state, "sftp-contract", &source).await.unwrap();
+        transfer::delete(storage, &state, "sftp-contract", &renamed).await.unwrap();
+        transfer::delete(storage, &state, "sftp-contract", &directory).await.unwrap();
+        service::delete_connection(storage, "sftp-contract").await.unwrap();
+        assert!(service::list_connections(storage).await.unwrap().is_empty());
         let _ = tokio::fs::remove_file(local_source).await;
         let _ = tokio::fs::remove_file(local_download).await;
         let _ = tokio::fs::remove_file(database).await;

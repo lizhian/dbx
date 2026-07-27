@@ -9,10 +9,12 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import FileManagerPage from "./FileManagerPage.vue";
 import { displayFilePath, parentFilePath } from "./filePath";
 
-const { copyFilePath, deleteFilePath, downloadFile, listFilePath, renameFilePath, uploadFile } = vi.hoisted(() => ({
+const { copyFilePath, deleteFilePath, disconnectDb, downloadFile, executeWithProductionContextGuard, listFilePath, renameFilePath, uploadFile } = vi.hoisted(() => ({
   copyFilePath: vi.fn(async (_request: unknown) => undefined),
   deleteFilePath: vi.fn(async (_connectionId: string, _path: string) => undefined),
+  disconnectDb: vi.fn(async (_connectionId: string) => undefined),
   downloadFile: vi.fn(async (_request: unknown) => 11),
+  executeWithProductionContextGuard: vi.fn(async (options: { execute: () => Promise<unknown> }) => options.execute()),
   listFilePath: vi.fn(async (_connectionId: string, path: string) =>
     path
       ? []
@@ -23,6 +25,14 @@ const { copyFilePath, deleteFilePath, downloadFile, listFilePath, renameFilePath
   ),
   renameFilePath: vi.fn(async (_request: unknown) => undefined),
   uploadFile: vi.fn(async (_request: unknown) => 11),
+}));
+
+vi.mock("@/lib/database/productionExecutionGuard", () => ({
+  executeWithProductionContextGuard,
+}));
+
+vi.mock("@/lib/tabs/tabResultCache", () => ({
+  deleteTabResultSnapshotsForOwner: vi.fn(async () => undefined),
 }));
 
 vi.mock("@/lib/backend/api", () => ({
@@ -46,6 +56,7 @@ vi.mock("@/lib/backend/api", () => ({
   loadTunnelProfiles: vi.fn(async () => []),
   deleteSchemaCache: vi.fn(async () => undefined),
   deleteSchemaCachePrefix: vi.fn(async () => undefined),
+  disconnectDb,
   listFileConnections: vi.fn(async () => [
     {
       id: "ftp-local",
@@ -152,6 +163,8 @@ afterEach(() => {
   uploadFile.mockClear();
   downloadFile.mockClear();
   deleteFilePath.mockClear();
+  disconnectDb.mockClear();
+  executeWithProductionContextGuard.mockClear();
   copyFilePath.mockClear();
   renameFilePath.mockClear();
 });
@@ -258,6 +271,63 @@ describe("FileManagerPage browsing", () => {
     deleteButton?.click();
     await flushPage();
     expect(deleteFilePath).toHaveBeenCalledWith("ftp-local", "folder");
+  });
+
+  it("does not execute file mutations when production confirmation is cancelled", async () => {
+    await mountPage();
+    buttonWithTitle("Open")?.click();
+    await flushPage();
+
+    executeWithProductionContextGuard.mockResolvedValueOnce(undefined);
+    const uploadButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.includes("Upload"));
+    uploadButton?.click();
+    await flushPage();
+    const uploadButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).filter((button) => button.textContent?.trim() === "Upload");
+    uploadButtons[uploadButtons.length - 1]?.click();
+    await flushPage();
+    expect(uploadFile).not.toHaveBeenCalled();
+
+    executeWithProductionContextGuard.mockResolvedValueOnce(undefined);
+    buttonWithTitle("Delete")?.click();
+    await flushPage();
+    const deleteButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Delete");
+    deleteButton?.click();
+    await flushPage();
+    expect(deleteFilePath).not.toHaveBeenCalled();
+
+    executeWithProductionContextGuard.mockResolvedValueOnce(undefined);
+    buttonWithTitle("Copy")?.click();
+    await flushPage();
+    const copyButtons = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).filter((button) => button.textContent?.trim() === "Copy");
+    copyButtons[copyButtons.length - 1]?.click();
+    await flushPage();
+    expect(copyFilePath).not.toHaveBeenCalled();
+
+    executeWithProductionContextGuard.mockResolvedValueOnce(undefined);
+    buttonWithTitle("Rename or move")?.click();
+    await flushPage();
+    const destination = document.querySelector<HTMLInputElement>("#file-operation-destination-path");
+    if (destination) {
+      destination.value = "moved.txt";
+      destination.dispatchEvent(new Event("input"));
+    }
+    await flushPage();
+    const renameButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Rename or move");
+    renameButton?.click();
+    await flushPage();
+    expect(renameFilePath).not.toHaveBeenCalled();
+  });
+
+  it("disconnects the desktop runtime after deleting a file connection", async () => {
+    await mountPage();
+
+    buttonWithTitle("Delete")?.click();
+    await flushPage();
+    const deleteButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Delete");
+    deleteButton?.click();
+    await flushPage();
+
+    expect(disconnectDb).toHaveBeenCalledWith("ftp-local", undefined);
   });
 
   it("shows capability-driven Copy only for files and sends one connection ID", async () => {

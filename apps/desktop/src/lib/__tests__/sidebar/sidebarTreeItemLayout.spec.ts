@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { alignedSidebarCommentLabelWidths, sidebarTreeNaturalContentWidth, trailingCommentAvailableWidth, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { alignedSidebarCommentLabelWidths, canTreeNodeShowExpander, sidebarTreeNaturalContentWidth, trailingCommentAvailableWidth, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 
 describe("sidebar tree item layout", () => {
   it("keeps a table row constrained when it displays a comment", () => {
@@ -47,5 +47,10 @@ describe("sidebar tree item layout", () => {
 
   it("returns zero when no tree row uses natural width", () => {
     expect(sidebarTreeNaturalContentWidth([{ depth: 2, label: "commented", usesNaturalWidth: false }], (text) => text.length * 7)).toBe(0);
+  });
+
+  it("keeps file connections as leaf entries while ordinary connections remain expandable", () => {
+    expect(canTreeNodeShowExpander({ type: "connection", databaseType: "postgresql" })).toBe(true);
+    expect(canTreeNodeShowExpander({ type: "connection", databaseType: "file" })).toBe(false);
   });
 });

@@ -11,6 +11,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useToast } from "@/composables/useToast";
 import { formatError } from "@/lib/backend/errorUtils";
 import * as api from "@/lib/backend/api";
+import { executeWithProductionContextGuard } from "@/lib/database/productionExecutionGuard";
 import type { ConnectionConfig } from "@/types/database";
 import type { FileConnection, FileConnectionImplementation, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
 import { childFilePath, displayFilePath, formatFileSize, parentFilePath } from "./filePath";
@@ -221,7 +222,16 @@ async function startDownload(entry: FileEntry) {
 async function runTransfer(operation: "upload" | "download", request: FileTransferRequest) {
   operationActive.value = `${operation}:${request.remotePath}`;
   try {
-    const bytes = operation === "upload" ? await api.uploadFile(request) : await api.downloadFile(request);
+    const bytes =
+      operation === "upload"
+        ? await executeWithProductionContextGuard({
+            connection: connectionStore.getConfig(request.connectionId),
+            reviewText: `UPLOAD ${request.localPath} -> ${request.remotePath}${request.replace ? " (replace)" : ""}`,
+            source: t("fileManager.title"),
+            execute: () => api.uploadFile(request),
+          })
+        : await api.downloadFile(request);
+    if (bytes === undefined) return;
     toast(t(operation === "upload" ? "fileManager.uploadSucceeded" : "fileManager.downloadSucceeded", { size: formatFileSize(bytes) }));
     if (operation === "upload") await refreshDirectory();
   } catch (error) {
@@ -260,8 +270,17 @@ async function confirmRemoteOperation() {
 async function runRemoteOperation(operation: "copy" | "rename", request: FileRemoteOperationRequest) {
   operationActive.value = `${operation}:${request.sourcePath}`;
   try {
-    if (operation === "copy") await api.copyFilePath(request);
-    else await api.renameFilePath(request);
+    const executed = await executeWithProductionContextGuard({
+      connection: connectionStore.getConfig(request.connectionId),
+      reviewText: `${operation.toUpperCase()} ${request.sourcePath} -> ${request.destinationPath}${request.replace ? " (replace)" : ""}`,
+      source: t("fileManager.title"),
+      execute: async () => {
+        if (operation === "copy") await api.copyFilePath(request);
+        else await api.renameFilePath(request);
+        return true;
+      },
+    });
+    if (!executed) return;
     toast(t(operation === "copy" ? "fileManager.copySucceeded" : "fileManager.renameSucceeded"));
     await refreshDirectory();
   } catch (error) {
@@ -310,7 +329,16 @@ async function confirmDeleteEntry() {
   deleteEntryTarget.value = undefined;
   operationActive.value = `delete:${entry.path}`;
   try {
-    await api.deleteFilePath(connection.id, entry.path);
+    const executed = await executeWithProductionContextGuard({
+      connection: connectionStore.getConfig(connection.id),
+      reviewText: `DELETE ${entry.path}`,
+      source: t("fileManager.title"),
+      execute: async () => {
+        await api.deleteFilePath(connection.id, entry.path);
+        return true;
+      },
+    });
+    if (!executed) return;
     toast(t("fileManager.deleteSucceeded"));
     await refreshDirectory();
   } catch (error) {
@@ -333,6 +361,9 @@ async function removeConnection() {
   try {
     const id = deleting.value.id;
     await connectionStore.removeConnection(id);
+    connectionStore.disconnect(id).catch((error) => {
+      console.warn("[DBX][file-connection:delete:disconnect-failed]", { connectionId: id, error });
+    });
     runtimeConnections.value.delete(id);
     if (activeConnection.value?.id === id) closeBrowser();
     toast(t("fileManager.connectionDeleted"));

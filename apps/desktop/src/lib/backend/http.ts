@@ -297,7 +297,7 @@ export async function closeDatabaseConnection(connectionId: string, database: st
 }
 
 export async function saveConnections(configs: ConnectionConfig[], fileSecretUpdates?: Record<string, import("@/types/fileManager").FileSecretUpdates>): Promise<void> {
-  if (fileSecretUpdates && Object.keys(fileSecretUpdates).length > 0) {
+  if (configs.some((config) => config.db_type === "file") || (fileSecretUpdates && Object.keys(fileSecretUpdates).length > 0)) {
     throw new Error("File Manager connections are available only in the desktop app.");
   }
   return post("/api/connection/save", { configs });

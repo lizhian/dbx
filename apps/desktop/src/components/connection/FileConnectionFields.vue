@@ -199,7 +199,7 @@ async function selectHadoopConfigDirectory() {
       <div v-if="draft.authentication === 'private_key'" class="grid gap-1.5">
         <Label for="file-connection-private-key">{{ t("fileManager.privateKey") }}</Label>
         <div class="flex gap-2">
-          <Input id="file-connection-private-key" :model-value="draft.privateKey" :placeholder="secretStatus?.privateKey ? t('fileManager.privateKeyPreserved') : undefined" disabled />
+          <Input id="file-connection-private-key" v-model="draft.privateKey" :placeholder="secretStatus?.privateKey ? t('fileManager.privateKeyPreserved') : undefined" :disabled="draft.clearPrivateKey" autocomplete="off" />
           <Button type="button" variant="outline" size="icon" :title="t('fileManager.selectPrivateKey')" :disabled="draft.clearPrivateKey" @click="selectPrivateKey">
             <FolderOpen class="h-4 w-4" />
           </Button>
