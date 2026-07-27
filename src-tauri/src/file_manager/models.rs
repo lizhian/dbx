@@ -154,6 +154,13 @@ pub struct FileTransferRequest {
     pub replace: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTransferProgress {
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileRemoteOperationRequest {

@@ -4,11 +4,12 @@ use std::sync::Arc;
 use dbx_core::connection::AppState;
 use dbx_core::file_connection_config::{FILE_SECRET_KEYS, FILE_SECRET_PREFIX};
 use dbx_core::models::connection::DatabaseType;
-use tauri::State;
+use tauri::{ipc::Channel, State};
 
 use crate::file_manager;
 use crate::file_manager::models::{
-    FileConnection, FileEntry, FileManagerError, FileRemoteOperationRequest, FileSecretStatus, FileTransferRequest,
+    FileConnection, FileEntry, FileManagerError, FileRemoteOperationRequest, FileSecretStatus, FileTransferProgress,
+    FileTransferRequest,
 };
 use crate::file_manager::{FileOperatorRegistry, FileTransferState};
 
@@ -101,8 +102,18 @@ pub async fn download_file(
     registry: State<'_, FileOperatorRegistry>,
     transfer_state: State<'_, FileTransferState>,
     request: FileTransferRequest,
+    on_progress: Channel<FileTransferProgress>,
 ) -> Result<u64, FileManagerError> {
-    file_manager::transfer::download_cached(state.inner(), registry.inner(), &transfer_state, request).await
+    file_manager::transfer::download_cached(
+        state.inner(),
+        registry.inner(),
+        &transfer_state,
+        request,
+        move |bytes_transferred, total_bytes| {
+            let _ = on_progress.send(FileTransferProgress { bytes_transferred, total_bytes });
+        },
+    )
+    .await
 }
 
 #[tauri::command]

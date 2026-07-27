@@ -9,10 +9,13 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import FileManagerPage from "./FileManagerPage.vue";
 import { displayFilePath, parentFilePath } from "./filePath";
 
-const { copyFilePath, deleteFilePath, downloadFile, executeWithProductionContextGuard, listFilePath, renameFilePath, uploadFile } = vi.hoisted(() => ({
+const { copyFilePath, deleteFilePath, downloadFile, executeWithProductionContextGuard, listFilePath, renameFilePath, revealPathInFileManager, shellOpen, uploadFile } = vi.hoisted(() => ({
   copyFilePath: vi.fn(async (_request: unknown) => undefined),
   deleteFilePath: vi.fn(async (_connectionId: string, _path: string) => undefined),
-  downloadFile: vi.fn(async (_request: unknown) => 11),
+  downloadFile: vi.fn(async (_request: unknown, onProgress?: (progress: { bytesTransferred: number; totalBytes: number }) => void) => {
+    onProgress?.({ bytesTransferred: 1536, totalBytes: 1536 });
+    return 1536;
+  }),
   executeWithProductionContextGuard: vi.fn(async (options: { execute: () => Promise<unknown> }) => options.execute()),
   listFilePath: vi.fn(async (_connectionId: string, path: string) =>
     path === "folder"
@@ -26,6 +29,8 @@ const { copyFilePath, deleteFilePath, downloadFile, executeWithProductionContext
           ],
   ),
   renameFilePath: vi.fn(async (_request: unknown) => undefined),
+  revealPathInFileManager: vi.fn(async (_path: string) => undefined),
+  shellOpen: vi.fn(async (_path: string) => undefined),
   uploadFile: vi.fn(async (_request: unknown) => 11),
 }));
 
@@ -36,6 +41,16 @@ vi.mock("@/lib/database/productionExecutionGuard", () => ({
 vi.mock("@/lib/tabs/tabResultCache", () => ({
   deleteTabResultSnapshotsForOwner: vi.fn(async () => undefined),
 }));
+
+vi.mock("@/components/ui/popover", async () => {
+  const { defineComponent, h } = await import("vue");
+  const passthrough = defineComponent({
+    setup(_props, { slots }) {
+      return () => h("div", slots.default?.());
+    },
+  });
+  return { Popover: passthrough, PopoverContent: passthrough, PopoverTrigger: passthrough };
+});
 
 vi.mock("@/lib/backend/api", () => ({
   loadConnections: vi.fn(async () => [
@@ -52,6 +67,20 @@ vi.mock("@/lib/backend/api", () => ({
       ssl: false,
       read_only: false,
       external_config: { protocol: "ftp", endpoint: "127.0.0.1", port: 2121, root: "/ftp/dbx/", username: "dbx" },
+    },
+    {
+      id: "ftp-other",
+      name: "Other FTP",
+      db_type: "file",
+      driver_profile: "ftp",
+      driver_label: "FTP",
+      host: "127.0.0.1",
+      port: 2122,
+      username: "dbx",
+      password: "",
+      ssl: false,
+      read_only: false,
+      external_config: { protocol: "ftp", endpoint: "127.0.0.1", port: 2122, root: "/ftp/other/", username: "dbx" },
     },
   ]),
   loadSidebarLayout: vi.fn(async () => null),
@@ -88,6 +117,35 @@ vi.mock("@/lib/backend/api", () => ({
         delegationToken: false,
       },
     },
+    {
+      id: "ftp-other",
+      name: "Other FTP",
+      config: { protocol: "ftp", endpoint: "127.0.0.1", port: 2122, root: "/ftp/other/", username: "dbx" },
+      capabilities: {
+        read: true,
+        write: true,
+        stat: true,
+        list: true,
+        delete: true,
+        copy: true,
+        rename: true,
+        nativeCopy: false,
+        nativeRename: false,
+        atomicRename: false,
+        atomicNoClobber: false,
+        copyMode: "stream_relay",
+        renameMode: "copy_delete",
+      },
+      secretStatus: {
+        password: true,
+        privateKey: false,
+        accessKey: false,
+        secretKey: false,
+        sessionToken: false,
+        bearerToken: false,
+        delegationToken: false,
+      },
+    },
   ]),
   saveConnections: vi.fn(),
   listFilePath,
@@ -97,11 +155,16 @@ vi.mock("@/lib/backend/api", () => ({
   deleteFilePath,
   copyFilePath,
   renameFilePath,
+  revealPathInFileManager,
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(async () => "/tmp/replacement.txt"),
   save: vi.fn(async () => "/tmp/fixture.txt"),
+}));
+
+vi.mock("@tauri-apps/plugin-shell", () => ({
+  open: shellOpen,
 }));
 
 const mountedApps: App[] = [];
@@ -171,6 +234,8 @@ afterEach(() => {
   executeWithProductionContextGuard.mockClear();
   copyFilePath.mockClear();
   renameFilePath.mockClear();
+  revealPathInFileManager.mockClear();
+  shellOpen.mockClear();
 });
 
 describe("FileManagerPage browsing", () => {
@@ -199,6 +264,7 @@ describe("FileManagerPage browsing", () => {
     expect(toolbar?.textContent).toContain("Local FTP");
     expect(toolbar?.textContent).toContain("/");
     expect(toolbar?.textContent).toContain("Upload");
+    expect(toolbar?.textContent).toContain("Downloads");
     expect(toolbar?.querySelector('button[title="Refresh"]')).not.toBeNull();
 
     const headings = Array.from(document.querySelectorAll("thead th")).map((heading) => heading.textContent?.trim());
@@ -249,12 +315,59 @@ describe("FileManagerPage browsing", () => {
     entryRow("fixture.txt")?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
     await flushEntrySingleClick();
 
-    expect(downloadFile).toHaveBeenCalledWith({
-      connectionId: "ftp-local",
-      remotePath: "fixture.txt",
-      localPath: "/tmp/fixture.txt",
-      replace: false,
+    expect(downloadFile).toHaveBeenCalledWith(
+      {
+        connectionId: "ftp-local",
+        remotePath: "fixture.txt",
+        localPath: "/tmp/fixture.txt",
+        replace: false,
+      },
+      expect.any(Function),
+    );
+  });
+
+  it("shows download progress and opens completed files or their folders", async () => {
+    let finishDownload: ((bytes: number) => void) | undefined;
+    downloadFile.mockImplementationOnce(async (_request, onProgress) => {
+      onProgress?.({ bytesTransferred: 512, totalBytes: 1536 });
+      return new Promise<number>((resolve) => {
+        finishDownload = resolve;
+      });
     });
+    await mountOpenPage();
+
+    entryRow("fixture.txt")?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+    await flushEntrySingleClick();
+    document.querySelector<HTMLButtonElement>("[data-file-download-list-trigger]")?.click();
+    await flushPage();
+
+    const task = document.querySelector<HTMLElement>('[data-file-download-task="fixture.txt"]');
+    expect(task?.textContent).toContain("fixture.txt");
+    expect(task?.textContent).toContain("512 B / 1.5 KiB");
+    expect(task?.textContent).toContain("33%");
+
+    finishDownload?.(1536);
+    await flushPage();
+    expect(task?.textContent).toContain("Completed");
+
+    buttonWithTitle("Open file")?.click();
+    buttonWithTitle("Open folder")?.click();
+    await flushPage();
+    expect(shellOpen).toHaveBeenCalledWith("/tmp/fixture.txt");
+    expect(revealPathInFileManager).toHaveBeenCalledWith("/tmp/fixture.txt");
+  });
+
+  it("shows only downloads from the active connection", async () => {
+    const { page } = await mountOpenPage();
+
+    entryRow("fixture.txt")?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+    await flushEntrySingleClick();
+    expect(document.querySelector('[data-file-download-task="fixture.txt"]')).not.toBeNull();
+
+    await page.openConnectionById("ftp-other");
+    await flushPage();
+    expect(document.querySelector('[data-file-download-task="fixture.txt"]')).toBeNull();
+    expect(document.querySelector("[data-file-download-list]")?.textContent).toContain("No downloads for this connection");
   });
 
   it("opens shared right-click actions for files and folders", async () => {

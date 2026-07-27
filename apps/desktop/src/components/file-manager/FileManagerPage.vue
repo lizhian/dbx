@@ -16,6 +16,8 @@ import { executeWithProductionContextGuard } from "@/lib/database/productionExec
 import { treeItemPaddingLeft } from "@/lib/sidebar/sidebarTreeItemLayout";
 import type { ConnectionConfig } from "@/types/database";
 import type { FileConnection, FileEntry, FileRemoteOperationRequest, FileTransferRequest } from "@/types/fileManager";
+import FileDownloadList from "./FileDownloadList.vue";
+import type { FileDownloadTask } from "./fileDownload";
 import { childFilePath, displayFilePath, formatFileSize, parentFilePath } from "./filePath";
 import { flattenVisibleFileTree, normalizeFileListing } from "./fileTree";
 
@@ -29,6 +31,8 @@ const runtimeConnections = ref(new Map<string, FileConnection>());
 let runtimeConnectionsRefreshGeneration = 0;
 const fileConnections = computed(() => connectionStore.connections.filter((connection) => connection.db_type === "file"));
 const activeConnection = ref<FileConnection>();
+const downloadTasks = ref<FileDownloadTask[]>([]);
+const activeConnectionDownloadTasks = computed(() => downloadTasks.value.filter((task) => task.connectionId === activeConnection.value?.id));
 const currentPath = ref("");
 const entries = ref<FileEntry[]>([]);
 const expandedDirectoryPaths = ref(new Set<string>());
@@ -45,7 +49,7 @@ const uploadRemotePath = ref("");
 const operationActive = ref("");
 const deleteEntryTarget = ref<FileEntry>();
 const remoteOperation = ref<{ operation: "copy" | "rename"; entry: FileEntry; destinationPath: string }>();
-const replaceRequest = ref<{ operation: "upload" | "download"; request: FileTransferRequest } | { operation: "copy" | "rename"; request: FileRemoteOperationRequest; sourceKind: FileEntry["kind"] }>();
+const replaceRequest = ref<{ operation: "upload"; request: FileTransferRequest } | { operation: "download"; request: FileTransferRequest; downloadTaskId: string } | { operation: "copy" | "rename"; request: FileRemoteOperationRequest; sourceKind: FileEntry["kind"] }>();
 const fileContextMenuItems = ref<ContextMenuItem[]>([]);
 const ENTRY_SINGLE_CLICK_DELAY_MS = 180;
 let entryClickTimer: ReturnType<typeof setTimeout> | undefined;
@@ -246,7 +250,7 @@ async function startUpload() {
   const connection = activeConnection.value;
   if (!connection || !uploadRemotePath.value.trim()) return;
   uploadDialogOpen.value = false;
-  await runTransfer("upload", {
+  await runUpload({
     connectionId: connection.id,
     remotePath: uploadRemotePath.value.trim(),
     localPath: uploadLocalPath.value,
@@ -261,7 +265,18 @@ async function startDownload(entry: FileEntry) {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const localPath = await save({ defaultPath: entry.name, title: t("fileManager.selectDownload") });
     if (!localPath) return;
-    await runTransfer("download", {
+    const task: FileDownloadTask = {
+      id: crypto.randomUUID(),
+      connectionId: connection.id,
+      remotePath: entry.path,
+      fileName: entry.name,
+      localPath,
+      bytesTransferred: 0,
+      totalBytes: entry.size,
+      status: "downloading",
+    };
+    downloadTasks.value.push(task);
+    await runDownload(task.id, {
       connectionId: connection.id,
       remotePath: entry.path,
       localPath,
@@ -295,29 +310,74 @@ function handleEntryDoubleClick(entry: FileEntry) {
 
 onBeforeUnmount(cancelPendingEntryClick);
 
-async function runTransfer(operation: "upload" | "download", request: FileTransferRequest) {
-  operationActive.value = `${operation}:${request.remotePath}`;
+async function runUpload(request: FileTransferRequest) {
+  operationActive.value = `upload:${request.remotePath}`;
   try {
-    const bytes =
-      operation === "upload"
-        ? await executeWithProductionContextGuard({
-            connection: connectionStore.getConfig(request.connectionId),
-            reviewText: `UPLOAD ${request.localPath} -> ${request.remotePath}${request.replace ? " (replace)" : ""}`,
-            source: t("fileManager.title"),
-            execute: () => api.uploadFile(request),
-          })
-        : await api.downloadFile(request);
+    const bytes = await executeWithProductionContextGuard({
+      connection: connectionStore.getConfig(request.connectionId),
+      reviewText: `UPLOAD ${request.localPath} -> ${request.remotePath}${request.replace ? " (replace)" : ""}`,
+      source: t("fileManager.title"),
+      execute: () => api.uploadFile(request),
+    });
     if (bytes === undefined) return;
-    toast(t(operation === "upload" ? "fileManager.uploadSucceeded" : "fileManager.downloadSucceeded", { size: formatFileSize(bytes) }));
-    if (operation === "upload") await refreshDirectory();
+    toast(t("fileManager.uploadSucceeded", { size: formatFileSize(bytes) }));
+    await refreshDirectory();
   } catch (error) {
     if (typeof error === "object" && error && "code" in error && error.code === "already_exists") {
-      replaceRequest.value = { operation, request: { ...request, replace: true } };
+      replaceRequest.value = { operation: "upload", request: { ...request, replace: true } };
     } else {
       toast(formatError(error), 4000);
     }
   } finally {
     operationActive.value = "";
+  }
+}
+
+async function runDownload(taskId: string, request: FileTransferRequest) {
+  const task = downloadTasks.value.find((candidate) => candidate.id === taskId);
+  if (!task) return;
+  task.status = "downloading";
+  task.error = undefined;
+  if (request.replace) task.bytesTransferred = 0;
+  try {
+    const bytes = await api.downloadFile(request, (progress) => {
+      const activeTask = downloadTasks.value.find((candidate) => candidate.id === taskId);
+      if (!activeTask || activeTask.status !== "downloading") return;
+      activeTask.bytesTransferred = progress.bytesTransferred;
+      activeTask.totalBytes = progress.totalBytes;
+    });
+    task.bytesTransferred = bytes;
+    task.totalBytes ||= bytes;
+    task.status = "completed";
+    toast(t("fileManager.downloadSucceeded", { size: formatFileSize(bytes) }));
+  } catch (error) {
+    if (typeof error === "object" && error && "code" in error && error.code === "already_exists") {
+      task.status = "waiting";
+      replaceRequest.value = { operation: "download", request: { ...request, replace: true }, downloadTaskId: taskId };
+      return;
+    }
+    task.status = "failed";
+    task.error = formatError(error);
+    toast(task.error, 4000);
+  }
+}
+
+async function openDownloadedFile(task: FileDownloadTask) {
+  if (task.status !== "completed") return;
+  try {
+    const { open } = await import("@tauri-apps/plugin-shell");
+    await open(task.localPath);
+  } catch (error) {
+    toast(t("fileManager.openDownloadedFileFailed", { message: formatError(error) }), 5000);
+  }
+}
+
+async function openDownloadFolder(task: FileDownloadTask) {
+  if (task.status !== "completed") return;
+  try {
+    await api.revealPathInFileManager(task.localPath);
+  } catch (error) {
+    toast(t("fileManager.openDownloadFolderFailed", { message: formatError(error) }), 5000);
   }
 }
 
@@ -388,10 +448,10 @@ async function confirmReplace() {
   if (!pending) return;
   switch (pending.operation) {
     case "upload":
-      await runTransfer("upload", pending.request);
+      await runUpload(pending.request);
       break;
     case "download":
-      await runTransfer("download", pending.request);
+      await runDownload(pending.downloadTaskId, pending.request);
       break;
     case "copy":
       await runRemoteOperation("copy", pending.request, pending.sourceKind);
@@ -400,6 +460,15 @@ async function confirmReplace() {
       await runRemoteOperation("rename", pending.request, pending.sourceKind);
       break;
   }
+}
+
+function dismissReplaceRequest() {
+  const pending = replaceRequest.value;
+  if (pending?.operation === "download") {
+    const task = downloadTasks.value.find((candidate) => candidate.id === pending.downloadTaskId);
+    if (task?.status === "waiting") task.status = "cancelled";
+  }
+  replaceRequest.value = undefined;
 }
 
 async function confirmDeleteEntry() {
@@ -507,6 +576,7 @@ defineExpose({ openConnectionById });
           <Upload v-else class="h-4 w-4" />
           {{ t("fileManager.upload") }}
         </Button>
+        <FileDownloadList :tasks="activeConnectionDownloadTasks" @open-file="openDownloadedFile" @open-folder="openDownloadFolder" />
         <span v-if="operationActive" role="status" class="sr-only">{{ t("fileManager.transferring") }}</span>
       </header>
 
@@ -632,7 +702,7 @@ defineExpose({ openConnectionById });
       </DialogContent>
     </Dialog>
 
-    <Dialog :open="!!replaceRequest" @update:open="(open) => !open && (replaceRequest = undefined)">
+    <Dialog :open="!!replaceRequest" @update:open="(open) => !open && dismissReplaceRequest()">
       <DialogContent class="sm:max-w-[420px]">
         <DialogHeader>
           <DialogTitle>{{ t("fileManager.replaceTitle") }}</DialogTitle>
@@ -640,7 +710,7 @@ defineExpose({ openConnectionById });
         <p class="text-sm text-muted-foreground">{{ t("fileManager.replaceMessage") }}</p>
         <p class="truncate font-mono text-xs">{{ replaceDestination }}</p>
         <DialogFooter>
-          <Button variant="outline" @click="replaceRequest = undefined">{{ t("common.cancel") }}</Button>
+          <Button variant="outline" @click="dismissReplaceRequest">{{ t("common.cancel") }}</Button>
           <Button variant="destructive" @click="confirmReplace">{{ t("fileManager.replace") }}</Button>
         </DialogFooter>
       </DialogContent>

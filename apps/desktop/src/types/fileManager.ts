@@ -133,6 +133,11 @@ export interface FileTransferRequest {
   replace?: boolean;
 }
 
+export interface FileTransferProgress {
+  bytesTransferred: number;
+  totalBytes: number;
+}
+
 export interface FileRemoteOperationRequest {
   connectionId: string;
   sourcePath: string;

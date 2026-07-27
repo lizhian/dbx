@@ -593,7 +593,7 @@ export async function uploadFile(_request: import("@/types/fileManager").FileTra
   throw new Error("Remote file connections are only available in the desktop app.");
 }
 
-export async function downloadFile(_request: import("@/types/fileManager").FileTransferRequest): Promise<number> {
+export async function downloadFile(_request: import("@/types/fileManager").FileTransferRequest, _onProgress?: (progress: import("@/types/fileManager").FileTransferProgress) => void): Promise<number> {
   throw new Error("Remote file connections are only available in the desktop app.");
 }
 

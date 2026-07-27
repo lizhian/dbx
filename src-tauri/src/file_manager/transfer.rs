@@ -8,7 +8,7 @@ use dbx_core::connection::AppState;
 use dbx_core::storage::Storage;
 use opendal::Operator;
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use uuid::Uuid;
@@ -21,6 +21,7 @@ use super::service::operator_for_connection;
 use super::service::{ensure_writable_connection, operator_lease_for_connection, validate_remote_path};
 
 const TRANSFER_BUFFER_SIZE: usize = 64 * 1024;
+const DOWNLOAD_PROGRESS_INTERVAL_BYTES: u64 = 1024 * 1024;
 #[cfg(test)]
 pub(crate) const TRANSFER_TIMEOUT_SECS: u64 = 60;
 const GLOBAL_TRANSFER_LIMIT: usize = 8;
@@ -133,25 +134,33 @@ pub async fn download(
     request: FileTransferRequest,
 ) -> Result<u64, FileManagerError> {
     let operator = operator_for_connection(storage, &request.connection_id).await?;
-    download_with_operator(state, request, operator, Some(Duration::from_secs(TRANSFER_TIMEOUT_SECS))).await
+    download_with_operator(state, request, operator, Some(Duration::from_secs(TRANSFER_TIMEOUT_SECS)), |_, _| {}).await
 }
 
-pub async fn download_cached(
+pub async fn download_cached<F>(
     app_state: &AppState,
     registry: &FileOperatorRegistry,
     state: &FileTransferState,
     request: FileTransferRequest,
-) -> Result<u64, FileManagerError> {
+    on_progress: F,
+) -> Result<u64, FileManagerError>
+where
+    F: FnMut(u64, u64),
+{
     let lease = operator_lease_for_connection(app_state, registry, &request.connection_id).await?;
-    download_with_operator(state, request, (*lease.operator).clone(), lease.operation_timeout).await
+    download_with_operator(state, request, (*lease.operator).clone(), lease.operation_timeout, on_progress).await
 }
 
-async fn download_with_operator(
+async fn download_with_operator<F>(
     state: &FileTransferState,
     request: FileTransferRequest,
     operator: Operator,
     timeout: Option<Duration>,
-) -> Result<u64, FileManagerError> {
+    mut on_progress: F,
+) -> Result<u64, FileManagerError>
+where
+    F: FnMut(u64, u64),
+{
     let remote_path = non_root_remote_path(&request.remote_path)?;
     let local_path = absolute_local_path(&request.local_path)?;
     validate_download_target(&local_path, request.replace).await?;
@@ -159,6 +168,12 @@ async fn download_with_operator(
     let (temporary_path, temporary_file) = create_download_temporary(&local_path).await?;
 
     let transfer_result = transfer_with_configured_timeout(timeout, async {
+        let metadata = operator.stat(&remote_path).await.map_err(map_operation_error)?;
+        if !metadata.is_file() {
+            return Err(FileManagerError::configuration("The download source must be a file"));
+        }
+        let total_bytes = metadata.content_length();
+        on_progress(0, total_bytes);
         let reader = operator
             .reader(&remote_path)
             .await
@@ -168,9 +183,11 @@ async fn download_with_operator(
             .map_err(map_operation_error)?
             .compat();
         let mut temporary_file = temporary_file;
-        let bytes = copy_with_fixed_buffer(reader, &mut temporary_file)
-            .await
-            .map_err(|_| FileManagerError::new("transfer", "The download did not complete"))?;
+        let bytes = copy_with_fixed_buffer_progress(reader, &mut temporary_file, |bytes_transferred| {
+            on_progress(bytes_transferred, total_bytes)
+        })
+        .await
+        .map_err(|_| FileManagerError::new("transfer", "The download did not complete"))?;
         temporary_file
             .sync_all()
             .await
@@ -264,6 +281,35 @@ where
     Ok(bytes)
 }
 
+async fn copy_with_fixed_buffer_progress<R, W, F>(reader: R, mut writer: W, mut on_progress: F) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnMut(u64),
+{
+    let mut reader = BufReader::with_capacity(TRANSFER_BUFFER_SIZE, reader);
+    let mut buffer = vec![0_u8; TRANSFER_BUFFER_SIZE];
+    let mut bytes = 0_u64;
+    let mut last_reported = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read]).await?;
+        bytes += read as u64;
+        if bytes - last_reported >= DOWNLOAD_PROGRESS_INTERVAL_BYTES {
+            on_progress(bytes);
+            last_reported = bytes;
+        }
+    }
+    writer.shutdown().await?;
+    if bytes != last_reported {
+        on_progress(bytes);
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn non_root_remote_path(path: &str) -> Result<String, FileManagerError> {
     let path = validate_remote_path(path)?;
     if path.is_empty() {
@@ -347,7 +393,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        copy_with_fixed_buffer, delete, download, upload, FileTransferRequest, FileTransferState, TRANSFER_BUFFER_SIZE,
+        copy_with_fixed_buffer, copy_with_fixed_buffer_progress, delete, download, upload, FileTransferRequest,
+        FileTransferState, DOWNLOAD_PROGRESS_INTERVAL_BYTES, TRANSFER_BUFFER_SIZE,
     };
     use crate::file_manager::models::{
         FileConnectionConfig, FileSecretUpdates, SaveFileConnectionRequest, SecretUpdate,
@@ -406,6 +453,21 @@ mod tests {
         let copied = copy_with_fixed_buffer(reader, &mut writer).await.unwrap();
         assert_eq!(copied, file_size as u64);
         assert_eq!(writer.bytes, file_size);
+        assert!(writer.largest_write <= TRANSFER_BUFFER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn download_progress_is_monotonic_and_reports_completion() {
+        let file_size = DOWNLOAD_PROGRESS_INTERVAL_BYTES as usize * 2 + 17;
+        let reader = GeneratedReader { remaining: file_size };
+        let mut writer = BoundedWriter::default();
+        let mut progress = Vec::new();
+
+        let copied = copy_with_fixed_buffer_progress(reader, &mut writer, |bytes| progress.push(bytes)).await.unwrap();
+
+        assert_eq!(copied, file_size as u64);
+        assert_eq!(progress.last(), Some(&(file_size as u64)));
+        assert!(progress.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(writer.largest_write <= TRANSFER_BUFFER_SIZE);
     }
 

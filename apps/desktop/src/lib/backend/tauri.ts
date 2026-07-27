@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
 import type {
@@ -1481,8 +1481,10 @@ export async function uploadFile(request: import("@/types/fileManager").FileTran
   return invoke("upload_file", { request });
 }
 
-export async function downloadFile(request: import("@/types/fileManager").FileTransferRequest): Promise<number> {
-  return invoke("download_file", { request });
+export async function downloadFile(request: import("@/types/fileManager").FileTransferRequest, onProgress?: (progress: import("@/types/fileManager").FileTransferProgress) => void): Promise<number> {
+  const channel = new Channel<import("@/types/fileManager").FileTransferProgress>();
+  channel.onmessage = (progress) => onProgress?.(progress);
+  return invoke("download_file", { request, onProgress: channel });
 }
 
 export async function deleteFilePath(connectionId: string, path: string): Promise<void> {
