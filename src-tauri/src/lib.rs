@@ -1246,6 +1246,7 @@ pub fn run() {
             app.manage(commands::external_db::ExternalDbOpenState::default());
             app.manage(commands::deep_link::DeepLinkOpenState::default());
             app.manage(commands::update::PendingUpdateState::default());
+            app.manage(file_manager::FileOperatorRegistry::default());
             app.manage(file_manager::FileTransferState::default());
             app.manage(commands::ssh_prompt::SshPromptState::new());
             commands::ssh_prompt::install_ssh_prompt_bridge(app.handle());
@@ -1379,9 +1380,7 @@ pub fn run() {
             commands::connection::load_sidebar_layout,
             commands::file_manager::list_file_connections,
             commands::file_manager::file_connection_secret_status,
-            commands::file_manager::save_file_connection,
-            commands::file_manager::delete_file_connection,
-            commands::file_manager::test_file_connection,
+            commands::file_manager::export_file_connection_secrets,
             commands::file_manager::stat_file_path,
             commands::file_manager::list_file_path,
             commands::file_manager::upload_file,

@@ -720,17 +720,17 @@ export async function setAiGlobalCustomInstructions(content: string): Promise<vo
   return invoke("set_ai_global_custom_instructions", { content });
 }
 
-export async function testConnection(config: ConnectionConfig): Promise<string> {
-  return invoke("test_connection", { config });
+export async function testConnection(config: ConnectionConfig, fileSecretUpdates?: import("@/types/fileManager").FileSecretUpdates): Promise<string> {
+  return invoke("test_connection", { config, fileSecretUpdates });
 }
 
-export async function testConnectionWithInfo(config: ConnectionConfig): Promise<ConnectionTestResult> {
+export async function testConnectionWithInfo(config: ConnectionConfig, fileSecretUpdates?: import("@/types/fileManager").FileSecretUpdates): Promise<ConnectionTestResult> {
   try {
-    const result = await invoke<unknown>("test_connection_with_info", { config });
+    const result = await invoke<unknown>("test_connection_with_info", { config, fileSecretUpdates });
     return normalizeConnectionTestResult(result, config);
   } catch (error) {
     if (!isTauriCommandUnavailable(error, "test_connection_with_info")) throw error;
-    return normalizeConnectionTestResult(await testConnection(config), config);
+    return normalizeConnectionTestResult(await testConnection(config, fileSecretUpdates), config);
   }
 }
 
@@ -1465,16 +1465,8 @@ export async function fileConnectionSecretStatus(id: string): Promise<import("@/
   return invoke("file_connection_secret_status", { id });
 }
 
-export async function saveFileConnection(request: import("@/types/fileManager").SaveFileConnectionRequest): Promise<import("@/types/fileManager").FileConnection> {
-  return invoke("save_file_connection", { request });
-}
-
-export async function deleteFileConnection(id: string): Promise<void> {
-  return invoke("delete_file_connection", { id });
-}
-
-export async function testFileConnection(request: import("@/types/fileManager").TestFileConnectionRequest): Promise<void> {
-  return invoke("test_file_connection", { request });
+export async function exportFileConnectionSecrets(connectionIds: string[]): Promise<Record<string, import("@/types/fileManager").FileSecretExportValues>> {
+  return invoke("export_file_connection_secrets", { connectionIds });
 }
 
 export async function statFilePath(connectionId: string, path: string): Promise<import("@/types/fileManager").FileEntry> {

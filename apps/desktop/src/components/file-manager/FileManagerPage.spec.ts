@@ -5,6 +5,7 @@ import { createPinia } from "pinia";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useToast } from "@/composables/useToast";
 import i18n from "@/i18n";
+import { useConnectionStore } from "@/stores/connectionStore";
 import FileManagerPage from "./FileManagerPage.vue";
 import { displayFilePath, parentFilePath } from "./filePath";
 
@@ -43,6 +44,8 @@ vi.mock("@/lib/backend/api", () => ({
   ]),
   loadSidebarLayout: vi.fn(async () => null),
   loadTunnelProfiles: vi.fn(async () => []),
+  deleteSchemaCache: vi.fn(async () => undefined),
+  deleteSchemaCachePrefix: vi.fn(async () => undefined),
   listFileConnections: vi.fn(async () => [
     {
       id: "ftp-local",
@@ -123,6 +126,21 @@ async function mountPageHandle() {
   return page;
 }
 
+async function mountPageWithStore() {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const app = createApp(FileManagerPage);
+  mountedApps.push(app);
+  const pinia = createPinia();
+  app.use(pinia);
+  app.use(i18n);
+  const page = app.mount(container) as unknown as {
+    openConnectionById: (connectionId: string) => Promise<void>;
+  };
+  await flushPage();
+  return { page, store: useConnectionStore(pinia) };
+}
+
 function buttonWithTitle(title: string): HTMLButtonElement | undefined {
   return Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.title === title);
 }
@@ -179,6 +197,23 @@ describe("FileManagerPage browsing", () => {
     const page = await mountPageHandle();
 
     await expect(page.openConnectionById("missing")).rejects.toThrow("File connection no longer exists");
+  });
+
+  it("refreshes the active connection snapshot after a generic connection edit", async () => {
+    const { page, store } = await mountPageWithStore();
+    await page.openConnectionById("ftp-local");
+    await flushPage();
+    expect(document.body.textContent).toContain("Upload");
+
+    const config = store.getConfig("ftp-local");
+    expect(config).toBeDefined();
+    await store.updateConnection({ ...config!, read_only: true });
+    await flushPage();
+
+    expect(document.body.textContent).not.toContain("Upload");
+    expect(buttonWithTitle("Copy")).toBeUndefined();
+    expect(buttonWithTitle("Rename")).toBeUndefined();
+    expect(buttonWithTitle("Delete")).toBeUndefined();
   });
 
   it("requires explicit Replace before retrying an existing upload", async () => {

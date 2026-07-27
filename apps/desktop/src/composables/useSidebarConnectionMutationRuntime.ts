@@ -126,7 +126,8 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
       const config = connectionStore.getConfig(target.connectionId);
       if (!config) continue;
       const newConfig = { ...config, id: uuid(), name: `${config.name} (Copy)` };
-      await connectionStore.addConnection(newConfig, connectionStore.groupIdForConnection(target.connectionId));
+      const fileSecretUpdates = await connectionStore.fileSecretUpdatesForConnection(target.connectionId);
+      await connectionStore.addConnection(newConfig, connectionStore.groupIdForConnection(target.connectionId), fileSecretUpdates);
       duplicatedCount += 1;
     }
     if (!duplicatedCount) return;
@@ -234,7 +235,7 @@ export function useSidebarConnectionMutationRuntime(options: SidebarConnectionMu
   const canConfigureVisibleDatabases = computed(() => {
     if (activeNode.value.type !== "connection" || !activeNode.value.connectionId) return false;
     const databaseType = connectionStore.getConfig(activeNode.value.connectionId)?.db_type;
-    return databaseType !== "elasticsearch" && databaseType !== "qdrant" && databaseType !== "milvus" && databaseType !== "weaviate" && databaseType !== "chromadb" && databaseType !== "etcd" && databaseType !== "mq" && databaseType !== "nacos";
+    return databaseType !== "elasticsearch" && databaseType !== "qdrant" && databaseType !== "milvus" && databaseType !== "weaviate" && databaseType !== "chromadb" && databaseType !== "etcd" && databaseType !== "mq" && databaseType !== "nacos" && databaseType !== "file";
   });
   const canConfigureVisibleSchemas = computed(() => {
     if (!activeNode.value.connectionId) return false;

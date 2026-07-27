@@ -15,7 +15,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import type { ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, HttpTunnelConfig, IdentifierCase, JdbcDriverInfo, JdbcLocalBundleInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshConfigHostEntry, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
-import type { FileConnection, FileConnectionConfig, FileConnectionImplementation, FileSecretStatus } from "@/types/fileManager";
+import type { FileConnection, FileConnectionConfig, FileConnectionImplementation, FileSecretStatus, FileSecretUpdates } from "@/types/fileManager";
 import type { InfluxDbExternalConfig, InfluxDbVersion } from "@/types/influxdb";
 import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import type { NacosAdminConfig, NacosAuthConfig, NacosImplementation, NacosRNacosConsoleAuth, NacosVersionMode } from "@/types/nacos";
@@ -1610,11 +1610,11 @@ async function persistSuccessfulConnectionTest(result: ConnectionTestResult, con
   }
 }
 
-async function testConnectionWithTimeout(config: ConnectionConfig, runId: number): Promise<ConnectionTestResult> {
+async function testConnectionWithTimeout(config: ConnectionConfig, runId: number, fileSecretUpdates?: FileSecretUpdates): Promise<ConnectionTestResult> {
   await tunnelProfileStore.init();
   const timeoutMs = connectionAttemptTimeoutMs(config, tunnelProfileStore.profileById);
   const timeoutMessage = connectionAttemptTimeoutMessage(timeoutMs);
-  const promise = api.testConnectionWithInfo(config);
+  const promise = api.testConnectionWithInfo(config, fileSecretUpdates);
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   void promise.catch((error) => {
@@ -2932,20 +2932,8 @@ async function testConnection() {
     config = connectionConfigForSubmit(editingId.value || draftTestConnectionId.value);
     if (config.db_type === "file") {
       const request = fileConnectionRequestForSubmit(config.id, config.name);
-      await api.testFileConnection({
-        id: editingId.value || undefined,
-        config: request.config,
-        secrets: request.secrets,
-      });
+      const result = await testConnectionWithTimeout(config, runId, request.secrets);
       if (runId !== testRunId) return;
-      const result: ConnectionTestResult = {
-        message: t("fileManager.testSucceeded"),
-        databaseInfo: {
-          productName: config.driver_label,
-          currentDatabase: fileDraft.protocol === "s3" ? fileDraft.bucket : fileDraft.root,
-          driverName: "Apache OpenDAL",
-        },
-      };
       applySuccessfulConnectionTest(result, config, submittedSourceName);
       void persistSuccessfulConnectionTest(result, config, submittedSourceName, runId);
       clearEditedConnectionErrorAfterSuccessfulTest();
@@ -6576,7 +6564,7 @@ function openExternalUrl(url: string) {
                   <Label :class="connectionLabelSmallClass">{{ t("connection.queryTimeout") }}</Label>
                   <Input v-model.number="form.query_timeout_secs" type="number" min="0" max="300" step="1" class="col-span-3" />
                 </div>
-                <div v-show="form.db_type === 'mongodb'" class="grid grid-cols-4 items-center gap-4">
+                <div v-show="form.db_type === 'mongodb' || form.db_type === 'file'" class="grid grid-cols-4 items-center gap-4">
                   <Label :class="connectionLabelSmallClass">{{ t("connection.idleTimeout") }}</Label>
                   <Input v-model.number="form.idle_timeout_secs" type="number" min="0" max="600" step="1" class="col-span-3" />
                 </div>

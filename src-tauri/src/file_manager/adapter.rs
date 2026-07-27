@@ -10,7 +10,7 @@ use super::models::{
     WebdavAuthentication,
 };
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ResolvedSecrets {
     values: HashMap<&'static str, String>,
 }
@@ -19,6 +19,24 @@ impl ResolvedSecrets {
     pub fn get(&self, key: &'static str) -> &str {
         self.values.get(key).map(String::as_str).unwrap_or_default()
     }
+
+    pub(crate) fn update_fingerprint(&self, hasher: &mut sha2::Sha256) {
+        use sha2::Digest;
+
+        for key in dbx_core::file_connection_config::FILE_SECRET_KEYS {
+            hasher.update((key.len() as u64).to_le_bytes());
+            hasher.update(key.as_bytes());
+            let value = self.get(key).as_bytes();
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeEndpoint {
+    pub host: String,
+    pub port: u16,
 }
 
 pub async fn resolve_secrets(
@@ -63,11 +81,17 @@ pub async fn resolve_secrets(
     Ok(ResolvedSecrets { values })
 }
 
-pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) -> Result<Operator, FileManagerError> {
+pub fn build_operator(
+    config: &FileConnectionConfig,
+    secrets: &ResolvedSecrets,
+    runtime_endpoint: Option<&RuntimeEndpoint>,
+) -> Result<Operator, FileManagerError> {
     match config {
         FileConnectionConfig::Ftp { endpoint, port, root, username } => {
             validate_required("FTP endpoint", endpoint)?;
-            let endpoint = endpoint_with_port(endpoint, "ftp", *port);
+            let endpoint = runtime_endpoint
+                .map(|runtime| endpoint_with_port(&runtime.host, "ftp", runtime.port))
+                .unwrap_or_else(|| endpoint_with_port(endpoint, "ftp", *port));
             Operator::new(
                 services::Ftp::default()
                     .endpoint(&endpoint)
@@ -87,7 +111,9 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
             #[cfg(unix)]
             {
                 validate_required("SFTP endpoint", endpoint)?;
-                let endpoint = endpoint_with_port(endpoint, "ssh", *port);
+                let endpoint = runtime_endpoint
+                    .map(|runtime| endpoint_with_port(&runtime.host, "ssh", runtime.port))
+                    .unwrap_or_else(|| endpoint_with_port(endpoint, "ssh", *port));
                 let mut builder =
                     services::Sftp::default().endpoint(&endpoint).root(root).user(username).known_hosts_strategy("Add");
                 if matches!(authentication, SftpAuthentication::PrivateKey) {
@@ -99,6 +125,7 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
             }
         }
         FileConnectionConfig::S3 { endpoint, region, bucket, root, path_style } => {
+            reject_runtime_endpoint(runtime_endpoint, "S3")?;
             validate_required("S3 endpoint", endpoint)?;
             validate_required("S3 region", region)?;
             validate_required("S3 bucket", bucket)?;
@@ -122,6 +149,7 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
             Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
         }
         FileConnectionConfig::Webdav { endpoint, root, authentication } => {
+            reject_runtime_endpoint(runtime_endpoint, "WebDAV")?;
             validate_required("WebDAV endpoint", endpoint)?;
             let mut builder = services::Webdav::default().endpoint(endpoint).root(root);
             match authentication {
@@ -139,6 +167,7 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
         }
         FileConnectionConfig::Hdfs { config } => match config {
             HdfsConfig::Webhdfs { endpoint, root, simple_user, use_delegation_token } => {
+                reject_runtime_endpoint(runtime_endpoint, "WebHDFS")?;
                 validate_required("WebHDFS endpoint", endpoint)?;
                 let mut builder = services::Webhdfs::default().endpoint(endpoint).root(root);
                 if *use_delegation_token {
@@ -151,12 +180,21 @@ pub fn build_operator(config: &FileConnectionConfig, secrets: &ResolvedSecrets) 
                 Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
             }
             HdfsConfig::Native { name_node_uri, root, hadoop_config_directory } => {
+                reject_runtime_endpoint(runtime_endpoint, "HDFS Native")?;
                 validate_hdfs_name_node_uri(name_node_uri)?;
                 let options = load_hadoop_config_options(hadoop_config_directory)?;
                 let builder = services::HdfsNative::default().name_node(name_node_uri).root(root).options(options);
                 Operator::new(builder).map(|builder| builder.finish()).map_err(map_build_error)
             }
         },
+    }
+}
+
+fn reject_runtime_endpoint(runtime_endpoint: Option<&RuntimeEndpoint>, protocol: &str) -> Result<(), FileManagerError> {
+    if runtime_endpoint.is_some() {
+        Err(FileManagerError::new("unsupported", format!("{protocol} does not support SSH or proxy transport layers")))
+    } else {
+        Ok(())
     }
 }
 
@@ -286,11 +324,14 @@ pub fn map_operation_error(error: opendal::Error) -> FileManagerError {
 
 #[cfg(test)]
 mod tests {
+    use crate::file_manager::models::FileConnectionConfig;
     #[cfg(unix)]
-    use super::{build_operator, ResolvedSecrets};
-    use super::{endpoint_with_port, load_hadoop_config_options, validate_hdfs_name_node_uri};
-    #[cfg(unix)]
-    use crate::file_manager::models::{FileConnectionConfig, SftpAuthentication};
+    use crate::file_manager::models::SftpAuthentication;
+
+    use super::{
+        build_operator, endpoint_with_port, load_hadoop_config_options, validate_hdfs_name_node_uri, ResolvedSecrets,
+        RuntimeEndpoint,
+    };
 
     #[test]
     fn endpoint_port_is_added_once() {
@@ -330,6 +371,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn runtime_endpoint_override_is_limited_to_tcp_safe_protocols() {
+        let runtime = RuntimeEndpoint { host: "127.0.0.1".to_string(), port: 32123 };
+        let secrets = ResolvedSecrets::default();
+        let ftp = FileConnectionConfig::Ftp {
+            endpoint: "ftp.example.com".to_string(),
+            port: 21,
+            root: "/".to_string(),
+            username: "dbx".to_string(),
+        };
+        assert!(build_operator(&ftp, &secrets, Some(&runtime)).is_ok());
+
+        let s3 = FileConnectionConfig::S3 {
+            endpoint: "https://s3.example.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "dbx".to_string(),
+            root: "/".to_string(),
+            path_style: true,
+        };
+        let error = build_operator(&s3, &secrets, Some(&runtime)).unwrap_err();
+        assert_eq!(error.code, "unsupported");
+        assert!(error.message.contains("S3"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn sftp_config_and_agent_use_system_openssh_while_private_key_requires_a_secret_path() {
@@ -341,10 +406,10 @@ mod tests {
             authentication,
         };
         let secrets = ResolvedSecrets::default();
-        assert!(build_operator(&config(SftpAuthentication::SshConfig), &secrets).is_ok());
-        assert!(build_operator(&config(SftpAuthentication::SshAgent), &secrets).is_ok());
+        assert!(build_operator(&config(SftpAuthentication::SshConfig), &secrets, None).is_ok());
+        assert!(build_operator(&config(SftpAuthentication::SshAgent), &secrets, None).is_ok());
         assert_eq!(
-            build_operator(&config(SftpAuthentication::PrivateKey), &secrets).unwrap_err().code,
+            build_operator(&config(SftpAuthentication::PrivateKey), &secrets, None).unwrap_err().code,
             "configuration"
         );
     }

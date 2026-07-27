@@ -1,18 +1,33 @@
+#[cfg(test)]
+use std::collections::HashMap;
 use std::time::Duration;
 
-use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
+use dbx_core::connection::AppState;
+use dbx_core::file_connection_config::FileSecretUpdates as GenericFileSecretUpdates;
+use dbx_core::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
 use dbx_core::storage::Storage;
-use opendal::{EntryMode, Metadata, Operator};
+#[cfg(test)]
+use opendal::Operator;
+use opendal::{EntryMode, Metadata};
 use percent_encoding::percent_decode_str;
 
-use super::adapter::{build_operator, map_operation_error, resolve_secrets};
+use super::adapter::map_operation_error;
+#[cfg(test)]
+use super::adapter::{build_operator, resolve_secrets};
 use super::models::{
     FileCapabilities, FileConnection, FileConnectionConfig, FileEntry, FileEntryKind, FileManagerError,
-    FileSecretStatus, FileSecretUpdates, HdfsConfig, SaveFileConnectionRequest, SecretUpdate, SftpAuthentication,
-    StoredFileConnection, TestFileConnectionRequest, WebdavAuthentication,
+    FileSecretStatus, HdfsConfig, StoredFileConnection,
 };
+#[cfg(test)]
+use super::models::{
+    FileSecretUpdates, SaveFileConnectionRequest, SecretUpdate, SftpAuthentication, TestFileConnectionRequest,
+    WebdavAuthentication,
+};
+use super::registry::{FileOperatorLease, FileOperatorRegistry};
 
+#[cfg(test)]
 const CONNECTION_TEST_TIMEOUT_SECS: u64 = 15;
+#[cfg(test)]
 const FILE_OPERATION_TIMEOUT_SECS: u64 = 60;
 
 pub async fn list_connections(storage: &Storage) -> Result<Vec<FileConnection>, FileManagerError> {
@@ -32,26 +47,26 @@ pub async fn list_connections(storage: &Storage) -> Result<Vec<FileConnection>, 
             status,
         ));
     }
-    if !connections.is_empty() {
-        return Ok(connections);
-    }
-
-    let legacy_values = storage
-        .load_file_connections()
-        .await
-        .map_err(|_| FileManagerError::new("storage", "Failed to load legacy file connections"))?;
-    for value in legacy_values {
-        let stored: StoredFileConnection = serde_json::from_value(value)
-            .map_err(|_| FileManagerError::new("storage", "A saved legacy file connection is invalid"))?;
-        let keys = storage
-            .file_connection_secret_keys(&stored.id)
+    #[cfg(test)]
+    if connections.is_empty() {
+        let legacy_values = storage
+            .load_file_connections()
             .await
-            .map_err(|_| FileManagerError::new("storage", "Failed to load file connection credential status"))?;
-        connections.push(public_connection(stored, FileSecretStatus::from_keys(&keys)));
+            .map_err(|_| FileManagerError::new("storage", "Failed to load legacy file connections"))?;
+        for value in legacy_values {
+            let stored: StoredFileConnection = serde_json::from_value(value)
+                .map_err(|_| FileManagerError::new("storage", "A saved legacy file connection is invalid"))?;
+            let keys = storage
+                .file_connection_secret_keys(&stored.id)
+                .await
+                .map_err(|_| FileManagerError::new("storage", "Failed to load file connection credential status"))?;
+            connections.push(public_connection(stored, FileSecretStatus::from_keys(&keys)));
+        }
     }
     Ok(connections)
 }
 
+#[cfg(test)]
 pub async fn save_connection(
     storage: &Storage,
     mut request: SaveFileConnectionRequest,
@@ -64,9 +79,38 @@ pub async fn save_connection(
         secrets: request.secrets.clone(),
     };
     let resolved = resolve_secrets(storage, &validation_request).await?;
-    build_operator(&request.config, &resolved)?;
+    build_operator(&request.config, &resolved, None)?;
     let updates = request.secrets.persistence_updates().map_err(FileManagerError::configuration)?;
     let stored = StoredFileConnection { id: request.id, name: request.name, config: request.config };
+    let (host, port, ssl) = stored.config.projected_host_port_ssl();
+    let generic: ConnectionConfig = serde_json::from_value(serde_json::json!({
+        "id": stored.id.clone(),
+        "name": stored.name.clone(),
+        "db_type": "file",
+        "driver_profile": stored.config.driver_profile(),
+        "driver_label": stored.config.driver_label(),
+        "host": host,
+        "port": port,
+        "username": stored.config.username(),
+        "password": "",
+        "database": null,
+        "ssl": ssl,
+        "external_config": stored.config.clone(),
+    }))
+    .map_err(|_| FileManagerError::new("storage", "Failed to serialize the file connection"))?;
+    let mut configs = storage
+        .load_connections()
+        .await
+        .map_err(|_| FileManagerError::new("storage", "Failed to load file connections"))?;
+    configs.retain(|config| config.id != generic.id);
+    configs.push(generic);
+    storage
+        .save_connections_with_file_secret_updates(
+            &configs,
+            &HashMap::from([(stored.id.clone(), request.secrets.clone())]),
+        )
+        .await
+        .map_err(|_| FileManagerError::new("storage", "Failed to save the file connection"))?;
     let value = serde_json::to_value(&stored)
         .map_err(|_| FileManagerError::new("storage", "Failed to serialize the file connection"))?;
     storage
@@ -80,6 +124,7 @@ pub async fn save_connection(
     Ok(public_connection(stored, FileSecretStatus::from_keys(&keys)))
 }
 
+#[cfg(test)]
 fn clear_inactive_secret_updates(config: &FileConnectionConfig, secrets: &mut FileSecretUpdates) {
     let (password, private_key, access_key, secret_key, session_token, bearer_token, delegation_token) = match config {
         FileConnectionConfig::Ftp { .. } => (true, false, false, false, false, false, false),
@@ -111,24 +156,36 @@ fn clear_inactive_secret_updates(config: &FileConnectionConfig, secrets: &mut Fi
     }
 }
 
+#[cfg(test)]
 pub async fn delete_connection(storage: &Storage, id: &str) -> Result<(), FileManagerError> {
     if id.trim().is_empty() {
         return Err(FileManagerError::configuration("A file connection ID is required"));
     }
-    let deleted = storage
+    let mut configs = storage
+        .load_connections()
+        .await
+        .map_err(|_| FileManagerError::new("storage", "Failed to load file connections"))?;
+    let before = configs.len();
+    configs.retain(|config| config.id != id);
+    storage
+        .save_connections(&configs)
+        .await
+        .map_err(|_| FileManagerError::new("storage", "Failed to delete the file connection"))?;
+    let deleted_legacy = storage
         .delete_file_connection(id)
         .await
         .map_err(|_| FileManagerError::new("storage", "Failed to delete the file connection"))?;
-    if deleted {
+    if before != configs.len() || deleted_legacy {
         Ok(())
     } else {
         Err(FileManagerError::new("not_found", "The file connection does not exist"))
     }
 }
 
+#[cfg(test)]
 pub async fn test_connection(storage: &Storage, request: TestFileConnectionRequest) -> Result<(), FileManagerError> {
     let secrets = resolve_secrets(storage, &request).await?;
-    let operator = build_operator(&request.config, &secrets)?;
+    let operator = build_operator(&request.config, &secrets, None)?;
     match tokio::time::timeout(Duration::from_secs(CONNECTION_TEST_TIMEOUT_SECS), operator.check()).await {
         Err(_) => Err(FileManagerError::new("timeout", "The file connection test timed out")),
         Ok(Ok(())) => Ok(()),
@@ -145,6 +202,55 @@ pub async fn test_connection(storage: &Storage, request: TestFileConnectionReque
     }
 }
 
+pub async fn test_connection_config(
+    state: &AppState,
+    registry: &FileOperatorRegistry,
+    connection: &ConnectionConfig,
+    secrets: &GenericFileSecretUpdates,
+) -> Result<DatabaseConnectionInfo, FileManagerError> {
+    let file_config = file_config_from_connection(connection)?;
+    let lease = registry.build_transient(state, connection, secrets).await?;
+    let tunnel_id = format!("{}:file-test", connection.id);
+    let result = match tokio::time::timeout(
+        Duration::from_secs(connection.effective_connect_timeout_secs()),
+        lease.operator.check(),
+    )
+    .await
+    {
+        Err(_) => Err(FileManagerError::new("timeout", "The file connection test timed out")),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            let mapped = map_operation_error(error);
+            match mapped.code {
+                "configuration" | "unsupported" => Err(mapped),
+                _ => Err(FileManagerError::new(
+                    "connection_failed",
+                    "Could not connect or authenticate with the remote file service",
+                )),
+            }
+        }
+    };
+    state.reset_connection_transport_for_config(&tunnel_id, connection).await;
+    result?;
+
+    let current_database = match &file_config {
+        FileConnectionConfig::S3 { bucket, root, .. } if root.is_empty() => Some(bucket.clone()),
+        FileConnectionConfig::S3 { bucket, root, .. } => Some(format!("{bucket}/{root}")),
+        FileConnectionConfig::Ftp { root, .. }
+        | FileConnectionConfig::Sftp { root, .. }
+        | FileConnectionConfig::Webdav { root, .. }
+        | FileConnectionConfig::Hdfs { config: HdfsConfig::Webhdfs { root, .. } }
+        | FileConnectionConfig::Hdfs { config: HdfsConfig::Native { root, .. } } => Some(root.clone()),
+    };
+    Ok(DatabaseConnectionInfo {
+        product_name: Some(file_config.driver_label().to_string()),
+        current_database,
+        driver_name: Some("Apache OpenDAL".to_string()),
+        ..Default::default()
+    })
+}
+
+#[cfg(test)]
 pub async fn stat_path(storage: &Storage, connection_id: &str, path: &str) -> Result<FileEntry, FileManagerError> {
     let path = validate_remote_path(path)?;
     let operator = operator_for_connection(storage, connection_id).await?;
@@ -152,6 +258,19 @@ pub async fn stat_path(storage: &Storage, connection_id: &str, path: &str) -> Re
     Ok(entry_from_metadata(&path, &metadata))
 }
 
+pub async fn stat_path_cached(
+    state: &AppState,
+    registry: &FileOperatorRegistry,
+    connection_id: &str,
+    path: &str,
+) -> Result<FileEntry, FileManagerError> {
+    let path = validate_remote_path(path)?;
+    let lease = registry.get_or_build(state, connection_id).await?;
+    let metadata = with_configured_timeout(lease.operation_timeout, lease.operator.stat(&path)).await?;
+    Ok(entry_from_metadata(&path, &metadata))
+}
+
+#[cfg(test)]
 pub async fn list_path(storage: &Storage, connection_id: &str, path: &str) -> Result<Vec<FileEntry>, FileManagerError> {
     let path = validate_remote_path(path)?;
     let directory = if path.is_empty() { String::new() } else { format!("{path}/") };
@@ -171,6 +290,19 @@ pub async fn list_path(storage: &Storage, connection_id: &str, path: &str) -> Re
         right_directory.cmp(&left_directory).then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
     Ok(result)
+}
+
+pub async fn list_path_cached(
+    state: &AppState,
+    registry: &FileOperatorRegistry,
+    connection_id: &str,
+    path: &str,
+) -> Result<Vec<FileEntry>, FileManagerError> {
+    let path = validate_remote_path(path)?;
+    let directory = if path.is_empty() { String::new() } else { format!("{path}/") };
+    let lease = registry.get_or_build(state, connection_id).await?;
+    let entries = with_configured_timeout(lease.operation_timeout, lease.operator.list(&directory)).await?;
+    entries_from_listing(&directory, entries)
 }
 
 pub fn validate_remote_path(path: &str) -> Result<String, FileManagerError> {
@@ -211,6 +343,7 @@ fn validate_path_representation(path: &str) -> Result<(), FileManagerError> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn operator_for_connection(
     storage: &Storage,
     connection_id: &str,
@@ -218,9 +351,18 @@ pub(crate) async fn operator_for_connection(
     let stored = stored_connection(storage, connection_id).await?;
     let request = TestFileConnectionRequest { id: Some(stored.id), config: stored.config, secrets: Default::default() };
     let secrets = resolve_secrets(storage, &request).await?;
-    build_operator(&request.config, &secrets)
+    build_operator(&request.config, &secrets, None)
 }
 
+pub(crate) async fn operator_lease_for_connection(
+    state: &AppState,
+    registry: &FileOperatorRegistry,
+    connection_id: &str,
+) -> Result<FileOperatorLease, FileManagerError> {
+    registry.get_or_build(state, connection_id).await
+}
+
+#[cfg(test)]
 async fn stored_connection(storage: &Storage, connection_id: &str) -> Result<StoredFileConnection, FileManagerError> {
     if let Some(config) = connection_config(storage, connection_id).await? {
         let file_config = file_config_from_connection(&config)?;
@@ -258,7 +400,7 @@ async fn connection_config(
         })
 }
 
-fn file_config_from_connection(config: &ConnectionConfig) -> Result<FileConnectionConfig, FileManagerError> {
+pub(crate) fn file_config_from_connection(config: &ConnectionConfig) -> Result<FileConnectionConfig, FileManagerError> {
     let value = config
         .external_config
         .clone()
@@ -272,6 +414,7 @@ fn file_config_from_connection(config: &ConnectionConfig) -> Result<FileConnecti
     Ok(file_config)
 }
 
+#[cfg(test)]
 async fn with_operation_timeout<T>(
     operation: impl std::future::Future<Output = opendal::Result<T>>,
 ) -> Result<T, FileManagerError> {
@@ -280,6 +423,37 @@ async fn with_operation_timeout<T>(
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(map_operation_error(error)),
     }
+}
+
+pub(crate) async fn with_configured_timeout<T>(
+    timeout: Option<Duration>,
+    operation: impl std::future::Future<Output = opendal::Result<T>>,
+) -> Result<T, FileManagerError> {
+    match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, operation).await {
+            Err(_) => Err(FileManagerError::new("timeout", "The remote file operation timed out")),
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(map_operation_error(error)),
+        },
+        None => operation.await.map_err(map_operation_error),
+    }
+}
+
+fn entries_from_listing(directory: &str, entries: Vec<opendal::Entry>) -> Result<Vec<FileEntry>, FileManagerError> {
+    let mut result = entries
+        .into_iter()
+        .filter(|entry| entry.path() != directory)
+        .map(|entry| {
+            let path = validate_remote_path(entry.path())?;
+            Ok(entry_from_metadata(&path, entry.metadata()))
+        })
+        .collect::<Result<Vec<_>, FileManagerError>>()?;
+    result.sort_by(|left, right| {
+        let left_directory = left.kind == FileEntryKind::Directory;
+        let right_directory = right.kind == FileEntryKind::Directory;
+        right_directory.cmp(&left_directory).then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(result)
 }
 
 fn entry_from_metadata(path: &str, metadata: &Metadata) -> FileEntry {
@@ -298,6 +472,7 @@ fn entry_from_metadata(path: &str, metadata: &Metadata) -> FileEntry {
     }
 }
 
+#[cfg(test)]
 fn validate_identity(id: &str, name: &str) -> Result<(), FileManagerError> {
     if id.trim().is_empty() {
         return Err(FileManagerError::configuration("A file connection ID is required"));

@@ -101,15 +101,19 @@ export interface FileSecretUpdates {
   delegationToken?: SecretUpdate;
 }
 
+export interface FileSecretExportValues {
+  password?: string;
+  private_key?: string;
+  access_key?: string;
+  secret_key?: string;
+  session_token?: string;
+  bearer_token?: string;
+  delegation_token?: string;
+}
+
 export interface SaveFileConnectionRequest {
   id: string;
   name: string;
-  config: FileConnectionConfig;
-  secrets?: FileSecretUpdates;
-}
-
-export interface TestFileConnectionRequest {
-  id?: string;
   config: FileConnectionConfig;
   secrets?: FileSecretUpdates;
 }

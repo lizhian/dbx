@@ -22,7 +22,7 @@ import type {
   TunnelProfile,
   VectorCollectionMeta,
 } from "@/types/database";
-import type { FileSecretUpdates } from "@/types/fileManager";
+import type { FileSecretExportValues, FileSecretUpdates } from "@/types/fileManager";
 import {
   inheritNaturalTreeNodeOrder,
   migrateLegacyPinnedTreeNodeOrder,
@@ -1978,12 +1978,19 @@ export const useConnectionStore = defineStore("connection", () => {
     return entries.length;
   }
 
+  async function fileSecretUpdatesForConnection(connectionId: string): Promise<FileSecretUpdates | undefined> {
+    if (getConfig(connectionId)?.db_type !== "file") return undefined;
+    const exported = await api.exportFileConnectionSecrets([connectionId]);
+    return fileSecretUpdatesFromExport(exported[connectionId]);
+  }
+
   async function pasteConnectionClipboard(targetGroupId?: string | null): Promise<number> {
     const clipboard = treeClipboard.value;
     if (clipboard?.kind !== "connection-copy" || clipboard.connections.length === 0) return 0;
 
     let pastedCount = 0;
     for (const entry of clipboard.connections) {
+      const fileSecretUpdates = await fileSecretUpdatesForConnection(entry.config.id);
       await addConnection(
         {
           ...entry.config,
@@ -1991,6 +1998,7 @@ export const useConnectionStore = defineStore("connection", () => {
           name: `${entry.config.name} (Copy)`,
         },
         targetGroupId === undefined ? entry.sourceGroupId : targetGroupId,
+        fileSecretUpdates,
       );
       pastedCount += 1;
     }
@@ -5654,7 +5662,14 @@ export const useConnectionStore = defineStore("connection", () => {
     const { encryptConfig } = await import("@/lib/backend/configCrypto");
     const tunnelProfileStore = useTunnelProfileStore();
     await tunnelProfileStore.init();
-    const exportData = { connections: connections.value, layout: sidebarLayout.value, tunnelProfiles: tunnelProfileStore.profiles };
+    const fileConnectionIds = connections.value.filter((connection) => connection.db_type === "file").map((connection) => connection.id);
+    const fileSecrets = fileConnectionIds.length > 0 ? await api.exportFileConnectionSecrets(fileConnectionIds) : {};
+    const exportData = {
+      connections: connections.value,
+      layout: sidebarLayout.value,
+      tunnelProfiles: tunnelProfileStore.profiles,
+      fileSecrets,
+    };
     const json = JSON.stringify(exportData);
     const payload = await encryptConfig(json, passphrase);
     const content = JSON.stringify(payload, null, 2);
@@ -5677,6 +5692,24 @@ export const useConnectionStore = defineStore("connection", () => {
       a.click();
       URL.revokeObjectURL(url);
     }
+  }
+
+  function fileSecretUpdatesFromExport(values: FileSecretExportValues | undefined): FileSecretUpdates | undefined {
+    if (!values || typeof values !== "object") return undefined;
+    const updates: FileSecretUpdates = {};
+    const set = (field: keyof FileSecretUpdates, value: unknown) => {
+      if (typeof value === "string" && value.length > 0) {
+        updates[field] = { action: "set", value };
+      }
+    };
+    set("password", values.password);
+    set("privateKey", values.private_key);
+    set("accessKey", values.access_key);
+    set("secretKey", values.secret_key);
+    set("sessionToken", values.session_token);
+    set("bearerToken", values.bearer_token);
+    set("delegationToken", values.delegation_token);
+    return Object.keys(updates).length > 0 ? updates : undefined;
   }
 
   function bytesToBase64(bytes: Uint8Array) {
@@ -5853,6 +5886,7 @@ export const useConnectionStore = defineStore("connection", () => {
     let imported: ConnectionConfig[] = [];
     let importedLayout: SidebarLayout | undefined;
     let importedTunnelProfiles: TunnelProfile[] = [];
+    let importedFileSecrets: Record<string, FileSecretExportValues> = {};
 
     if (!passphrase && content.trimStart().startsWith("<")) {
       const { parseNavicatConnections } = await import("@/lib/imports/navicatImport");
@@ -5890,6 +5924,9 @@ export const useConnectionStore = defineStore("connection", () => {
           if (Array.isArray(parsed.tunnelProfiles)) {
             importedTunnelProfiles = parsed.tunnelProfiles;
           }
+          if (parsed.fileSecrets && typeof parsed.fileSecrets === "object") {
+            importedFileSecrets = parsed.fileSecrets;
+          }
         } else {
           imported = [];
         }
@@ -5910,6 +5947,9 @@ export const useConnectionStore = defineStore("connection", () => {
           }
           if (Array.isArray(decrypted.tunnelProfiles)) {
             importedTunnelProfiles = decrypted.tunnelProfiles;
+          }
+          if (decrypted.fileSecrets && typeof decrypted.fileSecrets === "object") {
+            importedFileSecrets = decrypted.fileSecrets;
           }
         } else {
           imported = [];
@@ -5939,10 +5979,11 @@ export const useConnectionStore = defineStore("connection", () => {
       const duplicate = connections.value.find((c) => c.name === config.name && c.host === config.host && c.port === config.port);
       if (!duplicate) {
         const importedId = config.id;
+        const fileSecretUpdates = config.db_type === "file" && typeof importedId === "string" ? fileSecretUpdatesFromExport(importedFileSecrets[importedId]) : undefined;
         config.id = uuid();
         if (typeof importedId === "string") importedConnectionIdMap.set(importedId, config.id);
         const normalized = normalizeConnection(config);
-        await addConnection(normalized);
+        await addConnection(normalized, undefined, fileSecretUpdates);
         count++;
       } else if (typeof config.id === "string") {
         importedConnectionIdMap.set(config.id, duplicate.id);
@@ -6086,6 +6127,7 @@ export const useConnectionStore = defineStore("connection", () => {
     addConnection,
     copyConnectionsToTreeClipboard,
     pasteConnectionClipboard,
+    fileSecretUpdatesForConnection,
     addEphemeralConnection,
     updateConnection,
     updateConnectionDatabaseInfo,

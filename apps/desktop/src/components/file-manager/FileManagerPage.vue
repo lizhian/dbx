@@ -26,6 +26,7 @@ const deleteActive = ref(false);
 const loadError = ref("");
 const runtimeConnections = ref(new Map<string, FileConnection>());
 const runtimeConnectionsLoading = ref(false);
+let runtimeConnectionsRefreshGeneration = 0;
 const fileConnections = computed(() => connectionStore.connections.filter((connection) => connection.db_type === "file"));
 const activeConnection = ref<FileConnection>();
 const currentPath = ref("");
@@ -69,16 +70,29 @@ function effectiveRuntimeConnection(config: ConnectionConfig): FileConnection | 
   };
 }
 
+function syncActiveConnection() {
+  const activeId = activeConnection.value?.id;
+  if (!activeId) return;
+  const config = fileConnections.value.find((connection) => connection.id === activeId);
+  const connection = config ? effectiveRuntimeConnection(config) : undefined;
+  if (connection) activeConnection.value = connection;
+  else closeBrowser();
+}
+
 async function refreshRuntimeConnections() {
+  const generation = ++runtimeConnectionsRefreshGeneration;
   runtimeConnectionsLoading.value = true;
   try {
     const runtime = await api.listFileConnections();
+    if (generation !== runtimeConnectionsRefreshGeneration) return;
     runtimeConnections.value = new Map(runtime.map((connection) => [connection.id, connection]));
+    syncActiveConnection();
     loadError.value = "";
   } catch (error) {
+    if (generation !== runtimeConnectionsRefreshGeneration) return;
     loadError.value = formatError(error);
   } finally {
-    runtimeConnectionsLoading.value = false;
+    if (generation === runtimeConnectionsRefreshGeneration) runtimeConnectionsLoading.value = false;
   }
 }
 
@@ -92,9 +106,11 @@ onMounted(async () => {
 });
 
 watch(
-  () => fileConnections.value.map((connection) => `${connection.id}:${connection.driver_profile}:${JSON.stringify(connection.external_config)}:${connection.read_only}`).join("|"),
-  () => {
-    void refreshRuntimeConnections();
+  () => fileConnections.value.map((connection) => `${connection.id}:${connection.name}:${connection.driver_profile}:${JSON.stringify(connection.external_config)}:${connection.read_only}`).join("|"),
+  async () => {
+    const activeId = activeConnection.value?.id;
+    await refreshRuntimeConnections();
+    if (activeId && activeConnection.value?.id === activeId) await refreshDirectory();
   },
 );
 

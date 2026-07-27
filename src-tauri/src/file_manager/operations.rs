@@ -1,3 +1,5 @@
+use dbx_core::connection::AppState;
+#[cfg(test)]
 use dbx_core::storage::Storage;
 use opendal::{ErrorKind, Operator};
 use std::future::Future;
@@ -6,54 +8,98 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use super::adapter::map_operation_error;
 use super::models::{FileManagerError, FileRemoteOperationRequest};
-use super::service::{ensure_writable_connection, operator_for_connection};
+use super::registry::FileOperatorRegistry;
+#[cfg(test)]
+use super::service::operator_for_connection;
+use super::service::{ensure_writable_connection, operator_lease_for_connection};
+#[cfg(test)]
+use super::transfer::TRANSFER_TIMEOUT_SECS;
 use super::transfer::{
-    copy_with_fixed_buffer, non_root_remote_path, transfer_timeout, FileTransferState, TRANSFER_TIMEOUT_SECS,
+    copy_with_fixed_buffer, non_root_remote_path, transfer_with_configured_timeout, FileTransferState,
 };
 
+#[cfg(test)]
 pub async fn copy(
     storage: &Storage,
     state: &FileTransferState,
     request: FileRemoteOperationRequest,
 ) -> Result<(), FileManagerError> {
     ensure_writable_connection(storage, &request.connection_id).await?;
-    let source = non_root_remote_path(&request.source_path)?;
-    let destination = destination_path(&source, &request.destination_path)?;
     let operator = operator_for_connection(storage, &request.connection_id).await?;
-    let _permits = state.acquire(&request.connection_id).await?;
-    transfer_timeout(copy_with_operator(&operator, &source, &destination, request.replace)).await
+    copy_with_cached_operator(state, request, operator, Some(Duration::from_secs(TRANSFER_TIMEOUT_SECS))).await
 }
 
+pub async fn copy_cached(
+    app_state: &AppState,
+    registry: &FileOperatorRegistry,
+    state: &FileTransferState,
+    request: FileRemoteOperationRequest,
+) -> Result<(), FileManagerError> {
+    ensure_writable_connection(&app_state.storage, &request.connection_id).await?;
+    let lease = operator_lease_for_connection(app_state, registry, &request.connection_id).await?;
+    copy_with_cached_operator(state, request, (*lease.operator).clone(), lease.operation_timeout).await
+}
+
+async fn copy_with_cached_operator(
+    state: &FileTransferState,
+    request: FileRemoteOperationRequest,
+    operator: Operator,
+    timeout: Option<Duration>,
+) -> Result<(), FileManagerError> {
+    let source = non_root_remote_path(&request.source_path)?;
+    let destination = destination_path(&source, &request.destination_path)?;
+    let _permits = state.acquire(&request.connection_id).await?;
+    transfer_with_configured_timeout(timeout, copy_with_operator(&operator, &source, &destination, request.replace))
+        .await
+}
+
+#[cfg(test)]
 pub async fn rename(
     storage: &Storage,
     state: &FileTransferState,
     request: FileRemoteOperationRequest,
 ) -> Result<(), FileManagerError> {
     ensure_writable_connection(storage, &request.connection_id).await?;
+    let operator = operator_for_connection(storage, &request.connection_id).await?;
+    rename_with_cached_operator(state, request, operator, Some(Duration::from_secs(TRANSFER_TIMEOUT_SECS))).await
+}
+
+pub async fn rename_cached(
+    app_state: &AppState,
+    registry: &FileOperatorRegistry,
+    state: &FileTransferState,
+    request: FileRemoteOperationRequest,
+) -> Result<(), FileManagerError> {
+    ensure_writable_connection(&app_state.storage, &request.connection_id).await?;
+    let lease = operator_lease_for_connection(app_state, registry, &request.connection_id).await?;
+    rename_with_cached_operator(state, request, (*lease.operator).clone(), lease.operation_timeout).await
+}
+
+async fn rename_with_cached_operator(
+    state: &FileTransferState,
+    request: FileRemoteOperationRequest,
+    operator: Operator,
+    timeout: Option<Duration>,
+) -> Result<(), FileManagerError> {
     let source = non_root_remote_path(&request.source_path)?;
     let destination = destination_path(&source, &request.destination_path)?;
-    let operator = operator_for_connection(storage, &request.connection_id).await?;
     let _permits = state.acquire(&request.connection_id).await?;
     if operator.info().full_capability().rename {
-        transfer_timeout(async {
+        transfer_with_configured_timeout(timeout, async {
             ensure_source_file(&operator, &source).await?;
             ensure_destination(&operator, &destination, request.replace).await?;
             operator.rename(&source, &destination).await.map_err(map_operation_error)
         })
         .await
     } else {
-        fallback_rename_with_delete(
-            &operator,
-            &source,
-            &destination,
-            request.replace,
-            Duration::from_secs(TRANSFER_TIMEOUT_SECS),
-            || operator.delete(&source),
-        )
+        fallback_rename_with_optional_timeout(&operator, &source, &destination, request.replace, timeout, || {
+            operator.delete(&source)
+        })
         .await
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn fallback_rename_with_delete<F, Fut>(
     operator: &Operator,
     source: &str,
@@ -66,17 +112,34 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<(), opendal::Error>>,
 {
+    fallback_rename_with_optional_timeout(operator, source, destination, replace, Some(timeout), delete_source).await
+}
+
+async fn fallback_rename_with_optional_timeout<F, Fut>(
+    operator: &Operator,
+    source: &str,
+    destination: &str,
+    replace: bool,
+    timeout: Option<Duration>,
+    delete_source: F,
+) -> Result<(), FileManagerError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<(), opendal::Error>>,
+{
     let mut copied = false;
-    let result = tokio::time::timeout(timeout, async {
+    let operation = async {
         copy_with_operator(operator, source, destination, replace).await?;
         copied = true;
         delete_source().await.map_err(|_| partial_rename_error(source, destination))
-    })
-    .await;
-    match result {
-        Ok(result) => result,
-        Err(_) if copied => Err(partial_rename_error(source, destination)),
-        Err(_) => Err(FileManagerError::new("timeout", "The file transfer timed out")),
+    };
+    match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => result,
+            Err(_) if copied => Err(partial_rename_error(source, destination)),
+            Err(_) => Err(FileManagerError::new("timeout", "The file transfer timed out")),
+        },
+        None => operation.await,
     }
 }
 

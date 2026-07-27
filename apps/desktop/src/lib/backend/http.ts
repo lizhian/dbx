@@ -242,11 +242,14 @@ function qs(params: Record<string, string | number | boolean | undefined>): stri
 // Connection
 // ---------------------------------------------------------------------------
 
-export async function testConnection(config: ConnectionConfig): Promise<string> {
+export async function testConnection(config: ConnectionConfig, _fileSecretUpdates?: import("@/types/fileManager").FileSecretUpdates): Promise<string> {
   return post("/api/connection/test", { config });
 }
 
-export async function testConnectionWithInfo(config: ConnectionConfig): Promise<ConnectionTestResult> {
+export async function testConnectionWithInfo(config: ConnectionConfig, fileSecretUpdates?: import("@/types/fileManager").FileSecretUpdates): Promise<ConnectionTestResult> {
+  if (config.db_type === "file" || fileSecretUpdates) {
+    throw new Error("Remote file connections are only available in the desktop app.");
+  }
   const response = await fetch(apiUrl("/api/connection/test-info"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -574,15 +577,7 @@ export async function fileConnectionSecretStatus(_id: string): Promise<import("@
   throw new Error("Remote file connections are only available in the desktop app.");
 }
 
-export async function saveFileConnection(_request: import("@/types/fileManager").SaveFileConnectionRequest): Promise<import("@/types/fileManager").FileConnection> {
-  throw new Error("Remote file connections are only available in the desktop app.");
-}
-
-export async function deleteFileConnection(_id: string): Promise<void> {
-  throw new Error("Remote file connections are only available in the desktop app.");
-}
-
-export async function testFileConnection(_request: import("@/types/fileManager").TestFileConnectionRequest): Promise<void> {
+export async function exportFileConnectionSecrets(_connectionIds: string[]): Promise<Record<string, import("@/types/fileManager").FileSecretExportValues>> {
   throw new Error("Remote file connections are only available in the desktop app.");
 }
 

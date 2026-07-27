@@ -106,6 +106,7 @@ pub struct StoredFileConnection {
     pub config: FileConnectionConfig,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveFileConnectionRequest {

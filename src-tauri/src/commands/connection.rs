@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tauri::State;
 
+use crate::file_manager::{validate_file_connection_config, FileOperatorRegistry, FileTransferState};
 pub use dbx_core::agent_connection::{
     agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver, oracle_alternate_connect_config,
     oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
@@ -544,12 +545,26 @@ mod tests {
 #[tauri::command]
 pub async fn save_connections(
     state: State<'_, Arc<AppState>>,
+    file_registry: State<'_, FileOperatorRegistry>,
     configs: Vec<ConnectionConfig>,
     file_secret_updates: Option<HashMap<String, FileSecretUpdates>>,
 ) -> Result<(), String> {
     let configs: Vec<ConnectionConfig> = configs.into_iter().map(|config| config.canonicalized()).collect();
     let file_secret_updates = file_secret_updates.unwrap_or_default();
-    save_connection_configs_with_file_secrets(state.inner(), &configs, &file_secret_updates).await
+    let mut file_ids: HashSet<String> = state
+        .configs
+        .read()
+        .await
+        .values()
+        .filter(|config| config.db_type == DatabaseType::FileManager)
+        .map(|config| config.id.clone())
+        .collect();
+    file_ids.extend(
+        configs.iter().filter(|config| config.db_type == DatabaseType::FileManager).map(|config| config.id.clone()),
+    );
+    save_connection_configs_with_file_secrets(state.inner(), &configs, &file_secret_updates).await?;
+    file_registry.drop_connections(state.inner(), file_ids.iter().map(String::as_str)).await;
+    Ok(())
 }
 
 async fn save_connection_configs(state: &AppState, configs: &[ConnectionConfig]) -> Result<(), String> {
@@ -568,6 +583,9 @@ async fn save_connection_configs_with_file_secrets(
                 &config.password,
                 !config.attached_databases.is_empty(),
             )?;
+        }
+        if config.db_type == DatabaseType::FileManager {
+            validate_file_connection_config(state, config).await.map_err(|error| error.message)?;
         }
     }
     state.storage.save_connections_with_file_secret_updates(configs, file_secret_updates).await?;
@@ -727,22 +745,51 @@ async fn test_redis_connection(
 }
 
 #[tauri::command]
-pub async fn test_connection(state: State<'_, Arc<AppState>>, config: ConnectionConfig) -> Result<String, String> {
-    test_connection_with_info_inner(state.inner(), config).await.map(|result| result.message)
+pub async fn test_connection(
+    state: State<'_, Arc<AppState>>,
+    file_registry: State<'_, FileOperatorRegistry>,
+    config: ConnectionConfig,
+    file_secret_updates: Option<FileSecretUpdates>,
+) -> Result<String, String> {
+    test_connection_with_info_inner(
+        state.inner(),
+        file_registry.inner(),
+        config,
+        file_secret_updates.unwrap_or_default(),
+    )
+    .await
+    .map(|result| result.message)
 }
 
 #[tauri::command]
 pub async fn test_connection_with_info(
     state: State<'_, Arc<AppState>>,
+    file_registry: State<'_, FileOperatorRegistry>,
     config: ConnectionConfig,
+    file_secret_updates: Option<FileSecretUpdates>,
 ) -> Result<ConnectionTestResult, String> {
-    test_connection_with_info_inner(state.inner(), config).await
+    test_connection_with_info_inner(
+        state.inner(),
+        file_registry.inner(),
+        config,
+        file_secret_updates.unwrap_or_default(),
+    )
+    .await
 }
 
 async fn test_connection_with_info_inner(
     state: &Arc<AppState>,
+    file_registry: &FileOperatorRegistry,
     config: ConnectionConfig,
+    file_secret_updates: FileSecretUpdates,
 ) -> Result<ConnectionTestResult, String> {
+    if config.db_type == DatabaseType::FileManager {
+        let database_info =
+            crate::file_manager::service::test_connection_config(state, file_registry, &config, &file_secret_updates)
+                .await
+                .map_err(|error| error.message)?;
+        return Ok(ConnectionTestResult::success("Connection successful").with_database_info(Some(database_info)));
+    }
     let tunnel_id = format!("{}:test", config.id);
     let has_transport_layers = config.has_effective_transport_layers();
     let connection_id = if has_transport_layers { tunnel_id.as_str() } else { config.id.as_str() };
@@ -1405,6 +1452,8 @@ pub async fn connection_final_proxy_port(
 #[tauri::command]
 pub async fn disconnect_db(
     state: State<'_, Arc<AppState>>,
+    file_registry: State<'_, FileOperatorRegistry>,
+    file_transfer_state: State<'_, FileTransferState>,
     connection_id: String,
     client_attempt: Option<u64>,
 ) -> Result<(), String> {
@@ -1421,6 +1470,8 @@ pub async fn disconnect_db(
     state.remove_connection_pools_detached(&connection_id).await;
     drop_nacos_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
     drop_mq_adapters_for_connection_ids(state.inner(), std::slice::from_ref(&connection_id)).await;
+    file_registry.drop_connection(state.inner(), &connection_id).await;
+    file_transfer_state.forget_connection(&connection_id).await;
     state.reset_connection_transport(&connection_id).await;
     if connection_id.starts_with("__visible_draft_") || connection_id.starts_with("__visible_schema_draft_") {
         state.configs.write().await.remove(&connection_id);

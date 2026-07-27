@@ -74,7 +74,7 @@ export function supportsClearableQuerySchema(dbType?: DatabaseType): boolean {
 }
 
 export function supportsConnectionQueryActions(dbType?: DatabaseType): boolean {
-  return dbType !== "nacos";
+  return dbType !== "nacos" && dbType !== "file";
 }
 
 export function usesFetchFirst(dbType?: DatabaseType): boolean {

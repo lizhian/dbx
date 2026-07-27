@@ -812,7 +812,7 @@ async fn apply_sensitive_payload(storage: &Storage, payload: &SensitiveSyncPaylo
         if !SECRET_KEYS.contains(&secret.key.as_str())
             && !secret.key.starts_with(SSH_TUNNEL_SECRET_PREFIX)
             && !secret.key.starts_with(TRANSPORT_LAYER_SECRET_PREFIX)
-            && !secret.key.starts_with(FILE_SECRET_PREFIX)
+            && !is_file_secret_key(&secret.key)
         {
             continue;
         }
@@ -838,6 +838,10 @@ async fn apply_sensitive_payload(storage: &Storage, payload: &SensitiveSyncPaylo
         storage.save_tunnel_profiles(profiles).await?;
     }
     Ok(())
+}
+
+fn is_file_secret_key(key: &str) -> bool {
+    key.strip_prefix(FILE_SECRET_PREFIX).is_some_and(|key| FILE_SECRET_KEYS.contains(&key))
 }
 
 async fn clear_connection_secrets(storage: &Storage, connections: &[ConnectionConfig]) -> Result<(), String> {
@@ -1588,6 +1592,32 @@ mod tests {
             restored.get_secret("files", "file.access_key").await.unwrap().as_deref(),
             Some("file-access-secret")
         );
+    }
+
+    #[tokio::test]
+    async fn sensitive_payload_accepts_only_declared_file_secret_keys() {
+        let storage = Storage::open(&temp_db_path("file-secret-allowlist")).await.unwrap();
+        let payload = SensitiveSyncPayload {
+            connection_secrets: vec![
+                ConnectionSecretSnapshot {
+                    connection_id: "files".to_string(),
+                    key: "file.password".to_string(),
+                    secret: "allowed".to_string(),
+                },
+                ConnectionSecretSnapshot {
+                    connection_id: "files".to_string(),
+                    key: "file.unexpected".to_string(),
+                    secret: "rejected".to_string(),
+                },
+            ],
+            ai_configs: None,
+            ai_config: None,
+            tunnel_profiles: None,
+        };
+
+        apply_sensitive_payload(&storage, &payload).await.unwrap();
+        assert_eq!(storage.get_secret("files", "file.password").await.unwrap().as_deref(), Some("allowed"));
+        assert_eq!(storage.get_secret("files", "file.unexpected").await.unwrap(), None);
     }
 
     #[tokio::test]

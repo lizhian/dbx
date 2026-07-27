@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use dbx_core::connection::AppState;
+#[cfg(test)]
 use dbx_core::storage::Storage;
+use opendal::Operator;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
@@ -12,9 +15,13 @@ use uuid::Uuid;
 
 use super::adapter::map_operation_error;
 use super::models::{FileManagerError, FileTransferRequest};
-use super::service::{ensure_writable_connection, operator_for_connection, validate_remote_path};
+use super::registry::FileOperatorRegistry;
+#[cfg(test)]
+use super::service::operator_for_connection;
+use super::service::{ensure_writable_connection, operator_lease_for_connection, validate_remote_path};
 
 const TRANSFER_BUFFER_SIZE: usize = 64 * 1024;
+#[cfg(test)]
 pub(crate) const TRANSFER_TIMEOUT_SECS: u64 = 60;
 const GLOBAL_TRANSFER_LIMIT: usize = 8;
 const CONNECTION_TRANSFER_LIMIT: usize = 2;
@@ -59,12 +66,34 @@ impl FileTransferState {
     }
 }
 
+#[cfg(test)]
 pub async fn upload(
     storage: &Storage,
     state: &FileTransferState,
     request: FileTransferRequest,
 ) -> Result<u64, FileManagerError> {
     ensure_writable_connection(storage, &request.connection_id).await?;
+    let operator = operator_for_connection(storage, &request.connection_id).await?;
+    upload_with_operator(state, request, operator, Some(Duration::from_secs(TRANSFER_TIMEOUT_SECS))).await
+}
+
+pub async fn upload_cached(
+    app_state: &AppState,
+    registry: &FileOperatorRegistry,
+    state: &FileTransferState,
+    request: FileTransferRequest,
+) -> Result<u64, FileManagerError> {
+    ensure_writable_connection(&app_state.storage, &request.connection_id).await?;
+    let lease = operator_lease_for_connection(app_state, registry, &request.connection_id).await?;
+    upload_with_operator(state, request, (*lease.operator).clone(), lease.operation_timeout).await
+}
+
+async fn upload_with_operator(
+    state: &FileTransferState,
+    request: FileTransferRequest,
+    operator: Operator,
+    timeout: Option<Duration>,
+) -> Result<u64, FileManagerError> {
     let remote_path = non_root_remote_path(&request.remote_path)?;
     let local_path = absolute_local_path(&request.local_path)?;
     let metadata = tokio::fs::metadata(&local_path)
@@ -73,10 +102,9 @@ pub async fn upload(
     if !metadata.is_file() {
         return Err(FileManagerError::configuration("The upload source must be a file"));
     }
-    let operator = operator_for_connection(storage, &request.connection_id).await?;
     let _permits = state.acquire(&request.connection_id).await?;
 
-    transfer_timeout(async {
+    transfer_with_configured_timeout(timeout, async {
         if !request.replace && operator.exists(&remote_path).await.map_err(map_operation_error)? {
             return Err(FileManagerError::new("already_exists", "The remote destination already exists"));
         }
@@ -98,19 +126,39 @@ pub async fn upload(
     .await
 }
 
+#[cfg(test)]
 pub async fn download(
     storage: &Storage,
     state: &FileTransferState,
     request: FileTransferRequest,
 ) -> Result<u64, FileManagerError> {
+    let operator = operator_for_connection(storage, &request.connection_id).await?;
+    download_with_operator(state, request, operator, Some(Duration::from_secs(TRANSFER_TIMEOUT_SECS))).await
+}
+
+pub async fn download_cached(
+    app_state: &AppState,
+    registry: &FileOperatorRegistry,
+    state: &FileTransferState,
+    request: FileTransferRequest,
+) -> Result<u64, FileManagerError> {
+    let lease = operator_lease_for_connection(app_state, registry, &request.connection_id).await?;
+    download_with_operator(state, request, (*lease.operator).clone(), lease.operation_timeout).await
+}
+
+async fn download_with_operator(
+    state: &FileTransferState,
+    request: FileTransferRequest,
+    operator: Operator,
+    timeout: Option<Duration>,
+) -> Result<u64, FileManagerError> {
     let remote_path = non_root_remote_path(&request.remote_path)?;
     let local_path = absolute_local_path(&request.local_path)?;
     validate_download_target(&local_path, request.replace).await?;
-    let operator = operator_for_connection(storage, &request.connection_id).await?;
     let _permits = state.acquire(&request.connection_id).await?;
     let (temporary_path, temporary_file) = create_download_temporary(&local_path).await?;
 
-    let transfer_result = transfer_timeout(async {
+    let transfer_result = transfer_with_configured_timeout(timeout, async {
         let reader = operator
             .reader(&remote_path)
             .await
@@ -145,6 +193,7 @@ pub async fn download(
     Ok(bytes)
 }
 
+#[cfg(test)]
 pub async fn delete(
     storage: &Storage,
     state: &FileTransferState,
@@ -152,10 +201,32 @@ pub async fn delete(
     path: &str,
 ) -> Result<(), FileManagerError> {
     ensure_writable_connection(storage, connection_id).await?;
-    let path = non_root_remote_path(path)?;
     let operator = operator_for_connection(storage, connection_id).await?;
+    delete_with_operator(state, connection_id, path, operator, Some(Duration::from_secs(TRANSFER_TIMEOUT_SECS))).await
+}
+
+pub async fn delete_cached(
+    app_state: &AppState,
+    registry: &FileOperatorRegistry,
+    state: &FileTransferState,
+    connection_id: &str,
+    path: &str,
+) -> Result<(), FileManagerError> {
+    ensure_writable_connection(&app_state.storage, connection_id).await?;
+    let lease = operator_lease_for_connection(app_state, registry, connection_id).await?;
+    delete_with_operator(state, connection_id, path, (*lease.operator).clone(), lease.operation_timeout).await
+}
+
+async fn delete_with_operator(
+    state: &FileTransferState,
+    connection_id: &str,
+    path: &str,
+    operator: Operator,
+    timeout: Option<Duration>,
+) -> Result<(), FileManagerError> {
+    let path = non_root_remote_path(path)?;
     let _permits = state.acquire(connection_id).await?;
-    transfer_timeout(async {
+    transfer_with_configured_timeout(timeout, async {
         let metadata = operator.stat(&path).await.map_err(map_operation_error)?;
         if metadata.is_dir() {
             let directory = format!("{path}/");
@@ -170,12 +241,16 @@ pub async fn delete(
     .await
 }
 
-pub(crate) async fn transfer_timeout<T>(
+pub(crate) async fn transfer_with_configured_timeout<T>(
+    timeout: Option<Duration>,
     operation: impl std::future::Future<Output = Result<T, FileManagerError>>,
 ) -> Result<T, FileManagerError> {
-    tokio::time::timeout(Duration::from_secs(TRANSFER_TIMEOUT_SECS), operation)
-        .await
-        .map_err(|_| FileManagerError::new("timeout", "The file transfer timed out"))?
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, operation)
+            .await
+            .map_err(|_| FileManagerError::new("timeout", "The file transfer timed out"))?,
+        None => operation.await,
+    }
 }
 
 pub(crate) async fn copy_with_fixed_buffer<R, W>(reader: R, mut writer: W) -> std::io::Result<u64>
