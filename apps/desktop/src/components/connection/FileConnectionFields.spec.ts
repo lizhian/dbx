@@ -3,17 +3,20 @@
 import { createApp, type App } from "vue";
 import { afterEach, describe, expect, it } from "vitest";
 import i18n from "@/i18n";
-import { createFileConnectionImplementationDraft } from "@/components/file-manager/fileConnectionDraft";
-import type { FileConnectionImplementation } from "@/types/fileManager";
+import { createFileConnectionImplementationDraft, type FileConnectionDraft } from "@/components/file-manager/fileConnectionDraft";
+import type { FileConnectionImplementation, FileSecretStatus } from "@/types/fileManager";
 import FileConnectionFields from "./FileConnectionFields.vue";
 
 const mountedApps: App[] = [];
 
-function mountFields(implementation: FileConnectionImplementation): HTMLElement {
+function mountFields(implementation: FileConnectionImplementation, configure?: (draft: FileConnectionDraft) => void, secretStatus?: FileSecretStatus): HTMLElement {
   const container = document.createElement("div");
   document.body.append(container);
+  const draft = createFileConnectionImplementationDraft(implementation);
+  configure?.(draft);
   const app = createApp(FileConnectionFields, {
-    draft: createFileConnectionImplementationDraft(implementation),
+    draft,
+    secretStatus,
   });
   mountedApps.push(app);
   app.use(i18n);
@@ -48,7 +51,7 @@ describe("FileConnectionFields layout", () => {
     expect(port.parentElement).toBe(controls);
   });
 
-  it("keeps S3 secret helpers under their right-side controls", () => {
+  it("keeps S3 secret inputs in the shared right-side controls", () => {
     const fields = mountFields("s3");
     const accessKey = fields.querySelector<HTMLInputElement>("#file-connection-access-key")!;
     const controls = accessKey.closest<HTMLElement>(".col-span-3")!;
@@ -56,5 +59,25 @@ describe("FileConnectionFields layout", () => {
     expect(controls).not.toBeNull();
     expect(controls.parentElement?.classList.contains("grid-cols-4")).toBe(true);
     expect(fields.querySelector("label[for='file-connection-access-key']")).not.toBeNull();
+  });
+
+  it("does not expose file-specific controls for clearing saved credentials", () => {
+    const secretStatus: FileSecretStatus = {
+      password: true,
+      privateKey: true,
+      accessKey: true,
+      secretKey: true,
+      sessionToken: true,
+      bearerToken: true,
+      delegationToken: true,
+    };
+
+    mountFields("ftp", undefined, secretStatus);
+    mountFields("s3", undefined, secretStatus);
+    mountFields("webdav", (draft) => (draft.webdavAuthentication = "bearer"), secretStatus);
+    mountFields("sftp", (draft) => (draft.authentication = "private_key"), secretStatus);
+    mountFields("webhdfs", (draft) => (draft.useDelegationToken = true), secretStatus);
+
+    expect(document.body.textContent).not.toContain("Clear the saved");
   });
 });

@@ -26,27 +26,20 @@ export interface FileConnectionDraft {
   root: string;
   username: string;
   password: string;
-  clearPassword: boolean;
   authentication: SftpAuthenticationMethod;
   privateKey: string;
-  clearPrivateKey: boolean;
   region: string;
   bucket: string;
   pathStyle: boolean;
   accessKey: string;
-  clearAccessKey: boolean;
   secretKey: string;
-  clearSecretKey: boolean;
   sessionToken: string;
-  clearSessionToken: boolean;
   webdavAuthentication: WebdavAuthenticationMethod;
   bearerToken: string;
-  clearBearerToken: boolean;
   hdfsImplementation: HdfsImplementation;
   simpleUser: string;
   useDelegationToken: boolean;
   delegationToken: string;
-  clearDelegationToken: boolean;
   nameNodeUri: string;
   hadoopConfigDirectory: string;
 }
@@ -63,27 +56,20 @@ function emptyDraft(connection?: FileConnection): FileConnectionDraft {
     root: "/",
     username: "",
     password: "",
-    clearPassword: false,
     authentication: "ssh_config",
     privateKey: "",
-    clearPrivateKey: false,
     region: "us-east-1",
     bucket: "",
     pathStyle: true,
     accessKey: "",
-    clearAccessKey: false,
     secretKey: "",
-    clearSecretKey: false,
     sessionToken: "",
-    clearSessionToken: false,
     webdavAuthentication: "basic",
     bearerToken: "",
-    clearBearerToken: false,
     hdfsImplementation: "webhdfs",
     simpleUser: "dbx",
     useDelegationToken: false,
     delegationToken: "",
-    clearDelegationToken: false,
     nameNodeUri: "hdfs://127.0.0.1:19000",
     hadoopConfigDirectory: "",
   };
@@ -185,38 +171,37 @@ export function createProtocolDraft(protocol: SupportedFileProtocol, current: Pi
   return draft;
 }
 
-function secretUpdate(value: string, clear: boolean): SecretUpdate {
-  if (clear) return { action: "clear" };
+function secretUpdate(value: string): SecretUpdate {
   if (value) return { action: "set", value };
   return { action: "keep" };
 }
 
-export function ftpPasswordUpdate(draft: Pick<FileConnectionDraft, "password" | "clearPassword">): SecretUpdate {
-  return secretUpdate(draft.password, draft.clearPassword);
+export function ftpPasswordUpdate(draft: Pick<FileConnectionDraft, "password">): SecretUpdate {
+  return secretUpdate(draft.password);
 }
 
-export function sftpPrivateKeyUpdate(draft: Pick<FileConnectionDraft, "privateKey" | "clearPrivateKey">): SecretUpdate {
-  return secretUpdate(draft.privateKey, draft.clearPrivateKey);
+export function sftpPrivateKeyUpdate(draft: Pick<FileConnectionDraft, "privateKey">): SecretUpdate {
+  return secretUpdate(draft.privateKey);
 }
 
-export function s3AccessKeyUpdate(draft: Pick<FileConnectionDraft, "accessKey" | "clearAccessKey">): SecretUpdate {
-  return secretUpdate(draft.accessKey, draft.clearAccessKey);
+export function s3AccessKeyUpdate(draft: Pick<FileConnectionDraft, "accessKey">): SecretUpdate {
+  return secretUpdate(draft.accessKey);
 }
 
-export function s3SecretKeyUpdate(draft: Pick<FileConnectionDraft, "secretKey" | "clearSecretKey">): SecretUpdate {
-  return secretUpdate(draft.secretKey, draft.clearSecretKey);
+export function s3SecretKeyUpdate(draft: Pick<FileConnectionDraft, "secretKey">): SecretUpdate {
+  return secretUpdate(draft.secretKey);
 }
 
-export function s3SessionTokenUpdate(draft: Pick<FileConnectionDraft, "sessionToken" | "clearSessionToken">): SecretUpdate {
-  return secretUpdate(draft.sessionToken, draft.clearSessionToken);
+export function s3SessionTokenUpdate(draft: Pick<FileConnectionDraft, "sessionToken">): SecretUpdate {
+  return secretUpdate(draft.sessionToken);
 }
 
-export function webdavBearerTokenUpdate(draft: Pick<FileConnectionDraft, "bearerToken" | "clearBearerToken">): SecretUpdate {
-  return secretUpdate(draft.bearerToken, draft.clearBearerToken);
+export function webdavBearerTokenUpdate(draft: Pick<FileConnectionDraft, "bearerToken">): SecretUpdate {
+  return secretUpdate(draft.bearerToken);
 }
 
-export function hdfsDelegationTokenUpdate(draft: Pick<FileConnectionDraft, "delegationToken" | "clearDelegationToken">): SecretUpdate {
-  return secretUpdate(draft.delegationToken, draft.clearDelegationToken);
+export function hdfsDelegationTokenUpdate(draft: Pick<FileConnectionDraft, "delegationToken">): SecretUpdate {
+  return secretUpdate(draft.delegationToken);
 }
 
 export function fileConnectionRequestFromDraft(draft: FileConnectionDraft): SaveFileConnectionRequest {

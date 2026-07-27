@@ -23,7 +23,6 @@ const isWindows = typeof navigator !== "undefined" && /Windows/i.test(navigator.
 const fieldRowClass = "grid grid-cols-4 items-center gap-4";
 const fieldTopRowClass = "grid grid-cols-4 items-start gap-4";
 const fieldLabelClass = "justify-self-start text-left";
-const fieldLabelTopClass = `${fieldLabelClass} mt-2`;
 
 async function selectPrivateKey() {
   try {
@@ -31,7 +30,6 @@ async function selectPrivateKey() {
     const selected = await open({ multiple: false, directory: false, title: t("fileManager.selectPrivateKey") });
     if (!selected || Array.isArray(selected)) return;
     props.draft.privateKey = selected;
-    props.draft.clearPrivateKey = false;
   } catch (error) {
     emit("error", String(error));
   }
@@ -80,37 +78,19 @@ async function selectHadoopConfigDirectory() {
         <Input id="file-connection-bucket" v-model="draft.bucket" class="col-span-3" autocomplete="off" />
       </div>
 
-      <div :class="fieldTopRowClass">
-        <Label for="file-connection-access-key" :class="fieldLabelTopClass">{{ t("fileManager.accessKey") }}</Label>
-        <div class="col-span-3 grid min-w-0 gap-1.5">
-          <PasswordInput id="file-connection-access-key" v-model="draft.accessKey" :disabled="draft.clearAccessKey" :placeholder="secretStatus?.accessKey ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
-          <label v-if="secretStatus?.accessKey" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="draft.clearAccessKey" type="checkbox" />
-            {{ t("fileManager.clearSavedAccessKey") }}
-          </label>
-        </div>
+      <div :class="fieldRowClass">
+        <Label for="file-connection-access-key" :class="fieldLabelClass">{{ t("fileManager.accessKey") }}</Label>
+        <PasswordInput id="file-connection-access-key" v-model="draft.accessKey" class="col-span-3" :placeholder="secretStatus?.accessKey ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
       </div>
 
-      <div :class="fieldTopRowClass">
-        <Label for="file-connection-secret-key" :class="fieldLabelTopClass">{{ t("fileManager.secretKey") }}</Label>
-        <div class="col-span-3 grid min-w-0 gap-1.5">
-          <PasswordInput id="file-connection-secret-key" v-model="draft.secretKey" :disabled="draft.clearSecretKey" :placeholder="secretStatus?.secretKey ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
-          <label v-if="secretStatus?.secretKey" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="draft.clearSecretKey" type="checkbox" />
-            {{ t("fileManager.clearSavedSecretKey") }}
-          </label>
-        </div>
+      <div :class="fieldRowClass">
+        <Label for="file-connection-secret-key" :class="fieldLabelClass">{{ t("fileManager.secretKey") }}</Label>
+        <PasswordInput id="file-connection-secret-key" v-model="draft.secretKey" class="col-span-3" :placeholder="secretStatus?.secretKey ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
       </div>
 
-      <div :class="fieldTopRowClass">
-        <Label for="file-connection-session-token" :class="fieldLabelTopClass">{{ t("fileManager.sessionToken") }}</Label>
-        <div class="col-span-3 grid min-w-0 gap-1.5">
-          <PasswordInput id="file-connection-session-token" v-model="draft.sessionToken" :disabled="draft.clearSessionToken" :placeholder="secretStatus?.sessionToken ? t('fileManager.secretPreserved') : t('fileManager.optional')" autocomplete="off" />
-          <label v-if="secretStatus?.sessionToken" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="draft.clearSessionToken" type="checkbox" />
-            {{ t("fileManager.clearSavedSessionToken") }}
-          </label>
-        </div>
+      <div :class="fieldRowClass">
+        <Label for="file-connection-session-token" :class="fieldLabelClass">{{ t("fileManager.sessionToken") }}</Label>
+        <PasswordInput id="file-connection-session-token" v-model="draft.sessionToken" class="col-span-3" :placeholder="secretStatus?.sessionToken ? t('fileManager.secretPreserved') : t('fileManager.optional')" autocomplete="off" />
       </div>
 
       <div :class="fieldRowClass">
@@ -138,27 +118,15 @@ async function selectHadoopConfigDirectory() {
         <Input id="file-webdav-username" v-model="draft.username" class="col-span-3" autocomplete="username" />
       </div>
 
-      <div v-if="draft.webdavAuthentication === 'bearer'" :class="fieldTopRowClass">
-        <Label for="file-connection-bearer-token" :class="fieldLabelTopClass">{{ t("fileManager.bearerToken") }}</Label>
-        <div class="col-span-3 grid min-w-0 gap-1.5">
-          <PasswordInput id="file-connection-bearer-token" v-model="draft.bearerToken" :disabled="draft.clearBearerToken" :placeholder="secretStatus?.bearerToken ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
-          <label v-if="secretStatus?.bearerToken" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="draft.clearBearerToken" type="checkbox" />
-            {{ t("fileManager.clearSavedBearerToken") }}
-          </label>
-        </div>
+      <div v-if="draft.webdavAuthentication === 'bearer'" :class="fieldRowClass">
+        <Label for="file-connection-bearer-token" :class="fieldLabelClass">{{ t("fileManager.bearerToken") }}</Label>
+        <PasswordInput id="file-connection-bearer-token" v-model="draft.bearerToken" class="col-span-3" :placeholder="secretStatus?.bearerToken ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
       </div>
     </template>
 
-    <div v-if="draft.protocol === 'ftp' || (draft.protocol === 'webdav' && draft.webdavAuthentication === 'basic')" :class="fieldTopRowClass">
-      <Label for="file-connection-password" :class="fieldLabelTopClass">{{ t("fileManager.password") }}</Label>
-      <div class="col-span-3 grid min-w-0 gap-1.5">
-        <PasswordInput id="file-connection-password" v-model="draft.password" :disabled="draft.clearPassword" :placeholder="secretStatus?.password ? t('fileManager.secretPreserved') : undefined" autocomplete="new-password" />
-        <label v-if="secretStatus?.password" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
-          <input v-model="draft.clearPassword" type="checkbox" />
-          {{ t("fileManager.clearSavedPassword") }}
-        </label>
-      </div>
+    <div v-if="draft.protocol === 'ftp' || (draft.protocol === 'webdav' && draft.webdavAuthentication === 'basic')" :class="fieldRowClass">
+      <Label for="file-connection-password" :class="fieldLabelClass">{{ t("fileManager.password") }}</Label>
+      <PasswordInput id="file-connection-password" v-model="draft.password" class="col-span-3" :placeholder="secretStatus?.password ? t('fileManager.secretPreserved') : undefined" autocomplete="new-password" />
     </div>
 
     <template v-if="draft.protocol === 'hdfs' && draft.hdfsImplementation === 'webhdfs'">
@@ -170,15 +138,9 @@ async function selectHadoopConfigDirectory() {
         <Label for="file-connection-simple-user" :class="fieldLabelClass">{{ t("fileManager.simpleUser") }}</Label>
         <Input id="file-connection-simple-user" v-model="draft.simpleUser" class="col-span-3" autocomplete="username" />
       </div>
-      <div v-else :class="fieldTopRowClass">
-        <Label for="file-connection-delegation-token" :class="fieldLabelTopClass">{{ t("fileManager.delegationToken") }}</Label>
-        <div class="col-span-3 grid min-w-0 gap-1.5">
-          <PasswordInput id="file-connection-delegation-token" v-model="draft.delegationToken" :disabled="draft.clearDelegationToken" :placeholder="secretStatus?.delegationToken ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
-          <label v-if="secretStatus?.delegationToken" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="draft.clearDelegationToken" type="checkbox" />
-            {{ t("fileManager.clearSavedDelegationToken") }}
-          </label>
-        </div>
+      <div v-else :class="fieldRowClass">
+        <Label for="file-connection-delegation-token" :class="fieldLabelClass">{{ t("fileManager.delegationToken") }}</Label>
+        <PasswordInput id="file-connection-delegation-token" v-model="draft.delegationToken" class="col-span-3" :placeholder="secretStatus?.delegationToken ? t('fileManager.secretPreserved') : undefined" autocomplete="off" />
       </div>
     </template>
 
@@ -212,19 +174,13 @@ async function selectHadoopConfigDirectory() {
           </Select>
         </div>
       </div>
-      <div v-if="draft.authentication === 'private_key'" :class="fieldTopRowClass">
-        <Label for="file-connection-private-key" :class="fieldLabelTopClass">{{ t("fileManager.privateKey") }}</Label>
-        <div class="col-span-3 grid min-w-0 gap-1.5">
-          <div class="flex min-w-0 gap-2">
-            <Input id="file-connection-private-key" v-model="draft.privateKey" :placeholder="secretStatus?.privateKey ? t('fileManager.privateKeyPreserved') : undefined" :disabled="draft.clearPrivateKey" autocomplete="off" />
-            <Button type="button" variant="outline" size="icon" :title="t('fileManager.selectPrivateKey')" :disabled="draft.clearPrivateKey" @click="selectPrivateKey">
-              <FolderOpen class="h-4 w-4" />
-            </Button>
-          </div>
-          <label v-if="secretStatus?.privateKey" class="inline-flex w-fit items-center gap-2 text-xs text-muted-foreground">
-            <input v-model="draft.clearPrivateKey" type="checkbox" />
-            {{ t("fileManager.clearSavedPrivateKey") }}
-          </label>
+      <div v-if="draft.authentication === 'private_key'" :class="fieldRowClass">
+        <Label for="file-connection-private-key" :class="fieldLabelClass">{{ t("fileManager.privateKey") }}</Label>
+        <div class="col-span-3 flex min-w-0 gap-2">
+          <Input id="file-connection-private-key" v-model="draft.privateKey" :placeholder="secretStatus?.privateKey ? t('fileManager.privateKeyPreserved') : undefined" autocomplete="off" />
+          <Button type="button" variant="outline" size="icon" :title="t('fileManager.selectPrivateKey')" @click="selectPrivateKey">
+            <FolderOpen class="h-4 w-4" />
+          </Button>
         </div>
       </div>
     </template>

@@ -15,20 +15,22 @@ describe("file connection drafts", () => {
     expect(createFileConnectionImplementationDraft(implementation, { id: "files", name: "Files" })).toMatchObject(expected);
   });
 
-  it("keeps S3 secrets outside external config and uses explicit Set, Keep, and Clear", () => {
+  it("keeps S3 secrets outside external config and uses Set or Keep", () => {
     const draft = createFileConnectionImplementationDraft("s3", { id: "s3", name: "S3" });
     expect(s3AccessKeyUpdate(draft)).toEqual({ action: "keep" });
     expect(s3SecretKeyUpdate(draft)).toEqual({ action: "keep" });
     expect(s3SessionTokenUpdate(draft)).toEqual({ action: "keep" });
+    expect(draft).not.toHaveProperty("clearAccessKey");
+    expect(draft).not.toHaveProperty("clearSecretKey");
+    expect(draft).not.toHaveProperty("clearSessionToken");
 
     draft.accessKey = "replacement-access";
     draft.secretKey = "replacement-secret";
-    draft.clearSessionToken = true;
     const request = fileConnectionRequestFromDraft(draft);
     expect(request.secrets).toEqual({
       accessKey: { action: "set", value: "replacement-access" },
       secretKey: { action: "set", value: "replacement-secret" },
-      sessionToken: { action: "clear" },
+      sessionToken: { action: "keep" },
     });
     expect(JSON.stringify(request.config)).not.toContain("replacement-");
   });

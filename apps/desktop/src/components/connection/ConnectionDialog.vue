@@ -2821,22 +2821,22 @@ const fileDraftCanSubmit = computed(() => {
   if (hdfsNative) return !!fileDraft.nameNodeUri.trim() && !!fileDraft.hadoopConfigDirectory.trim();
   if (!fileDraft.endpoint.trim()) return false;
   if (fileDraft.protocol === "s3") {
-    const accessKey = !!fileDraft.accessKey || (!!fileSecretStatus.value?.accessKey && !fileDraft.clearAccessKey);
-    const secretKey = !!fileDraft.secretKey || (!!fileSecretStatus.value?.secretKey && !fileDraft.clearSecretKey);
+    const accessKey = !!fileDraft.accessKey || !!fileSecretStatus.value?.accessKey;
+    const secretKey = !!fileDraft.secretKey || !!fileSecretStatus.value?.secretKey;
     return !!fileDraft.region.trim() && !!fileDraft.bucket.trim() && accessKey && secretKey;
   }
   if (fileDraft.protocol === "webdav") {
     if (fileDraft.webdavAuthentication === "basic") {
-      return !!fileDraft.username.trim() && (!!fileDraft.password || (!!fileSecretStatus.value?.password && !fileDraft.clearPassword));
+      return !!fileDraft.username.trim() && (!!fileDraft.password || !!fileSecretStatus.value?.password);
     }
-    return !!fileDraft.bearerToken || (!!fileSecretStatus.value?.bearerToken && !fileDraft.clearBearerToken);
+    return !!fileDraft.bearerToken || !!fileSecretStatus.value?.bearerToken;
   }
   if (fileDraft.protocol === "hdfs") {
     if (!fileDraft.useDelegationToken) return !!fileDraft.simpleUser.trim();
-    return !!fileDraft.delegationToken || (!!fileSecretStatus.value?.delegationToken && !fileDraft.clearDelegationToken);
+    return !!fileDraft.delegationToken || !!fileSecretStatus.value?.delegationToken;
   }
   if (fileDraft.protocol !== "sftp" || fileDraft.authentication !== "private_key") return true;
-  return !!fileDraft.privateKey || (!!fileSecretStatus.value?.privateKey && !fileDraft.clearPrivateKey);
+  return !!fileDraft.privateKey || !!fileSecretStatus.value?.privateKey;
 });
 const hasRequiredConnectionTarget = computed(() => {
   if (form.value.db_type === "file") return fileDraftCanSubmit.value;
