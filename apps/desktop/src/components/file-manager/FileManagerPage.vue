@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, Copy, Download, File as FileIcon, FilePenLine, FileQuestion, Folder, FolderOpen, FolderPlus, Loader2, RefreshCw, Trash2, Upload } from "@lucide/vue";
+import { ChevronDown, ChevronLeft, ChevronRight, Copy, Download, File as FileIcon, FilePenLine, FileQuestion, Folder, FolderOpen, FolderPlus, Loader2, RefreshCw, Trash2, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -601,13 +601,6 @@ defineExpose({ openConnectionById });
   <div class="flex h-full min-h-0 flex-1 flex-col">
     <section class="flex h-full min-h-0 flex-col bg-background">
       <header v-if="activeConnection" data-file-manager-toolbar class="flex h-11 shrink-0 items-center gap-1 border-b px-2">
-        <div class="flex min-w-0 shrink-0 items-center gap-2">
-          <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :title="t('common.close')" @click="closeBrowser">
-            <ArrowLeft class="h-4 w-4" />
-          </Button>
-          <h1 class="max-w-48 truncate text-sm font-semibold" :title="activeConnection.name">{{ activeConnection.name }}</h1>
-        </div>
-        <div class="mx-1 h-5 border-l" />
         <Button variant="ghost" size="icon" class="h-7 w-7 shrink-0" :disabled="!currentPath || browsing" :title="t('fileManager.up')" @click="goUp">
           <ChevronLeft class="h-4 w-4" />
         </Button>

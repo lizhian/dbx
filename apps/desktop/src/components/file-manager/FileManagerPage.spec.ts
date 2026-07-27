@@ -246,7 +246,6 @@ describe("FileManagerPage browsing", () => {
     await mountPage("ftp-local");
 
     expect(listFilePath).toHaveBeenLastCalledWith("ftp-local", "");
-    expect(document.body.textContent).toContain("Local FTP");
     expect(document.body.textContent).toContain("fixture.txt");
   });
 
@@ -272,7 +271,7 @@ describe("FileManagerPage browsing", () => {
 
     const toolbar = document.querySelector<HTMLElement>("[data-file-manager-toolbar]");
     expect(document.querySelectorAll("header")).toHaveLength(1);
-    expect(toolbar?.textContent).toContain("Local FTP");
+    expect(toolbar?.textContent).not.toContain("Local FTP");
     expect(toolbar?.textContent).toContain("/");
     expect(toolbar?.textContent).toContain("New folder");
     expect(toolbar?.textContent).toContain("Upload");
@@ -445,14 +444,12 @@ describe("FileManagerPage browsing", () => {
     await expect(page.openConnectionById("missing")).rejects.toThrow("File connection no longer exists");
   });
 
-  it("closes the connection detail instead of returning to a connection index", async () => {
+  it("uses the tab title and close control instead of duplicating them in the toolbar", async () => {
     await mountOpenPage();
 
-    buttonWithTitle("Close")?.click();
-    await flushPage();
-
-    expect(document.querySelector("[data-file-manager-loading]")).not.toBeNull();
-    expect(document.body.textContent).not.toContain("Local FTP");
+    const toolbar = document.querySelector<HTMLElement>("[data-file-manager-toolbar]");
+    expect(toolbar?.querySelector('button[title="Close"]')).toBeNull();
+    expect(toolbar?.textContent).not.toContain("Local FTP");
   });
 
   it("refreshes the active connection snapshot after a generic connection edit", async () => {
